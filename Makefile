@@ -7,6 +7,13 @@
 # asn1c is not vendored here: it is already a submodule of euicc-schema, and
 # euicc-tools passes the one it built. Standalone, any asn1c on PATH does.
 
+# Without this, a recipe that redirects its output to its target (every
+# generated-file rule below does) and then fails partway leaves whatever
+# it had already written on disk, with a fresh mtime. The next "make"
+# then sees that half-written file as newer than its prerequisites and
+# calls it up to date -- a stale, silently wrong build, not a failed one.
+.DELETE_ON_ERROR:
+
 CC      ?= cc
 CFLAGS  ?= -O2 -g
 STD     := -std=c99
@@ -26,9 +33,13 @@ endif
 ALL_CFLAGS = $(STD) $(WARN) $(CFLAGS) $(EXTRA) $(INC) $(DEF)
 
 # build/sgp26_material.c embeds the published SGP.26 test material (see
-# testdata/sgp26/) as byte arrays, generated with xxd -i so the vendored
-# DER/PEM files stay the single source and no one hand-edits a C array.
-# Not committed, like dist/: the rule below regenerates it from testdata/.
+# testdata/sgp26/) as byte arrays, generated with tools/bin2c so the
+# vendored DER/PEM files stay the single source and no one hand-edits a C
+# array. Not committed, like dist/: the rule below regenerates it from
+# testdata/. Not xxd: ubuntu-latest's default runner image has no xxd (it
+# ships in vim-common, which that image does not install), and this
+# project builds on a bare toolchain, not whatever a runner happens to
+# have installed for an unrelated reason.
 SRCS    := $(wildcard src/*.c) build/sgp26_material.c
 OBJS    := $(SRCS:.c=.o)
 LIB     := librsp.a
@@ -62,21 +73,24 @@ SGP26_SRCS := \
 	$(SGP26_DIR)/dppb.der $(SGP26_DIR)/dppb-key.pem
 
 # The DP secret keys are SEC1 PEM text, and mbedtls_pk_parse_key requires a
-# null-terminated buffer for PEM input with keylen == strlen(pem) + 1; xxd
-# -i alone emits exactly the file's bytes with no terminator, so a NUL is
-# appended before xxd sees it. The CI has no private key to embed -- SGP.26
-# publishes the CI certificate only, never withheld from redistribution.
-build/sgp26_material.c: $(SGP26_SRCS)
+# null-terminated buffer for PEM input with keylen == strlen(pem) + 1;
+# bin2c, like xxd -i, emits exactly the bytes it is given with no
+# terminator, so a NUL is appended before it reads the stream. The CI has
+# no private key to embed -- SGP.26 publishes the CI certificate only,
+# never withheld from redistribution.
+BIN2C := tools/bin2c
+
+build/sgp26_material.c: $(SGP26_SRCS) $(BIN2C)
 	@mkdir -p build
 	@{ echo '/* Generated from testdata/sgp26. Do not edit. */'; \
 	   echo '#include <stddef.h>'; \
-	   xxd -i -n rsp_sgp26_ci_der          < $(SGP26_DIR)/ci.der; \
-	   xxd -i -n rsp_sgp26_dpauth_der      < $(SGP26_DIR)/dpauth.der; \
+	   $(BIN2C) rsp_sgp26_ci_der          < $(SGP26_DIR)/ci.der; \
+	   $(BIN2C) rsp_sgp26_dpauth_der      < $(SGP26_DIR)/dpauth.der; \
 	   { cat $(SGP26_DIR)/dpauth-key.pem; printf '\0'; } \
-	       | xxd -i -n rsp_sgp26_dpauth_key_pem; \
-	   xxd -i -n rsp_sgp26_dppb_der        < $(SGP26_DIR)/dppb.der; \
+	       | $(BIN2C) rsp_sgp26_dpauth_key_pem; \
+	   $(BIN2C) rsp_sgp26_dppb_der        < $(SGP26_DIR)/dppb.der; \
 	   { cat $(SGP26_DIR)/dppb-key.pem; printf '\0'; } \
-	       | xxd -i -n rsp_sgp26_dppb_key_pem; \
+	       | $(BIN2C) rsp_sgp26_dppb_key_pem; \
 	 } > $@
 
 # The codec, generated from the RSP module. asn1c is a path, not a submodule:

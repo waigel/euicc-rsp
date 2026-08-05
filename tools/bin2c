@@ -1,0 +1,37 @@
+#!/bin/sh
+# bin2c NAME < input > C source fragment
+#
+# Emits the same shape xxd -i produces --
+#   unsigned char NAME[] = { 0x.., 0x.., ... };
+#   unsigned int NAME_len = N;
+# -- from stdin, byte for byte, without xxd. od, wc, tr and sed are POSIX
+# and are on every runner and every minimal distribution this project
+# claims to build on; xxd is not -- ubuntu-latest's default image has no
+# xxd, since that comes from vim-common, which that image does not
+# install, and this project builds on a bare toolchain, not whatever a
+# runner happens to have installed for an unrelated reason.
+#
+# Every step below is its own standalone command, never a non-last stage
+# of a multi-process pipe: "set -e" only sees a pipeline's last exit
+# status, so if an early stage failed (its tool missing, say) while a
+# later stage still exits 0 on the empty input that leaves it, the
+# failure would pass unnoticed and this would silently emit a truncated
+# array under a still-correct _len -- exactly the confusing, wrong-later
+# failure this script exists to not have.
+set -eu
+
+name=$1
+tmp="${TMPDIR:-/tmp}/bin2c.$$"
+trap 'rm -f "$tmp" "$tmp.od" "$tmp.tok"' EXIT
+cat > "$tmp"
+
+len=$(wc -c < "$tmp")
+len=$(printf '%s' "$len" | tr -d '[:space:]')
+
+od -An -v -t x1 "$tmp" > "$tmp.od"
+tr -s ' ' '\n' < "$tmp.od" > "$tmp.tok"
+
+printf 'unsigned char %s[] = {\n' "$name"
+sed -e '/^$/d' -e 's/^/0x/' -e 's/$/,/' "$tmp.tok"
+printf '};\n'
+printf 'unsigned int %s_len = %s;\n' "$name" "$len"
