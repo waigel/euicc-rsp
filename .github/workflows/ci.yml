@@ -15,7 +15,34 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      # ubuntu-latest packages asn1c 0.9.28, which has no -D (destination
+      # directory) option; the codec step below needs it. -D was added in
+      # asn1c v0.9.29 (github.com/vlm/asn1c, commit 6431b1c9, "Add '-D
+      # destdir' option for generated files"). Built here from source into
+      # a runner-temp directory, not installed system-wide: this project
+      # always takes asn1c as ASN1C=<path>, whether that path comes from
+      # euicc-tools or, standalone, from a build like this one.
+      - name: cache asn1c v0.9.29 build
+        id: asn1c-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/asn1c-src
+          key: asn1c-v0.9.29-${{ runner.os }}
+
+      - name: build asn1c v0.9.29 (Ubuntu ships 0.9.28, which lacks -D)
+        if: steps.asn1c-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq autoconf automake libtool bison flex
+          git clone --quiet --branch v0.9.29 --depth 1 \
+              https://github.com/vlm/asn1c.git "$RUNNER_TEMP/asn1c-src"
+          cd "$RUNNER_TEMP/asn1c-src"
+          autoreconf -iv
+          ./configure
+          make -j"$(nproc)"
+
       - name: build and test
         run: |
-          make
-          make check
+          make       ASN1C="$RUNNER_TEMP/asn1c-src/asn1c/asn1c" SKELDIR="$RUNNER_TEMP/asn1c-src/skeletons"
+          make check ASN1C="$RUNNER_TEMP/asn1c-src/asn1c/asn1c" SKELDIR="$RUNNER_TEMP/asn1c-src/skeletons"
