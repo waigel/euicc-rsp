@@ -29,6 +29,16 @@ time it runs. Install it with `brew install asn1c`, or point `ASN1C=` at a
 binary you already built; `SKELDIR=` overrides the skeleton directory the
 same way, if it is not next to `asn1c` on `PATH`.
 
+**This needs asn1c 0.9.29 or later.** The codec rule passes `-D` (the
+destination directory for generated files), which
+[was added](https://github.com/vlm/asn1c/commit/6431b1c969785e71aadb1b1991a3c8592266e747)
+in that release. Debian and Ubuntu package 0.9.28, which does not have it --
+`asn1c: invalid option -- 'D'` means this is why. `brew install asn1c` on
+macOS already gets 0.9.29 or newer; on Debian/Ubuntu, build from source (see
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) for a working
+sequence) and point `ASN1C=`/`SKELDIR=` at the result instead of installing
+the packaged one.
+
 ## The RSP ASN.1 module
 
 [`rsp-2.5.asn`](rsp-2.5.asn) is the `RSPDefinitions` module of GSMA SGP.22
