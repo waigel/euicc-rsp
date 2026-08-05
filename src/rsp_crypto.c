@@ -24,6 +24,7 @@
 #include "mbedtls/ecdh.h"
 #include "mbedtls/ecp.h"
 #include "mbedtls/entropy.h"
+#include "mbedtls/platform_util.h"
 #include "mbedtls/sha256.h"
 
 /* mbedTLS's scalar multiplication takes an RNG for blinding against timing
@@ -117,6 +118,11 @@ int rsp_kdf_x963(const uint8_t *z, size_t z_len,
         buf[z_len + 3] = (uint8_t)(counter);
 
         if (mbedtls_sha256(buf, buf_len, digest, 0) != 0) {
+            /* digest is uninitialized SHA-256 scratch on this path, not
+             * derived key material, but it shares the array with the
+             * success path below -- wipe unconditionally rather than
+             * make a future reader reason about which path needs it. */
+            mbedtls_platform_zeroize(digest, sizeof digest);
             goto out;
         }
 
@@ -127,13 +133,36 @@ int rsp_kdf_x963(const uint8_t *z, size_t z_len,
         memcpy(out + produced, digest, chunk);
         produced += chunk;
         counter++;
+        /* digest is a fresh stack array each iteration (its lifetime
+         * does not span iterations), but it is still live in this
+         * frame's memory until something overwrites it -- wipe the
+         * copy of the key material it just handed to "out" before the
+         * next iteration reuses (or the function returns and leaves)
+         * this slot. A plain memset here is exactly the pattern that
+         * -O2 removed elsewhere in this file: digest is never read
+         * again after this point, so the compiler can prove the store
+         * dead and drop it. mbedtls_platform_zeroize is written so
+         * that proof cannot go through. */
+        mbedtls_platform_zeroize(digest, sizeof digest);
     }
     ret = 0;
 
 out:
-    /* buf carries the shared secret Z; it does not outlive this call. */
-    memset(buf, 0, buf_len);
+    /* buf carries the shared secret Z; it does not outlive this call.
+     * This memset was checked separately (see the fix report) to
+     * survive at -O2 as a bzero call -- free() taking its address is
+     * enough here to block the dead-store proof -- but there is no
+     * harm in using the primitive that does not depend on that. */
+    mbedtls_platform_zeroize(buf, buf_len);
     free(buf);
+    if (ret != 0) {
+        /* A failed derivation must not leave whatever partial key
+         * material earlier iterations already wrote into the caller's
+         * buffer. rsp_session_init happens to re-zero its own output on
+         * failure regardless, but a caller of rsp_kdf_x963 directly
+         * does not get that for free unless this function does it. */
+        mbedtls_platform_zeroize(out, out_len);
+    }
     return ret;
 }
 
@@ -164,8 +193,17 @@ int rsp_session_init(const uint8_t otsk_dp[32], const uint8_t otpk_euicc[65],
     ret = 0;
 
 out:
-    memset(z, 0, sizeof z);
-    memset(key_data, 0, sizeof key_data);
+    /* z and key_data are locals that are never read again after this
+     * point and never escape this function, so a plain memset here is
+     * a proven-dead store at this project's -O2 and is removed: no
+     * wipe instruction survives on the success path (confirmed by
+     * reading the generated assembly, and independently by a runtime
+     * probe that found the just-returned chain/S-ENC/S-MAC values
+     * still present in stack memory -- see tests/test_zeroize.c and
+     * the fix report). mbedtls_platform_zeroize exists specifically to
+     * defeat that proof; use it here instead of memset. */
+    mbedtls_platform_zeroize(z, sizeof z);
+    mbedtls_platform_zeroize(key_data, sizeof key_data);
     if (ret != 0) {
         memset(out, 0, sizeof *out);
     }

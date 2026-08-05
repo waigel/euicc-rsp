@@ -46,8 +46,11 @@ int rsp_pki_verify(const rsp_credential_t *c);
 void rsp_credential_free(rsp_credential_t *c);
 
 /* The SCP03t session keys derived from the one-time key agreement between
- * the SM-DP+ and the eUICC (SGP.22 section 2.6.4). Secret: never printed,
- * logged, or otherwise emitted. Wipe with rsp_session_wipe when done. */
+ * the SM-DP+ and the eUICC (SGP.22 Annex G, "Key Derivation Process
+ * (Normative)" -- section 2.6.4 introduces these three keys by name, but
+ * the split that assigns KeyData's bytes to them is Annex G's, not
+ * 2.6.4's). Secret: never printed, logged, or otherwise emitted. Wipe
+ * with rsp_session_wipe when done. */
 typedef struct {
     uint8_t s_enc[16];
     uint8_t s_mac[16];
@@ -65,7 +68,12 @@ int rsp_kdf_x963(const uint8_t *z, size_t z_len,
 
 /* Both together, filling a session: ECDH on (otsk_dp, otpk_euicc), then the
  * X9.63 derivation of S-ENC, S-MAC and the initial chaining value from the
- * shared secret and shared_info. Returns 0 or -1. */
+ * shared secret and shared_info. shared_info is passed through to
+ * rsp_kdf_x963 exactly as given -- assembling it is the caller's job, not
+ * this function's. SGP.22 Annex G fixes its composition to: key type
+ * (1 byte) || key length (1 byte) || HostID as length-value || EID as
+ * length-value, the same data given as input to "ES8+.InitialiseSecureChannel".
+ * Returns 0 or -1. */
 int rsp_session_init(const uint8_t otsk_dp[32], const uint8_t otpk_euicc[65],
                       const uint8_t *shared_info, size_t shared_info_len,
                       rsp_session_t *out);
