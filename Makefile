@@ -138,7 +138,7 @@ INC     := -Iinclude -Isrc -I$(MBED)/include
 GEN_INC := -idirafter $(DIST)
 
 TESTS   := tests/run-link tests/run-codec tests/run-pki tests/run-kdf tests/run-zeroize \
-           tests/run-scp03t
+           tests/run-scp03t tests/run-bpp
 
 .PHONY: all check clean mbedtls codec
 
@@ -171,8 +171,13 @@ $(MBED_LIBS):
 
 mbedtls: $(MBED_LIBS)
 
-%.o: %.c $(MBED_LIBS)
-	$(CC) $(ALL_CFLAGS) -c $< -o $@
+
+# src/rsp_bpp.c reaches into the generated codec (BoundProfilePackage_t and
+# friends) directly, so every object -- not just the tests -- now needs
+# $(DIST)/.stamp built first and $(GEN_INC) on its command line. -idirafter,
+# not -I, for the same case-insensitive-Time.h reason the tests use it.
+%.o: %.c $(MBED_LIBS) $(DIST)/.stamp
+	$(CC) $(ALL_CFLAGS) $(GEN_INC) -c $< -o $@
 
 $(LIB): $(OBJS)
 	ar rcs $@ $(OBJS)

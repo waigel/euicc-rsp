@@ -120,4 +120,32 @@ long rsp_unprotect(rsp_session_t *s, const uint8_t *seg, size_t seg_len,
 int rsp_cmac(const uint8_t key[16], const uint8_t *msg, size_t len,
              uint8_t mac[16]);
 
+/* The Bound Profile Package (SGP.22 v2.6 section 2.5.4): the eUICC's
+ * one-time public key already agreed on, this assembles what
+ * InitialiseSecureChannel, ConfigureISDP and StoreMetadata need, plus the
+ * profile itself protected in tag-'86' segments (section 2.5.3), into the
+ * generated BoundProfilePackage_t and out to DER. upp is the Unprotected
+ * Profile Package -- the profile, DER, exactly as a profile compiler
+ * produces it. This library makes no assumption about the UPP's internal
+ * structure; section 2.5.3 itself treats it as "a unique block of data".
+ */
+typedef struct {
+    const uint8_t *upp;        /* the profile package, DER */
+    size_t         upp_len;
+    const uint8_t *otpk_dp;    /* our one-time public key, 65 bytes */
+    const uint8_t *iccid;      /* 10 bytes */
+    const char    *profile_name;
+    const char    *service_provider_name;
+} rsp_bpp_input_t;
+
+/* Build the BPP. *out is malloc'ed and belongs to the caller. The session is
+   advanced as segments are protected. Returns 0 or -1. */
+int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
+                  uint8_t **out, size_t *out_len);
+
+/* Recover the UPP from a BPP with the same session keys. This exists for the
+   self-check before sending and for the test below. Returns 0 or -1. */
+int rsp_bpp_recover(rsp_session_t *s, const uint8_t *bpp, size_t bpp_len,
+                    uint8_t **upp, size_t *upp_len);
+
 #endif /* RSP_H */
