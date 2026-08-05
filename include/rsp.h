@@ -81,4 +81,43 @@ int rsp_session_init(const uint8_t otsk_dp[32], const uint8_t otpk_euicc[65],
 /* Wipe a session's key material. Safe to call on a zeroed struct. */
 void rsp_session_wipe(rsp_session_t *s);
 
+/* SCP03t: the secure channel that protects each segment of a Bound Profile
+ * Package on its way to the eUICC. SGP.22 v2.6 section 2.5.3 states that
+ * "Command TLV encryption and MACing follows SGP.02 [2] section 4.1.3.3",
+ * which in turn says the mechanism is inherited from GlobalPlatform's SCP03
+ * (Amendment D to the GlobalPlatform Card Specification), restricted to the
+ * "MAC + encryption" security level, with the counter that normally drives
+ * the ICV replaced by the MAC chaining value (SGP.02 v4.1 section 4.1.3.3:
+ * "Otherwise the MAC chaining method SHALL be applied (i.e. the MAC
+ * chaining value of the previous command TLV SHALL be used)").
+ *
+ * A "segment" here is exactly one SCP03t tag-'86' data segment, as SGP.22
+ * section 2.5.3 names it ("Each data segment of the PPP is identified by
+ * the tag '86' as defined in SGP.02"). rsp_protect returns the segment's
+ * value bytes only (ciphertext, then the 8-byte C-MAC) -- the tag and its
+ * BER length octets are not written to *out*, because whoever assembles
+ * the BoundProfilePackage's [6] IMPLICIT OCTET STRING (Task 2's generated
+ * codec) reproduces them from the DER encoding rules; but per GlobalPlatform
+ * Amendment D section 6.2.4 / SGP.02 Figure 46, those bytes ARE part of what
+ * gets MACed, so rsp_protect and rsp_unprotect compute them internally
+ * (tag 0x86, DER-minimal-length of the ciphertext-plus-MAC) purely to feed
+ * the MAC input -- see src/rsp_crypto.c for the exact construction and its
+ * citations. */
+
+/* Protect one ES8+ command into one SCP03t segment. Advances s->chain.
+   Returns the number of bytes written to out, or -1. */
+long rsp_protect(rsp_session_t *s, const uint8_t *plain, size_t plain_len,
+                 uint8_t *out, size_t out_cap);
+
+/* The inverse, for the round trip and for the self-check before sending.
+   Advances s->chain the same way. Returns bytes written, or -1 when the MAC
+   does not match. */
+long rsp_unprotect(rsp_session_t *s, const uint8_t *seg, size_t seg_len,
+                   uint8_t *out, size_t out_cap);
+
+/* AES-CMAC over one block chain, exposed because it has published vectors
+ * and therefore deserves its own test. Returns 0 or -1. */
+int rsp_cmac(const uint8_t key[16], const uint8_t *msg, size_t len,
+             uint8_t mac[16]);
+
 #endif /* RSP_H */
