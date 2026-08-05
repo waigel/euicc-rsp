@@ -1,7 +1,7 @@
 /*
  * rsp_sign.c -- the ECDSA signatures that carry the handshake.
  *
- * SGP.22 v2.2 section 2.6.7.2 "ECDSA" states: "A signature based on ECDSA
+ * SGP.22 v2.6 section 2.6.7.2 "ECDSA" states: "A signature based on ECDSA
  * SHALL be computed as defined in GlobalPlatform Card Specification
  * Amendment E [12] ... with ... key length and HASH function recommended
  * above in section 2.6.5", and every SM-DP+/eUICC signature field in the
