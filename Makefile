@@ -31,9 +31,53 @@ LIB     := librsp.a
 
 MBED_LIBS := $(MBED)/library/libmbedx509.a $(MBED)/library/libmbedcrypto.a
 
-TESTS   := tests/run-link
+# The codec, generated from the RSP module. asn1c is a path, not a submodule:
+# euicc-schema already vendors one and euicc-tools passes it in. Standalone,
+# ASN1C defaults to whatever is on PATH.
+ASN1C    ?= asn1c
+SKELDIR  ?= $(shell dirname $$(command -v $(ASN1C)))/../share/asn1c
+RSP_ASN  := rsp-2.5.asn
+DIST     := dist
 
-.PHONY: all check clean mbedtls
+# RSPDefinitions imports Certificate, CertificateList, Time and
+# SubjectKeyIdentifier from the PKIX modules. asn1c does not ship them, and
+# this repository does not depend on the sibling that extracts them from the
+# RFC text (euicc-schema, via its asn1c submodule's rfc3280.txt + perl
+# script). Vendored here instead, generated once, so euicc-rsp stands alone.
+PKIX_DIR     := third_party/pkix
+PKIX_SOURCES := \
+	$(PKIX_DIR)/rfc3280-PKIX1Explicit88.asn1 \
+	$(PKIX_DIR)/rfc3280-PKIX1Implicit88.asn1
+
+$(DIST)/BoundProfilePackage.h: $(RSP_ASN) $(PKIX_SOURCES)
+	mkdir -p $(DIST)
+	$(ASN1C) -S $(SKELDIR) -pdu=auto -fcompound-names -D $(DIST) $(RSP_ASN) $(PKIX_SOURCES)
+
+# Generated code is compiled with warnings off. It is not ours to correct.
+# -idirafter, never -I: the PKIX types generate a Time.h that would hide the
+# system <time.h> on a case-insensitive filesystem (macOS's default HFS+/APFS
+# case-insensitive mode). -I. puts "." ahead of the system include path even
+# for angle-bracket includes, so <time.h> resolves to ./Time.h there instead
+# of the real header -- struct tm stays an incomplete forward declaration and
+# timegm() is undeclared. Quoted includes ("Foo.h") already search the
+# including file's own directory first regardless of -I/-idirafter, so local
+# headers still resolve correctly with -idirafter.
+# converter-example.c is asn1c's -pdu=auto sample front end. It needs -DPDU
+# and -DASN_PDU_COLLECTION to compile (see its own #error otherwise) and this
+# library has no use for a converter binary, so it is excluded here rather
+# than given defines it would never use.
+$(DIST)/.stamp: $(DIST)/BoundProfilePackage.h
+	cd $(DIST) && $(CC) $(STD) $(CFLAGS) $(EXTRA) -w -idirafter . -c $$(ls *.c | grep -v '^converter-example\.c$$')
+	@touch $@
+
+codec: $(DIST)/.stamp
+
+INC     := -Iinclude -Isrc -I$(MBED)/include
+GEN_INC := -idirafter $(DIST)
+
+TESTS   := tests/run-link tests/run-codec
+
+.PHONY: all check clean mbedtls codec
 
 all: $(LIB)
 
@@ -53,8 +97,8 @@ mbedtls: $(MBED_LIBS)
 $(LIB): $(OBJS)
 	ar rcs $@ $(OBJS)
 
-tests/run-%: tests/test_%.c $(LIB) $(MBED_LIBS)
-	$(CC) $(ALL_CFLAGS) $< $(LIB) $(MBED_LIBS) -o $@
+tests/run-%: tests/test_%.c $(LIB) $(MBED_LIBS) $(DIST)/.stamp
+	$(CC) $(ALL_CFLAGS) $(GEN_INC) $< $(LIB) $(DIST)/*.o $(MBED_LIBS) -o $@
 	@# On Darwin, a -g link auto-generates a companion run-%.dSYM directory.
 	@# tests/run-tests globs "run-*", so that bundle would be picked up and
 	@# "run" as if it were a test binary. Drop it: it is a build byproduct,
@@ -66,4 +110,5 @@ check: $(TESTS)
 
 clean:
 	rm -f $(OBJS) $(LIB) $(TESTS)
+	rm -rf $(DIST)
 	$(MAKE) -C $(MBED)/library clean 2>/dev/null || true
