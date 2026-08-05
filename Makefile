@@ -138,7 +138,7 @@ INC     := -Iinclude -Isrc -I$(MBED)/include
 GEN_INC := -idirafter $(DIST)
 
 TESTS   := tests/run-link tests/run-codec tests/run-pki tests/run-kdf tests/run-zeroize \
-           tests/run-scp03t tests/run-bpp
+           tests/run-scp03t tests/run-bpp tests/run-sign
 
 .PHONY: all check clean mbedtls codec
 

@@ -45,6 +45,37 @@ int rsp_pki_verify(const rsp_credential_t *c);
  * before freeing. Safe to call on a zeroed or already-freed struct. */
 void rsp_credential_free(rsp_credential_t *c);
 
+/* The handshake signatures (SGP.22 v2.6 section 2.6.7.2, "ECDSA" -- every
+ * SM-DP+/eUICC signature field, e.g. serverSignature1, smdpSignature2,
+ * euiccSignature1/2, smdpSign, is computed "as described in section
+ * 2.6.7.2"). That clause defers the exact computation to GlobalPlatform
+ * Card Specification v2.2 Amendment E, whose section 3.1.3 "ECDSA" states
+ * the signature is coded "in plain format ... the concatenation of the
+ * byte string representation of r and s", 64 bytes for P-256's 32-byte
+ * order -- not a DER SEQUENCE of two INTEGERs, which is how X.509
+ * (rsp_pki_verify's territory) encodes the same primitive. Amendment E's
+ * Table 3-3 pins SHA-256 as the hash for a 256-bit key. */
+
+/* Sign tbs (already the exact bytes to be hashed -- assembling the signed
+ * data object's concatenation, per whichever *Signed* structure applies,
+ * is the caller's job, not this function's) with c's private key.
+ * Returns 0, or -1 on failure. Every call produces a different sig for
+ * the same tbs: mbedtls_ecdsa_sign draws a fresh nonce each time. */
+int rsp_sign(const rsp_credential_t *c, const uint8_t *tbs, size_t tbs_len,
+             uint8_t sig[64]);
+
+/* Verify such a signature against the public key inside a certificate
+ * (DER, e.g. rsp_credential_t.der). Does not check the certificate's own
+ * chain of trust -- that is rsp_pki_verify's job, done separately, since
+ * a message can be signed and verified against a certificate this
+ * function has no way to know is untrusted. Returns 0 when the signature
+ * holds, -1 for anything else: an unparseable certificate, a non-EC key,
+ * or a signature that does not verify. Every path other than the single
+ * success returns -1; there is no way for a malformed input to read as
+ * accepted. */
+int rsp_verify(const uint8_t *cert_der, size_t cert_len,
+               const uint8_t *tbs, size_t tbs_len, const uint8_t sig[64]);
+
 /* The SCP03t session keys derived from the one-time key agreement between
  * the SM-DP+ and the eUICC (SGP.22 Annex G, "Key Derivation Process
  * (Normative)" -- section 2.6.4 introduces these three keys by name, but
