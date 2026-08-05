@@ -45,4 +45,32 @@ int rsp_pki_verify(const rsp_credential_t *c);
  * before freeing. Safe to call on a zeroed or already-freed struct. */
 void rsp_credential_free(rsp_credential_t *c);
 
+/* The SCP03t session keys derived from the one-time key agreement between
+ * the SM-DP+ and the eUICC (SGP.22 section 2.6.4). Secret: never printed,
+ * logged, or otherwise emitted. Wipe with rsp_session_wipe when done. */
+typedef struct {
+    uint8_t s_enc[16];
+    uint8_t s_mac[16];
+    uint8_t chain[16];   /* the MAC chaining value; rsp_protect advances it */
+} rsp_session_t;
+
+/* ECDH on P-256. pk is an uncompressed point, 65 bytes starting with 0x04.
+ * Writes the 32-byte x coordinate of the shared point. Returns 0 or -1. */
+int rsp_ecdh_p256(const uint8_t sk[32], const uint8_t pk[65], uint8_t z[32]);
+
+/* The X9.63 key derivation with SHA-256. Returns 0 or -1. */
+int rsp_kdf_x963(const uint8_t *z, size_t z_len,
+                  const uint8_t *info, size_t info_len,
+                  uint8_t *out, size_t out_len);
+
+/* Both together, filling a session: ECDH on (otsk_dp, otpk_euicc), then the
+ * X9.63 derivation of S-ENC, S-MAC and the initial chaining value from the
+ * shared secret and shared_info. Returns 0 or -1. */
+int rsp_session_init(const uint8_t otsk_dp[32], const uint8_t otpk_euicc[65],
+                      const uint8_t *shared_info, size_t shared_info_len,
+                      rsp_session_t *out);
+
+/* Wipe a session's key material. Safe to call on a zeroed struct. */
+void rsp_session_wipe(rsp_session_t *s);
+
 #endif /* RSP_H */

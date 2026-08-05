@@ -103,7 +103,7 @@ codec: $(DIST)/.stamp
 INC     := -Iinclude -Isrc -I$(MBED)/include
 GEN_INC := -idirafter $(DIST)
 
-TESTS   := tests/run-link tests/run-codec tests/run-pki
+TESTS   := tests/run-link tests/run-codec tests/run-pki tests/run-kdf
 
 .PHONY: all check clean mbedtls codec
 
