@@ -127,6 +127,13 @@ TESTS   := tests/run-link tests/run-codec tests/run-pki tests/run-kdf
 
 .PHONY: all check clean mbedtls codec
 
+# build/sgp26_material.c is the first target textually in this file, so
+# without this, GNU Make's default goal (what bare "make" builds) would be
+# that generated C file, not the library -- silently doing far less than
+# "make" is documented to do above. .DEFAULT_GOAL overrides the file-order
+# rule regardless of where "all" itself sits.
+.DEFAULT_GOAL := all
+
 all: $(LIB)
 
 # mbedTLS builds only the two libraries this needs. libmbedtls (the TLS
