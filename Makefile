@@ -35,6 +35,26 @@ LIB     := librsp.a
 
 MBED_LIBS := $(MBED)/library/libmbedx509.a $(MBED)/library/libmbedcrypto.a
 
+# mbedTLS commits five generated sources for this pinned tag, but its own
+# library/Makefile decides per file whether to trust that or regenerate.
+# Three of them (error.c, version_features.c, ssl_debug_helpers_generated.c)
+# use an order-only prerequisite on their generator, so they are only
+# rebuilt if actually missing -- safe, since we keep them. The PSA driver
+# wrapper pair does not: its rule depends plainly (mtime-checked) on
+# generate_driver_wrappers.py and two .jinja templates, so whenever those
+# LOOK newer -- which neither a fresh clone nor a copied tree can promise
+# one way or the other, since mtimes there are checkout-order artifacts,
+# not something either of those workflows sets deliberately -- make
+# demands a Python interpreter this project forbids, to regenerate a file
+# already correct and pinned. We do not patch the submodule for this: we
+# assert freshness ourselves before it gets a chance to decide otherwise.
+MBED_GENERATED := \
+	$(MBED)/library/error.c \
+	$(MBED)/library/version_features.c \
+	$(MBED)/library/ssl_debug_helpers_generated.c \
+	$(MBED)/library/psa_crypto_driver_wrappers.h \
+	$(MBED)/library/psa_crypto_driver_wrappers_no_static.c
+
 SGP26_DIR := testdata/sgp26
 SGP26_SRCS := \
 	$(SGP26_DIR)/ci.der \
@@ -115,6 +135,16 @@ $(MBED_LIBS):
 	@test -e $(MBED)/.git || { \
 	    echo "the submodule is missing: git submodule update --init --recursive" >&2; \
 	    exit 1; }
+	@for f in $(MBED_GENERATED); do \
+	    test -s "$$f" || { \
+	        echo "missing generated mbedTLS source: $$f" >&2; \
+	        echo "this build does not regenerate it (no interpreter is" >&2; \
+	        echo "allowed); check the submodule checkout instead of" >&2; \
+	        echo "touching it into existence" >&2; \
+	        exit 1; \
+	    }; \
+	done
+	@touch $(MBED_GENERATED)
 	$(MAKE) -C $(MBED)/library libmbedcrypto.a libmbedx509.a
 
 mbedtls: $(MBED_LIBS)
