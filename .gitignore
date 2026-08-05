@@ -3,3 +3,4 @@
 tests/run-*
 !tests/run-tests
 dist/
+build/

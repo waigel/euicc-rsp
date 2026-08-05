@@ -25,11 +25,39 @@ endif
 
 ALL_CFLAGS = $(STD) $(WARN) $(CFLAGS) $(EXTRA) $(INC) $(DEF)
 
-SRCS    := $(wildcard src/*.c)
+# build/sgp26_material.c embeds the published SGP.26 test material (see
+# testdata/sgp26/) as byte arrays, generated with xxd -i so the vendored
+# DER/PEM files stay the single source and no one hand-edits a C array.
+# Not committed, like dist/: the rule below regenerates it from testdata/.
+SRCS    := $(wildcard src/*.c) build/sgp26_material.c
 OBJS    := $(SRCS:.c=.o)
 LIB     := librsp.a
 
 MBED_LIBS := $(MBED)/library/libmbedx509.a $(MBED)/library/libmbedcrypto.a
+
+SGP26_DIR := testdata/sgp26
+SGP26_SRCS := \
+	$(SGP26_DIR)/ci.der \
+	$(SGP26_DIR)/dpauth.der $(SGP26_DIR)/dpauth-key.pem \
+	$(SGP26_DIR)/dppb.der $(SGP26_DIR)/dppb-key.pem
+
+# The DP secret keys are SEC1 PEM text, and mbedtls_pk_parse_key requires a
+# null-terminated buffer for PEM input with keylen == strlen(pem) + 1; xxd
+# -i alone emits exactly the file's bytes with no terminator, so a NUL is
+# appended before xxd sees it. The CI has no private key to embed -- SGP.26
+# publishes the CI certificate only, never withheld from redistribution.
+build/sgp26_material.c: $(SGP26_SRCS)
+	@mkdir -p build
+	@{ echo '/* Generated from testdata/sgp26. Do not edit. */'; \
+	   echo '#include <stddef.h>'; \
+	   xxd -i -n rsp_sgp26_ci_der          < $(SGP26_DIR)/ci.der; \
+	   xxd -i -n rsp_sgp26_dpauth_der      < $(SGP26_DIR)/dpauth.der; \
+	   { cat $(SGP26_DIR)/dpauth-key.pem; printf '\0'; } \
+	       | xxd -i -n rsp_sgp26_dpauth_key_pem; \
+	   xxd -i -n rsp_sgp26_dppb_der        < $(SGP26_DIR)/dppb.der; \
+	   { cat $(SGP26_DIR)/dppb-key.pem; printf '\0'; } \
+	       | xxd -i -n rsp_sgp26_dppb_key_pem; \
+	 } > $@
 
 # The codec, generated from the RSP module. asn1c is a path, not a submodule:
 # euicc-schema already vendors one and euicc-tools passes it in. Standalone,
@@ -75,7 +103,7 @@ codec: $(DIST)/.stamp
 INC     := -Iinclude -Isrc -I$(MBED)/include
 GEN_INC := -idirafter $(DIST)
 
-TESTS   := tests/run-link tests/run-codec
+TESTS   := tests/run-link tests/run-codec tests/run-pki
 
 .PHONY: all check clean mbedtls codec
 
@@ -110,5 +138,5 @@ check: $(TESTS)
 
 clean:
 	rm -f $(OBJS) $(LIB) $(TESTS)
-	rm -rf $(DIST)
+	rm -rf $(DIST) build
 	$(MAKE) -C $(MBED)/library clean 2>/dev/null || true

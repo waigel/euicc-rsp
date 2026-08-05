@@ -69,9 +69,13 @@ The code of this project, its Makefile and its documentation are under the
 
 ## Test material only
 
-The certificates and keys in this repository are the published GSMA SGP.26
-**test** material -- the ASN.1 module above is a format definition, not test
-material, and is unaffected by this note. The certificates and keys work on
-test eUICCs and nowhere else. A production eUICC rejects them, and a
-production profile must never be loaded with them. The private CI key is
-public by design, so nothing here is a secret and nothing here is safe.
+The certificates and keys in [`testdata/sgp26/`](testdata/sgp26/) are the
+published GSMA SGP.26 **test** material -- the ASN.1 module above is a
+format definition, not test material, and is unaffected by this note. They
+work on test eUICCs and nowhere else. A production eUICC rejects them, and
+a production profile must never be loaded with them. The DP certificates'
+private keys are part of the published material, redistributed here
+byte-identical from [osmocom/pysim](https://github.com/osmocom/pysim); the
+Certificate Issuer's private key is not published and is not in this
+repository -- see [`testdata/sgp26/README.md`](testdata/sgp26/README.md)
+for what each file is and where it came from.
