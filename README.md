@@ -5,6 +5,12 @@ for one eUICC. It is not a server: no HTTPS, no ES2+, no SM-DS, no activation
 code. [euicc-tools](https://github.com/waigel/euicc-tools) is the command
 that uses it.
 
+**No card accepts the BPP this library builds today.** `'87'`/`'88'` groups
+go in unprotected, `transactionId` is a fixed placeholder byte, `hostId` is
+the ICCID instead of the eUICC's EID, and `smdpSign` is empty -- see
+[`include/rsp.h`](include/rsp.h)'s comment on `rsp_bpp_input_t` for the full
+list and why each one is still open.
+
 | Repository | Role |
 | --- | --- |
 | [asn1c-vn](https://github.com/waigel/asn1c-vn) | the language |

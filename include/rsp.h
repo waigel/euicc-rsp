@@ -5,6 +5,11 @@
  * card and it opens no socket: the caller supplies what the card said, and
  * gets back what to send. That split is what makes the whole path testable
  * without hardware.
+ *
+ * No card accepts the BPP rsp_bpp_build produces yet: '87'/'88' groups are
+ * placed unprotected, transactionId is a fixed placeholder, hostId is the
+ * ICCID rather than the eUICC's EID, and smdpSign is empty. See the comment
+ * on rsp_bpp_input_t below for the full account of each gap.
  */
 #ifndef RSP_H
 #define RSP_H
