@@ -1,15 +1,25 @@
 #!/bin/sh
-# bin2c NAME < input > C source fragment
+# bin2c [-z] NAME < input > C source fragment
 #
 # Emits the same shape xxd -i produces --
-#   unsigned char NAME[] = { 0x.., 0x.., ... };
-#   unsigned int NAME_len = N;
+#   const unsigned char NAME[] = { 0x.., 0x.., ... };
+#   const unsigned int NAME_len = N;
 # -- from stdin, byte for byte, without xxd. od, wc, tr and sed are POSIX
 # and are on every runner and every minimal distribution this project
 # claims to build on; xxd is not -- ubuntu-latest's default image has no
 # xxd, since that comes from vim-common, which that image does not
 # install, and this project builds on a bare toolchain, not whatever a
-# runner happens to have installed for an unrelated reason.
+# runner happens to have installed for an unrelated reason. const: the
+# object this becomes is declared extern const at every use (src/rsp_pki.c)
+# -- an unqualified definition here is an incompatible type for the same
+# external object, and it lands 2.4 KB of certificate and key bytes in
+# writable .data instead of .rodata for no reason.
+#
+# -z appends one NUL byte after reading stdin, for PEM text a caller (see
+# the Makefile) needs null-terminated. Doing it here, on the file this
+# script already owns, means the Makefile never needs a *separate* command
+# whose output is fed onward through a pipe -- see the paragraph below on
+# why that shape is exactly what this script itself must not do.
 #
 # Every step below is its own standalone command, never a non-last stage
 # of a multi-process pipe: "set -e" only sees a pipeline's last exit
@@ -17,13 +27,30 @@
 # later stage still exits 0 on the empty input that leaves it, the
 # failure would pass unnoticed and this would silently emit a truncated
 # array under a still-correct _len -- exactly the confusing, wrong-later
-# failure this script exists to not have.
+# failure this script exists to not have. (A Makefile rule that piped its
+# own "cat somefile; printf '\0'" into this script from the outside would
+# reintroduce exactly that shape one level up, with this script none the
+# wiser -- which is why -z exists instead.)
 set -eu
 
+nul=
+if [ "$1" = "-z" ]; then
+    nul=1
+    shift
+fi
 name=$1
-tmp="${TMPDIR:-/tmp}/bin2c.$$"
+
+# mktemp, not a hand-built "${TMPDIR:-/tmp}/bin2c.$$" path: a predictable
+# name in a world-writable shared directory is exactly the shared-temp
+# symlink race a build-time script must not carry, and both GNU and BSD
+# mktemp (Linux and Darwin, the two platforms this project targets) create
+# the file atomically with no template argument needed.
+tmp=$(mktemp)
 trap 'rm -f "$tmp" "$tmp.od" "$tmp.tok"' EXIT
 cat > "$tmp"
+if [ -n "$nul" ]; then
+    printf '\0' >> "$tmp"
+fi
 
 len=$(wc -c < "$tmp")
 len=$(printf '%s' "$len" | tr -d '[:space:]')
@@ -31,7 +58,7 @@ len=$(printf '%s' "$len" | tr -d '[:space:]')
 od -An -v -t x1 "$tmp" > "$tmp.od"
 tr -s ' ' '\n' < "$tmp.od" > "$tmp.tok"
 
-printf 'unsigned char %s[] = {\n' "$name"
+printf 'const unsigned char %s[] = {\n' "$name"
 sed -e '/^$/d' -e 's/^/0x/' -e 's/$/,/' "$tmp.tok"
 printf '};\n'
-printf 'unsigned int %s_len = %s;\n' "$name" "$len"
+printf 'const unsigned int %s_len = %s;\n' "$name" "$len"

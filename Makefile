@@ -84,13 +84,11 @@ build/sgp26_material.c: $(SGP26_SRCS) $(BIN2C)
 	@mkdir -p build
 	@{ echo '/* Generated from testdata/sgp26. Do not edit. */'; \
 	   echo '#include <stddef.h>'; \
-	   $(BIN2C) rsp_sgp26_ci_der          < $(SGP26_DIR)/ci.der; \
-	   $(BIN2C) rsp_sgp26_dpauth_der      < $(SGP26_DIR)/dpauth.der; \
-	   { cat $(SGP26_DIR)/dpauth-key.pem; printf '\0'; } \
-	       | $(BIN2C) rsp_sgp26_dpauth_key_pem; \
-	   $(BIN2C) rsp_sgp26_dppb_der        < $(SGP26_DIR)/dppb.der; \
-	   { cat $(SGP26_DIR)/dppb-key.pem; printf '\0'; } \
-	       | $(BIN2C) rsp_sgp26_dppb_key_pem; \
+	   $(BIN2C) rsp_sgp26_ci_der          < $(SGP26_DIR)/ci.der && \
+	   $(BIN2C) rsp_sgp26_dpauth_der      < $(SGP26_DIR)/dpauth.der && \
+	   $(BIN2C) -z rsp_sgp26_dpauth_key_pem < $(SGP26_DIR)/dpauth-key.pem && \
+	   $(BIN2C) rsp_sgp26_dppb_der        < $(SGP26_DIR)/dppb.der && \
+	   $(BIN2C) -z rsp_sgp26_dppb_key_pem < $(SGP26_DIR)/dppb-key.pem; \
 	 } > $@
 
 # The codec, generated from the RSP module. asn1c is a path, not a submodule:
@@ -134,11 +132,13 @@ $(DIST)/.stamp: $(DIST)/BoundProfilePackage.h
 
 codec: $(DIST)/.stamp
 
-INC     := -Iinclude -Isrc -I$(MBED)/include
 GEN_INC := -idirafter $(DIST)
 
-TESTS   := tests/run-link tests/run-codec tests/run-pki tests/run-kdf tests/run-zeroize \
-           tests/run-scp03t tests/run-bpp tests/run-sign
+# Hand-maintained once, and a forgotten entry here used to mean "make check"
+# passed without ever running the new test -- a green suite that quietly
+# checked less than it claimed to. Derived from the test sources themselves
+# instead: adding tests/test_whatever.c is now sufficient on its own.
+TESTS   := $(patsubst tests/test_%.c,tests/run-%,$(wildcard tests/test_*.c))
 
 .PHONY: all check clean mbedtls codec
 
@@ -153,7 +153,19 @@ all: $(LIB)
 
 # mbedTLS builds only the two libraries this needs. libmbedtls (the TLS
 # stack) is never linked: there is no socket in this project.
-$(MBED_LIBS):
+#
+# $(MBED_LIBS) names two files built by one submake invocation below, and a
+# rule with multiple targets and one recipe is exactly the shape GNU Make
+# (without the 4.3+-only grouped-target "&:" syntax, which the Make Apple
+# ships on Darwin -- 3.81, for GPLv3 reasons -- does not have) is free to
+# treat as "run this recipe once per target that needs it": under "make -j"
+# with both .a files missing, that can mean two concurrent submakes racing
+# to write the same files, each also re-touching $(MBED_GENERATED). Routing
+# both targets through one stamp file makes the actual submake invocation a
+# single target again, so there is exactly one recipe instance to run no
+# matter how many of $(MBED_LIBS) triggered it.
+build/mbed.stamp:
+	@mkdir -p $(dir $@)
 	@test -e $(MBED)/.git || { \
 	    echo "the submodule is missing: git submodule update --init --recursive" >&2; \
 	    exit 1; }
@@ -168,6 +180,9 @@ $(MBED_LIBS):
 	done
 	@touch $(MBED_GENERATED)
 	$(MAKE) -C $(MBED)/library libmbedcrypto.a libmbedx509.a
+	@touch $@
+
+$(MBED_LIBS): build/mbed.stamp
 
 mbedtls: $(MBED_LIBS)
 
@@ -194,6 +209,18 @@ check: $(TESTS)
 	./tests/run-tests
 
 clean:
-	rm -f $(OBJS) $(LIB) $(TESTS)
+	rm -f $(OBJS) $(LIB)
+	@# Not "rm -f $(TESTS)": $(TESTS) is derived from the test sources that
+	@# exist right now, so a binary left over from a test that was since
+	@# renamed or deleted would not be in that list at all, would survive
+	@# "make clean", and tests/run-tests (which globs "run-*", not
+	@# $(TESTS)) would go on running and reporting it. Match run-tests'
+	@# own glob here instead, with the same "run-tests" exclusion it uses
+	@# on itself, so a clean tree and a stale binary cannot coexist.
+	@for f in tests/run-*; do \
+	    [ -e "$$f" ] || continue; \
+	    [ "$$(basename "$$f")" = "run-tests" ] && continue; \
+	    rm -f "$$f"; \
+	done
 	rm -rf $(DIST) build
 	$(MAKE) -C $(MBED)/library clean 2>/dev/null || true
