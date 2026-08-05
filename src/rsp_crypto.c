@@ -209,7 +209,11 @@ out:
     mbedtls_platform_zeroize(z, sizeof z);
     mbedtls_platform_zeroize(key_data, sizeof key_data);
     if (ret != 0) {
-        memset(out, 0, sizeof *out);
+        /* out is caller-visible: the same dead-store risk as the memset
+         * this replaces on rsp_session_wipe applies here too, since
+         * nothing forces a future caller to read *out again on this
+         * path before its own frame ends. */
+        mbedtls_platform_zeroize(out, sizeof *out);
     }
     return ret;
 }
@@ -219,7 +223,15 @@ void rsp_session_wipe(rsp_session_t *s)
     if (!s) {
         return;
     }
-    memset(s, 0, sizeof *s);
+    /* s is exactly the public-facing counterpart of the dead-store problem
+     * documented on rsp_session_init above: a plain memset on a struct the
+     * caller is about to stop using is a store the compiler can prove
+     * nothing reads again, and is free to drop -- provably so without
+     * LTO even, once this call is inlined into a caller whose own use of
+     * *s also ends here. mbedtls_platform_zeroize is written so that
+     * proof cannot go through; use it for the one function whose entire
+     * job is this wipe. */
+    mbedtls_platform_zeroize(s, sizeof *s);
 }
 
 /*

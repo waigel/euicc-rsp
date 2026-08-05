@@ -138,7 +138,15 @@ out:
     mbedtls_pk_free(&pk);
     if (ret != 0) {
         free(out->der);
-        memset(out, 0, sizeof *out);
+        /* out is caller-visible, so this failure-path clear has the same
+         * dead-store exposure as rsp_session_wipe's memset did (see
+         * src/rsp_crypto.c) -- a store the compiler can prove nothing
+         * reads again is free to drop. out->sk is not necessarily
+         * populated with real key material on every path that reaches
+         * here, but nothing about this call site can prove that, so it
+         * is wiped like any other secret-shaped buffer this library
+         * hands back. */
+        mbedtls_platform_zeroize(out, sizeof *out);
     }
     return ret;
 }
