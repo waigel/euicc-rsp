@@ -13,6 +13,7 @@
  * It works on test eUICCs and nowhere else.
  */
 #include "rsp.h"
+#include "rsp_internal.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -48,20 +49,6 @@ int rsp_pki_test_ci(const uint8_t **der, size_t *len)
     *der = rsp_sgp26_ci_der;
     *len = rsp_sgp26_ci_der_len;
     return 0;
-}
-
-/* mbedTLS's scalar multiplication takes an RNG for blinding against timing
- * attacks; it is not optional (f_rng must not be NULL). No key material is
- * generated with it here -- every scalar in this file already exists in
- * the published test material, this only re-derives a public point from a
- * known one so it can be compared. */
-static int rng_init(mbedtls_entropy_context *ent, mbedtls_ctr_drbg_context *drbg)
-{
-    static const unsigned char pers[] = "euicc-rsp/rsp_pki";
-    mbedtls_entropy_init(ent);
-    mbedtls_ctr_drbg_init(drbg);
-    return mbedtls_ctr_drbg_seed(drbg, mbedtls_entropy_func, ent,
-                                  pers, sizeof(pers) - 1);
 }
 
 int rsp_pki_dp(int role, rsp_credential_t *out)
@@ -111,7 +98,7 @@ int rsp_pki_dp(int role, rsp_credential_t *out)
          * already-published test key is loaded. */
         mbedtls_entropy_context ent;
         mbedtls_ctr_drbg_context drbg;
-        int rng_ok = rng_init(&ent, &drbg) == 0;
+        int rng_ok = rsp_rng_init(&ent, &drbg, "euicc-rsp/rsp_pki") == 0;
         int rc = rng_ok
             ? mbedtls_pk_parse_key(&pk, key_pem, key_len, NULL, 0,
                                     mbedtls_ctr_drbg_random, &drbg)
@@ -151,32 +138,6 @@ out:
     return ret;
 }
 
-/* Every SGP.22-profile certificate (Annex A) carries a critical
- * certificatePolicies extension naming a GSMA RSP role policy OID
- * (id-rspRole-*, arc 2.23.146.1.2.1). mbedTLS's built-in parser only
- * recognizes anyPolicy in that extension and refuses to parse a critical
- * extension it does not recognize, so a plain mbedtls_x509_crt_parse_der
- * fails on every certificate here with MBEDTLS_ERR_X509_FEATURE_UNAVAILABLE
- * -- not a corruption, just a policy OID mbedTLS was never taught. This
- * callback tells mbedtls_x509_crt_parse_der_with_ext_cb to accept that one
- * extension unconditionally. It does not weaken what rsp_pki_verify checks:
- * the actual chain-of-trust and signature verification below is unchanged,
- * and this credential's role is determined by which embedded array the
- * caller asked for in rsp_pki_dp, never by reading this OID's value. */
-static int accept_rsp_certificate_policies(void *p_ctx, mbedtls_x509_crt const *crt,
-                                            mbedtls_x509_buf const *oid, int is_critical,
-                                            const unsigned char *p, const unsigned char *end)
-{
-    (void)p_ctx;
-    (void)crt;
-    (void)p;
-    (void)end;
-    if (!is_critical) {
-        return 0;
-    }
-    return MBEDTLS_OID_CMP(MBEDTLS_OID_CERTIFICATE_POLICIES, oid) == 0 ? 0 : -1;
-}
-
 int rsp_pki_verify(const rsp_credential_t *c)
 {
     const uint8_t *ci_der;
@@ -196,15 +157,15 @@ int rsp_pki_verify(const rsp_credential_t *c)
 
     mbedtls_x509_crt_init(&ci);
     mbedtls_x509_crt_init(&leaf);
-    rng_ok = rng_init(&ent, &drbg) == 0;
+    rng_ok = rsp_rng_init(&ent, &drbg, "euicc-rsp/rsp_pki") == 0;
 
     if (mbedtls_x509_crt_parse_der_with_ext_cb(&ci, ci_der, ci_len, 1,
-                                                accept_rsp_certificate_policies,
+                                                rsp_accept_certificate_policies,
                                                 NULL) != 0) {
         goto out;
     }
     if (mbedtls_x509_crt_parse_der_with_ext_cb(&leaf, c->der, c->der_len, 1,
-                                                accept_rsp_certificate_policies,
+                                                rsp_accept_certificate_policies,
                                                 NULL) != 0) {
         goto out;
     }

@@ -16,6 +16,7 @@
  * L+1..2L are S-ENC, 2L+1..3L are S-MAC, with L = 16 for AES-128.
  */
 #include "rsp.h"
+#include "rsp_internal.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -30,20 +31,6 @@
 #include "mbedtls/entropy.h"
 #include "mbedtls/platform_util.h"
 #include "mbedtls/sha256.h"
-
-/* mbedTLS's scalar multiplication takes an RNG for blinding against timing
- * attacks. mbedtls_ecdh_compute_shared documents f_rng as "must not be
- * NULL" -- the same requirement Task 3 already ran into with
- * mbedtls_ecp_mul -- so a real RNG is seeded here too, even though the
- * scalar and point it multiplies are both already fixed by the caller. */
-static int rng_init(mbedtls_entropy_context *ent, mbedtls_ctr_drbg_context *drbg)
-{
-    static const unsigned char pers[] = "euicc-rsp/rsp_crypto";
-    mbedtls_entropy_init(ent);
-    mbedtls_ctr_drbg_init(drbg);
-    return mbedtls_ctr_drbg_seed(drbg, mbedtls_entropy_func, ent,
-                                  pers, sizeof(pers) - 1);
-}
 
 int rsp_ecdh_p256(const uint8_t sk[32], const uint8_t pk[65], uint8_t z[32])
 {
@@ -63,7 +50,13 @@ int rsp_ecdh_p256(const uint8_t sk[32], const uint8_t pk[65], uint8_t z[32])
     mbedtls_ecp_point_init(&q);
     mbedtls_mpi_init(&d);
     mbedtls_mpi_init(&shared);
-    rng_ok = rng_init(&ent, &drbg) == 0;
+    /* mbedTLS's scalar multiplication takes an RNG for blinding against
+     * timing attacks. mbedtls_ecdh_compute_shared documents f_rng as
+     * "must not be NULL" -- the same requirement src/rsp_pki.c already
+     * ran into with mbedtls_ecp_mul -- so a real RNG is seeded here too,
+     * even though the scalar and point it multiplies are both already
+     * fixed by the caller. */
+    rng_ok = rsp_rng_init(&ent, &drbg, "euicc-rsp/rsp_crypto") == 0;
 
     if (rng_ok &&
         mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1) == 0 &&
@@ -304,48 +297,30 @@ void rsp_session_wipe(rsp_session_t *s)
 #define RSP_SCP03T_TAG      0x86
 #define RSP_SCP03T_MAC_LEN  8
 
-/* BER/DER length octets for len, minimal encoding (no leading zero byte),
- * matching what any DER encoder (including Task 2's generated codec) would
- * emit for an OCTET STRING of that many bytes. Writes at most 3 bytes to
- * out (this project's segments never approach the 65536-byte boundary
- * where a fourth byte would be needed) and returns how many, or 0 if len
- * does not fit. */
-static size_t scp03t_length_octets(size_t len, uint8_t out[3])
-{
-    if (len < 0x80) {
-        out[0] = (uint8_t)len;
-        return 1;
-    }
-    if (len <= 0xFF) {
-        out[0] = 0x81;
-        out[1] = (uint8_t)len;
-        return 2;
-    }
-    if (len <= 0xFFFF) {
-        out[0] = 0x82;
-        out[1] = (uint8_t)(len >> 8);
-        out[2] = (uint8_t)len;
-        return 3;
-    }
-    return 0;
-}
-
 /* CMAC(S-MAC, chain || '86' || Lcc || ciphertext) -- rule 3 above. Always
  * produces the full 16-byte CMAC; the caller decides how much of it is
- * appended to the wire and how much becomes the next chaining value. */
+ * appended to the wire and how much becomes the next chaining value.
+ *
+ * Lcc -- the length octets the MAC covers -- comes from
+ * rsp_der_length_octets (src/rsp_internal.h), the same implementation
+ * src/rsp_bpp.c uses to write the length octets that actually go on the
+ * wire. See src/rsp_internal.h's own comment for why sharing that one
+ * implementation, rather than each file keeping its own copy of the DER
+ * length rule, is load-bearing here and not just tidiness: this is the
+ * length the MAC authenticates, and it must be computed exactly the way
+ * the wire bytes it is authenticating were computed. */
 static int scp03t_mac(const uint8_t s_mac[16], const uint8_t chain[16],
                        const uint8_t *ciphertext, size_t ciphertext_len,
                        uint8_t mac16[16])
 {
-    uint8_t len_octets[3];
+    uint8_t len_octets[RSP_DER_LEN_OCTETS_MAX];
     size_t len_octets_n;
     uint8_t *buf;
     size_t buf_len;
     int ret = -1;
 
-    len_octets_n = scp03t_length_octets(ciphertext_len + RSP_SCP03T_MAC_LEN,
-                                         len_octets);
-    if (len_octets_n == 0) {
+    if (rsp_der_length_octets(ciphertext_len + RSP_SCP03T_MAC_LEN,
+                               len_octets, &len_octets_n) != 0) {
         return -1;
     }
 

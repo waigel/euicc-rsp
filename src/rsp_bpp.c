@@ -116,6 +116,7 @@
  * with Task 2's generated types, as the brief asks.
  */
 #include "rsp.h"
+#include "rsp_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -236,64 +237,31 @@ static int der_encode_alloc(asn_TYPE_descriptor_t *td, const void *sptr,
     return 0;
 }
 
-/* Minimal DER length octets (no leading zero byte) -- the same rule
-   src/rsp_crypto.c uses for SCP03t's own length field, restated here
-   because that copy is private to that file, extended past that copy's
-   3-octet form to 4 (RSP_BPP_LEN_OCTETS_MAX below): a first review round
-   found the 3-octet cap (65535 bytes) refused any UPP whose sequenceOf86
-   content -- or the BoundProfilePackage's own outer content -- crossed
-   that boundary, measured at a 64527-byte UPP, well inside profiles that
-   carry applets. Nothing in SGP.22 imposes 65535 as a limit, and
-   ber_fetch_length (dist/ber_tlv_length.c) already decodes length forms
-   longer than 3 octets without complaint, so build was refusing packages
-   recover could read -- an asymmetry with no basis in the spec. The
-   4-octet form here caps at 0xFFFFFFFF bytes (4 GiB), past any UPP this
-   library will plausibly see; a UPP that size is refused here (see
-   RSP_BPP_LEN_OCTETS_MAX and its use in rsp_bpp_build), not silently
-   truncated. */
-#define RSP_BPP_LEN_OCTETS_MAX 5  /* 1 tag-of-length byte + up to 4 length bytes */
-static int der_len_octets(size_t len, uint8_t out[RSP_BPP_LEN_OCTETS_MAX],
-                           size_t *n)
-{
-    if (len < 0x80) {
-        out[0] = (uint8_t)len;
-        *n = 1;
-    } else if (len <= 0xFF) {
-        out[0] = 0x81;
-        out[1] = (uint8_t)len;
-        *n = 2;
-    } else if (len <= 0xFFFF) {
-        out[0] = 0x82;
-        out[1] = (uint8_t)(len >> 8);
-        out[2] = (uint8_t)len;
-        *n = 3;
-    } else if (len <= 0xFFFFFFUL) {
-        out[0] = 0x83;
-        out[1] = (uint8_t)(len >> 16);
-        out[2] = (uint8_t)(len >> 8);
-        out[3] = (uint8_t)len;
-        *n = 4;
-    } else if (len <= 0xFFFFFFFFUL) {
-        out[0] = 0x84;
-        out[1] = (uint8_t)(len >> 24);
-        out[2] = (uint8_t)(len >> 16);
-        out[3] = (uint8_t)(len >> 8);
-        out[4] = (uint8_t)len;
-        *n = 5;
-    } else {
-        return -1;
-    }
-    return 0;
-}
+/* rsp_der_length_octets (src/rsp_internal.h) is the DER length rule this
+   file used to carry its own copy of, extended to a 4-octet form (up to
+   0xFFFFFFFF bytes, RSP_DER_LEN_OCTETS_MAX total octets including the
+   leading tag-of-length byte): a first review round found the 3-octet
+   cap (65535 bytes) this file's own original copy had refused any UPP
+   whose sequenceOf86 content -- or the BoundProfilePackage's own outer
+   content -- crossed that boundary, measured at a 64527-byte UPP, well
+   inside profiles that carry applets. Nothing in SGP.22 imposes 65535 as
+   a limit, and ber_fetch_length (dist/ber_tlv_length.c) already decodes
+   length forms longer than 3 octets without complaint, so build was
+   refusing packages recover could read -- an asymmetry with no basis in
+   the spec. The shared implementation carries that same 4-octet form
+   (0xFFFFFFFF bytes, 4 GiB, past any UPP this library will plausibly
+   see) rather than this file quietly reverting to a narrower one of its
+   own; a UPP that size is refused here (see the checks in rsp_bpp_build
+   below), not silently truncated. */
 
 /* Append one TLV with a single-byte tag: tag, minimal DER length, content. */
 static int put_tlv(rsp_growbuf_t *g, uint8_t tag, const uint8_t *content,
                     size_t len)
 {
-    uint8_t lo[RSP_BPP_LEN_OCTETS_MAX];
+    uint8_t lo[RSP_DER_LEN_OCTETS_MAX];
     size_t n;
 
-    if (der_len_octets(len, lo, &n) != 0) {
+    if (rsp_der_length_octets(len, lo, &n) != 0) {
         return -1;
     }
     if (growbuf_append(g, &tag, 1) != 0) {
@@ -597,11 +565,11 @@ int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
        else in this file). */
     {
         rsp_growbuf_t g;
-        uint8_t lo[RSP_BPP_LEN_OCTETS_MAX];
+        uint8_t lo[RSP_DER_LEN_OCTETS_MAX];
         size_t n;
 
         memset(&g, 0, sizeof g);
-        if (der_len_octets(content.len, lo, &n) != 0) {
+        if (rsp_der_length_octets(content.len, lo, &n) != 0) {
             goto out;
         }
         {

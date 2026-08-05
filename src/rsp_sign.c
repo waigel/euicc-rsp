@@ -24,6 +24,7 @@
  * ran. There is exactly one place ret becomes 0.
  */
 #include "rsp.h"
+#include "rsp_internal.h"
 
 #include <string.h>
 
@@ -113,29 +114,6 @@ int rsp_sign(const rsp_credential_t *c, const uint8_t *tbs, size_t tbs_len,
     return ret;
 }
 
-/* Every certificate this project loads (see src/rsp_pki.c) carries a
- * critical certificatePolicies extension naming a GSMA RSP role policy
- * OID that mbedTLS's built-in parser does not recognize; a plain
- * mbedtls_x509_crt_parse_der refuses to look at the certificate at all.
- * This callback is the documented escape hatch, duplicated from
- * rsp_pki.c's accept_rsp_certificate_policies (static there, and this
- * file has no header to share it through) rather than reached into: it
- * accepts exactly that one critical extension and nothing else, so it
- * does not change what rsp_verify actually checks below. */
-static int accept_rsp_certificate_policies(void *p_ctx, mbedtls_x509_crt const *crt,
-                                            mbedtls_x509_buf const *oid, int is_critical,
-                                            const unsigned char *p, const unsigned char *end)
-{
-    (void)p_ctx;
-    (void)crt;
-    (void)p;
-    (void)end;
-    if (!is_critical) {
-        return 0;
-    }
-    return MBEDTLS_OID_CMP(MBEDTLS_OID_CERTIFICATE_POLICIES, oid) == 0 ? 0 : -1;
-}
-
 int rsp_verify(const uint8_t *cert_der, size_t cert_len,
                const uint8_t *tbs, size_t tbs_len, const uint8_t sig[64])
 {
@@ -160,7 +138,7 @@ int rsp_verify(const uint8_t *cert_der, size_t cert_len,
     mbedtls_mpi_init(&s);
 
     if (mbedtls_x509_crt_parse_der_with_ext_cb(&crt, cert_der, cert_len, 1,
-                                                accept_rsp_certificate_policies,
+                                                rsp_accept_certificate_policies,
                                                 NULL) != 0) {
         goto out;
     }
