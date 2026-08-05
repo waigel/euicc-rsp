@@ -1,0 +1,21 @@
+# Everything here runs without a card reader. That is the point of the first
+# half of this project: the crypto is provable on a plain runner.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: build and test
+        run: |
+          make
+          make check
