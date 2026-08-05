@@ -23,6 +23,7 @@
 #include "mbedtls/aes.h"
 #include "mbedtls/cipher.h"
 #include "mbedtls/cmac.h"
+#include "mbedtls/constant_time.h"
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/ecdh.h"
 #include "mbedtls/ecp.h"
@@ -411,11 +412,28 @@ long rsp_protect(rsp_session_t *s, const uint8_t *plain, size_t plain_len,
         return -1;
     }
 
+    /* Guard the two additions below (padding, then the MAC) before either
+     * can wrap. Without this, a plain_len near SIZE_MAX makes padded_len
+     * wrap to something small, which then passes the capacity check that
+     * follows and lets the memcpy a few lines down copy the full,
+     * enormous plain_len into a heap buffer sized for the wrapped value.
+     * Rule 1 never adds more than 16 bytes of padding, and at most
+     * RSP_SCP03T_MAC_LEN bytes of MAC follow that, so this is the most
+     * headroom either addition needs. */
+    if (plain_len > SIZE_MAX - 16 - RSP_SCP03T_MAC_LEN) {
+        return -1;
+    }
+
     /* Rule 1: always 1-16 bytes of padding, never zero. */
     pad_len = 16 - (plain_len % 16);
     padded_len = plain_len + pad_len;
 
-    if (padded_len > out_cap || padded_len + RSP_SCP03T_MAC_LEN > out_cap) {
+    /* padded_len + RSP_SCP03T_MAC_LEN > out_cap alone is sufficient:
+     * RSP_SCP03T_MAC_LEN is a positive constant, so padded_len > out_cap
+     * is already true whenever this is (adding a positive constant to
+     * padded_len only makes the left side larger), making that disjunct
+     * this check used to also test dead. One check is enough. */
+    if (padded_len + RSP_SCP03T_MAC_LEN > out_cap) {
         return -1;
     }
 
@@ -502,10 +520,18 @@ long rsp_unprotect(rsp_session_t *s, const uint8_t *seg, size_t seg_len,
 
     /* Verify the MAC before touching the padding at all: a tampered
      * segment must be refused, not decrypted and then found invalid.
-     * Fixed-length memcmp over the whole 8-byte MAC, not a hand-rolled
-     * loop that would return as soon as it saw the first mismatching
-     * byte. */
-    if (memcmp(mac16, seg + ciphertext_len, RSP_SCP03T_MAC_LEN) != 0) {
+     *
+     * mbedtls_ct_memcmp, not memcmp: plain memcmp is explicitly permitted
+     * by the C standard to be a chunked or vectorised comparison that
+     * returns as soon as it finds a mismatch, so the time it takes can
+     * leak how many leading bytes of the MAC matched -- a padding-oracle
+     * shaped side channel, just on the MAC instead of the padding.
+     * mbedtls_ct_memcmp (vendor/mbedtls/include/mbedtls/constant_time.h)
+     * is documented as constant-time with respect to whether its inputs
+     * are equal. Do not "simplify" this back to memcmp: rsp_unprotect is
+     * an exported entry point that a card's responses will eventually
+     * feed, not only this repository's own locally generated segments. */
+    if (mbedtls_ct_memcmp(mac16, seg + ciphertext_len, RSP_SCP03T_MAC_LEN) != 0) {
         goto out;
     }
 

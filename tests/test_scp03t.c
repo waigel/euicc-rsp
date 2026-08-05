@@ -3,6 +3,7 @@
    unprotect() must give back exactly what went in. That catches padding,
    segmentation and the chaining, which is where these implementations
    actually break. */
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include "rsp.h"
@@ -104,6 +105,44 @@ int main(void) {
                             clear of the trailing padding block (block 4) */
         ok("a segment tampered outside the padding block is refused"
            " (the MAC, not padding)",
+           rsp_unprotect(&s2, seg, (size_t)enc, back, sizeof back) < 0);
+    }
+
+    /* fix round 2, finding 2: an absurd plain_len must be rejected before
+       the padding-length arithmetic (plain_len + pad_len) can wrap
+       SIZE_MAX into something small enough to pass the capacity check,
+       which would then let the memcpy that follows overrun a heap buffer
+       sized for the wrapped value instead. plain does not, and must not,
+       actually hold this many bytes: rsp_protect has to reject the call
+       before it ever reads plain_len bytes from it, so a 1-byte buffer is
+       enough to prove no out-of-bounds read happens either. */
+    {
+        rsp_session_t s;
+        session(&s);
+        uint8_t one_byte[1] = { 0 };
+        uint8_t out[16];
+        ok("a plain_len near SIZE_MAX is rejected, not overflowed",
+           rsp_protect(&s, one_byte, SIZE_MAX - 1, out, sizeof out) < 0);
+    }
+
+    /* fix round 2, finding 1: rsp_unprotect now compares the MAC with
+       mbedtls_ct_memcmp instead of memcmp, so the comparison time does not
+       depend on how many leading bytes matched (see the comment at that
+       call site in src/rsp_crypto.c). A timing test to prove that directly
+       would be flaky and prove nothing in CI, so this does not attempt
+       one. What this proves instead: the comparison still covers the
+       *whole* 8-byte MAC, not just a prefix -- corrupting only the MAC's
+       last byte, leaving the ciphertext and the first 7 MAC bytes
+       untouched, must still be refused. */
+    {
+        uint8_t plain[16], seg[256], back[256];
+        memset(plain, 0x5A, sizeof plain);
+        rsp_session_t s1, s2;
+        session(&s1); session(&s2);
+        long enc = rsp_protect(&s1, plain, sizeof plain, seg, sizeof seg);
+        ok("a segment was produced for the MAC-last-byte case", enc > 0);
+        seg[enc - 1] ^= 0x01; /* only the MAC's last byte */
+        ok("a segment with only the MAC's last byte corrupted is refused",
            rsp_unprotect(&s2, seg, (size_t)enc, back, sizeof back) < 0);
     }
     return fails ? 1 : 0;
