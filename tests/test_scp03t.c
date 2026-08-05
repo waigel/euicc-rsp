@@ -125,6 +125,58 @@ int main(void) {
            rsp_protect(&s, one_byte, SIZE_MAX - 1, out, sizeof out) < 0);
     }
 
+    /* Absolute pin on the wire bytes. Every other check in this file is an
+       inversion (protect, then unprotect, then compare) or a MAC pinned in
+       isolation -- and an inversion cannot see an error that is symmetric
+       between rsp_protect and rsp_unprotect: swap the MAC input tag, take
+       the wire MAC from the wrong end of the CMAC, use a non-minimal DER
+       length in the MAC input, reverse the chaining value, or use the
+       chaining value itself as the ICV instead of AES-ECB(S-ENC, chain) --
+       and both sides of the round trip still agree with each other while
+       disagreeing with what a real eUICC expects on the wire. This is this
+       implementation's own measured output for two consecutive
+       rsp_protect calls -- reproduced independently before being written
+       here, not copied from anywhere -- and *not* a GSMA known-answer
+       test: no published SGP.22 vector for SCP03t's byte-level framing is
+       available to this repository. The card settles that in the second
+       half of the project. Two segments, not one: the chaining-value
+       mutation only shows up in the second segment, since the first
+       segment's chain is still the all-zero fixture value regardless. */
+    {
+        static const uint8_t want_seg1[40] = {
+            0xe6, 0x6d, 0x91, 0x52, 0x33, 0x0d, 0xaa, 0x4b,
+            0xb0, 0x07, 0xb7, 0x4c, 0xae, 0x9b, 0x9f, 0xc9,
+            0xf7, 0xfd, 0x7d, 0x3b, 0x94, 0x8c, 0x10, 0x2b,
+            0x8b, 0x8d, 0x50, 0xa6, 0xec, 0x2d, 0x63, 0x1c,
+            0x1d, 0xae, 0x9b, 0x60, 0x37, 0xa2, 0xdf, 0xf9
+        };
+        static const uint8_t want_seg2[40] = {
+            0x73, 0xa4, 0x96, 0x3a, 0x1a, 0x2f, 0xaf, 0x47,
+            0x93, 0xd7, 0x2c, 0x08, 0x8e, 0xe5, 0xba, 0xef,
+            0x0e, 0xb8, 0x38, 0x7a, 0xde, 0x65, 0x5f, 0x70,
+            0x19, 0x69, 0x2d, 0xf5, 0x11, 0x2d, 0x06, 0xce,
+            0x78, 0xe2, 0x4a, 0x78, 0x9b, 0x50, 0x9e, 0xb1
+        };
+        uint8_t plain[16], seg1[64], seg2[64];
+        memset(plain, 0x5A, sizeof plain);
+        rsp_session_t s;
+        session(&s);
+
+        long n1 = rsp_protect(&s, plain, sizeof plain, seg1, sizeof seg1);
+        long n2 = rsp_protect(&s, plain, sizeof plain, seg2, sizeof seg2);
+        ok("two segments were produced for the absolute wire pin",
+           n1 == (long)sizeof want_seg1 && n2 == (long)sizeof want_seg2);
+        ok("the first segment's wire bytes match this implementation's own"
+           " measured output (an absolute pin, not a round trip)",
+           n1 == (long)sizeof want_seg1 &&
+           memcmp(seg1, want_seg1, sizeof want_seg1) == 0);
+        ok("the second segment's wire bytes match this implementation's"
+           " own measured output (this is the one mutation 4, the reversed"
+           " chaining value, actually shows up in)",
+           n2 == (long)sizeof want_seg2 &&
+           memcmp(seg2, want_seg2, sizeof want_seg2) == 0);
+    }
+
     /* fix round 2, finding 1: rsp_unprotect now compares the MAC with
        mbedtls_ct_memcmp instead of memcmp, so the comparison time does not
        depend on how many leading bytes matched (see the comment at that
