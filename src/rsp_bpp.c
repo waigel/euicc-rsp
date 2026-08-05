@@ -443,6 +443,18 @@ int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
     if (!in->upp && in->upp_len) {
         return -1;
     }
+    /* An empty UPP would still produce a BPP (the do/while below writes
+     * exactly one, zero-length, segment for it -- see the comment there),
+     * but rsp_bpp_recover cannot tell that BPP apart from one whose
+     * sequenceOf86 has no segments at all without either misreporting
+     * the empty-UPP case or accepting a wire shape it must otherwise
+     * refuse (see rsp_bpp_recover and include/rsp.h's own note on
+     * *upp). Refusing the ambiguous input here, rather than trying to
+     * make recovery disambiguate it after the fact, is the cleaner fix:
+     * there is no real profile this UPP would ever legitimately be. */
+    if (in->upp_len == 0) {
+        return -1;
+    }
 
     memset(&content, 0, sizeof content);
     memset(&seq86, 0, sizeof seq86);

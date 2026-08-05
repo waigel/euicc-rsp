@@ -94,19 +94,48 @@ int main(void) {
     rsp_session_t s3; session(&s3); s3.s_enc[0] ^= 0xFF;
     uint8_t *other = NULL; size_t other_len = 0;
     rsp_session_t s4; session(&s4);
-    ok("a BPP under different keys is refused (rejected by padding, not the MAC -- see below)",
+    /* -1, not -2: rejected by the padding check, but the padding check
+       itself is only reached because the MAC (over the wrongly-decrypted
+       ciphertext, still computed with the right s_mac) verified -- a
+       real answer about this segment's content, per include/rsp.h's
+       failure convention, propagated through unchanged from
+       rsp_unprotect's own -1 for the same case. */
+    ok("a BPP under different keys is refused (rejected by padding, not"
+       " the MAC -- see below) with -1",
        rsp_bpp_build(&s3, &in, &other, &other_len) == 0
-       && rsp_bpp_recover(&s4, other, other_len, &back, &back_len) < 0);
+       && rsp_bpp_recover(&s4, other, other_len, &back, &back_len) == -1);
     free(other); other = NULL;
     free(back); back = NULL;
 
-    /* A BPP with an empty sequenceOf86 (no '86' elements at all -- not the
-       same as one segment that decrypts to zero bytes, which is the
-       legitimate empty-UPP case) must be refused, not treated as having
-       recovered an empty profile. Hand-built: BF36 09 { BF23 00  A0 00
-       A1 00  A3 00 } -- a minimal outer SEQUENCE holding empty
-       placeholder TLVs for initialiseSecureChannelRequest, firstSequenceOf87
-       and sequenceOf88, then sequenceOf86 with zero elements. Verified
+    /* rsp_bpp_build itself refuses upp_len == 0 (see src/rsp_bpp.c): an
+       empty UPP would otherwise still produce a BPP -- the do/while below
+       always writes at least one, zero-length, segment -- but that BPP is
+       byte-for-byte indistinguishable, on recovery, from one whose
+       sequenceOf86 has no segments at all, which rsp_bpp_recover must
+       refuse for the unrelated reason the next block tests. Refusing the
+       ambiguous input at build time, rather than trying to make recovery
+       disambiguate it afterwards, closes that off entirely. */
+    {
+        rsp_bpp_input_t empty_in = in;
+        empty_in.upp = NULL;
+        empty_in.upp_len = 0;
+        uint8_t *e_out = NULL; size_t e_out_len = 0;
+        rsp_session_t s0; session(&s0);
+        ok("rsp_bpp_build refuses an empty UPP outright",
+           rsp_bpp_build(&s0, &empty_in, &e_out, &e_out_len) < 0
+           && e_out == NULL);
+        free(e_out);
+    }
+
+    /* A BPP with an empty sequenceOf86 (no '86' elements at all) must be
+       refused, not treated as having recovered an empty profile. This is
+       no longer reachable through rsp_bpp_build (the check above refuses
+       an empty UPP before it ever gets this far), so this is a
+       hand-built input standing in for a BPP from anywhere else that
+       shares this shape. Hand-built: BF36 09 { BF23 00  A0 00 A1 00
+       A3 00 } -- a minimal outer SEQUENCE holding empty placeholder TLVs
+       for initialiseSecureChannelRequest, firstSequenceOf87 and
+       sequenceOf88, then sequenceOf86 with zero elements. Verified
        against an intentionally-reverted build that this exact input
        returns 0 with *upp == NULL if the "at least one segment" check is
        removed -- so this input is known to exercise that check, not some
@@ -121,9 +150,13 @@ int main(void) {
         };
         uint8_t *e_upp = NULL; size_t e_upp_len = 0;
         rsp_session_t s5; session(&s5);
-        ok("a BPP with no protected segments at all is refused, not treated as an empty recovery",
+        /* -2, not -1: no segment's MAC was ever checked here -- there are
+           no segments -- so this is "the question was never reached",
+           per include/rsp.h's failure convention, not a real MAC "no". */
+        ok("a BPP with no protected segments at all is refused, not treated"
+           " as an empty recovery, with -2",
            rsp_bpp_recover(&s5, empty_seq86, sizeof empty_seq86,
-                            &e_upp, &e_upp_len) < 0
+                            &e_upp, &e_upp_len) == -2
            && e_upp == NULL);
         free(e_upp);
     }
@@ -174,8 +207,13 @@ int main(void) {
            cannot be masked by an accidental padding-block hit the way a
            wrong s_enc can. This is deterministic, not a ~1/255 chance. */
         rsp_session_t ms3; session(&ms3); ms3.s_mac[0] ^= 0xFF;
-        ok("a BPP recovered with the wrong MAC key is refused by the MAC itself",
-           rsp_bpp_recover(&ms3, mbpp, mbpp_len, &mback, &mback_len) < 0
+        /* -1, not -2: the question was actually asked (rsp_unprotect ran
+           the comparison) and the answer is a real no, per
+           include/rsp.h's failure convention -- propagated through from
+           rsp_unprotect's own -1 for exactly this case. */
+        ok("a BPP recovered with the wrong MAC key is refused by the MAC"
+           " itself, with -1",
+           rsp_bpp_recover(&ms3, mbpp, mbpp_len, &mback, &mback_len) == -1
            && mback == NULL);
 
         free(mbpp);

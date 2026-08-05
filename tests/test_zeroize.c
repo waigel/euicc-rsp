@@ -48,19 +48,35 @@ static size_t hexline(FILE *f, uint8_t *out, size_t cap) {
    something the caller's own frame could be folded into. */
 #define WINDOW 8192
 
+/* Copies that window into a heap buffer and scans the copy, rather than
+   scanning the stack memory directly: window used to be a same-size
+   array in this function's own frame, at [fp - WINDOW, fp) -- exactly
+   the range being read -- so the copy's source and destination
+   overlapped (this frame's own locals, including window, live inside
+   that range). memcpy's behaviour on overlapping regions is undefined,
+   and it is not merely academic here: ASan's memcpy-param-overlap check
+   catches it and aborts, which means this test could not be run under a
+   sanitizer at all. A heap buffer for the destination has no address in
+   common with the stack range being read, so the copy is no longer
+   overlapping while the property under test -- what is actually sitting
+   in the stack memory below this frame -- is unchanged. */
 static int __attribute__((noinline)) count_in_window(const uint8_t *needle, size_t needle_len)
 {
-    uint8_t window[WINDOW];
+    uint8_t *window = malloc(WINDOW);
     uint8_t *fp = (uint8_t *)__builtin_frame_address(0);
     int n = 0;
     size_t i;
 
+    if (!window) {
+        return -1;
+    }
     memcpy(window, fp - WINDOW, WINDOW);
     for (i = 0; i + needle_len <= WINDOW; i++) {
         if (memcmp(window + i, needle, needle_len) == 0) {
             n++;
         }
     }
+    free(window);
     return n;
 }
 

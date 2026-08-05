@@ -20,6 +20,11 @@ them; never load a production profile with them.
 
 Both DP certificates are issued by, and chain to, `ci.der`.
 
+Both DP certificates expire on 30 March 2030 (`ci.der` itself is valid
+until 2055); from that date on, `rsp_pki_verify` will start failing on
+`dpauth.der`/`dppb.der` for that reason, not because anything in this
+library broke -- replace them with a current SGP.26 test issuance.
+
 ## Provenance
 
 Fetched byte-identical from the
