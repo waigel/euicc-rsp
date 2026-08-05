@@ -145,14 +145,21 @@ int rsp_pki_verify(const rsp_credential_t *c)
     mbedtls_x509_crt ci, leaf;
     mbedtls_entropy_context ent;
     mbedtls_ctr_drbg_context drbg;
-    int ret = -1;
+    /* -2 by default: every failure up to and including the chain-of-trust
+     * check is "the question was never reached" -- a malformed
+     * credential, an unparseable certificate, an RNG that would not seed
+     * -- see include/rsp.h's failure convention. mbedtls_x509_crt_verify
+     * rejecting the chain and the sk/public-key mismatch check below are
+     * the two places this project actually asked the question and got a
+     * real "no"; each sets ret to -1 explicitly. */
+    int ret = -2;
     int rng_ok;
 
     if (!c || !c->der || c->der_len == 0) {
-        return -1;
+        return -2;
     }
     if (rsp_pki_test_ci(&ci_der, &ci_len) != 0) {
-        return -1;
+        return -2;
     }
 
     mbedtls_x509_crt_init(&ci);
@@ -173,6 +180,7 @@ int rsp_pki_verify(const rsp_credential_t *c)
     {
         uint32_t flags = 0;
         if (mbedtls_x509_crt_verify(&leaf, &ci, NULL, NULL, &flags, NULL, NULL) != 0) {
+            ret = -1; /* the question was asked: this does not chain to the test CI */
             goto out;
         }
     }
@@ -223,6 +231,7 @@ int rsp_pki_verify(const rsp_credential_t *c)
         mbedtls_mpi_free(&d);
 
         if (!match) {
+            ret = -1; /* the question was asked: c->sk does not match this certificate */
             goto out;
         }
     }

@@ -17,6 +17,28 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Failure convention, for every function declared below.
+ *
+ * 0 always means success. Most functions here have exactly one way to
+ * fail -- a null argument, an allocation that did not happen, a crypto
+ * primitive that refused its input -- and for those, plain -1 covers it;
+ * there is nothing a caller could usefully tell apart.
+ *
+ * Four functions are different: their entire job is answering a
+ * cryptographic yes/no question (does this verify? does this MAC match?),
+ * and each of them used to return the same -1 both when the answer was a
+ * real "no" and when the question was never actually reached at all --
+ * indistinguishable to a caller, even though the two cases call for
+ * different responses (retry/report-and-stop, versus reject-and-move-on).
+ * This mirrors the exit-code contract the CLI built on top of this
+ * library needs one level up (0 done, 1 a real negative answer, 2 could
+ * not answer): for rsp_pki_verify, rsp_verify, rsp_unprotect and
+ * rsp_bpp_recover, -1 means the question was asked and the answer is no
+ * -- a signature that does not verify, a certificate that does not chain,
+ * a MAC that does not match. -2 means the question was never reached --
+ * a malformed input, a buffer too small, an allocation or RNG failure.
+ * Each of the four says so again at its own declaration below. */
+
 /* The library version, for a bug report. */
 const char *rsp_version(void);
 
@@ -43,7 +65,11 @@ int rsp_pki_dp(int role, rsp_credential_t *out);
 
 /* Verify that c's certificate chains to the test CI from rsp_pki_test_ci,
  * and that the certificate's public key is the one belonging to c->sk.
- * Returns 0 if both hold, or -1 otherwise. */
+ * Returns 0 if both hold. -1 means the question was actually asked and the
+ * answer is no: the certificate does not chain to the test CI, or c->sk
+ * does not match the certificate's public key. -2 means the question was
+ * never reached: a null or empty c->der, a certificate that will not
+ * parse, an RNG failure, or a non-EC key. */
 int rsp_pki_verify(const rsp_credential_t *c);
 
 /* Release a credential obtained from rsp_pki_dp. Wipes the private scalar
@@ -74,10 +100,11 @@ int rsp_sign(const rsp_credential_t *c, const uint8_t *tbs, size_t tbs_len,
  * chain of trust -- that is rsp_pki_verify's job, done separately, since
  * a message can be signed and verified against a certificate this
  * function has no way to know is untrusted. Returns 0 when the signature
- * holds, -1 for anything else: an unparseable certificate, a non-EC key,
- * or a signature that does not verify. Every path other than the single
- * success returns -1; there is no way for a malformed input to read as
- * accepted. */
+ * holds. -1 means the question was actually asked and the answer is no:
+ * mbedtls_ecdsa_verify rejected the signature. -2 means the question was
+ * never reached: an unparseable certificate, a non-EC key, or a null/empty
+ * argument. Every path other than the single success returns a negative
+ * value; there is no way for a malformed input to read as accepted. */
 int rsp_verify(const uint8_t *cert_der, size_t cert_len,
                const uint8_t *tbs, size_t tbs_len, const uint8_t sig[64]);
 
@@ -146,8 +173,14 @@ long rsp_protect(rsp_session_t *s, const uint8_t *plain, size_t plain_len,
                  uint8_t *out, size_t out_cap);
 
 /* The inverse, for the round trip and for the self-check before sending.
-   Advances s->chain the same way. Returns bytes written, or -1 when the MAC
-   does not match. */
+   Advances s->chain the same way. Returns bytes written on success. -1
+   means the question was actually asked and the answer is no: the MAC
+   does not match, or the decrypted padding is not valid SCP03t padding
+   (which only happens once the MAC has already matched, so this is still
+   a real answer about the segment's content, not an operational failure).
+   -2 means the question was never reached: a null argument, a seg_len
+   that cannot hold a valid segment, out_cap too small for the recovered
+   plaintext, or an allocation/crypto-primitive failure. */
 long rsp_unprotect(rsp_session_t *s, const uint8_t *seg, size_t seg_len,
                    uint8_t *out, size_t out_cap);
 
@@ -221,7 +254,13 @@ int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
                   uint8_t **out, size_t *out_len);
 
 /* Recover the UPP from a BPP with the same session keys. This exists for the
-   self-check before sending and for the test below. Returns 0 or -1.
+   self-check before sending and for the test below. Returns 0 on success.
+   -1 means the question was actually asked and the answer is no: some
+   segment's MAC did not match under these session keys (rsp_unprotect
+   returned -1 for it). -2 means the question was never reached: a null
+   argument, a malformed envelope (a bad tag, a truncated TLV, a
+   sequenceOf86 with no segments at all), an allocation failure, or
+   rsp_unprotect itself returning -2 for some segment.
 
    *upp is malloc'ed and belongs to the caller on success; it is the
    profile in the clear, so it carries whatever the profile itself
@@ -243,8 +282,8 @@ int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
    after the segments that verified before the failing one -- advanced,
    not rolled back -- the same way rsp_bpp_build leaves s->chain advanced
    through whatever it managed to protect before a later failure. Do not
-   reuse a session after either function returns -1; treat it as
-   consumed. */
+   reuse a session after either function returns a negative value (-1 or
+   -2); treat it as consumed. */
 int rsp_bpp_recover(rsp_session_t *s, const uint8_t *bpp, size_t bpp_len,
                     uint8_t **upp, size_t *upp_len);
 

@@ -122,13 +122,19 @@ int rsp_verify(const uint8_t *cert_der, size_t cert_len,
     mbedtls_ecp_group grp;
     mbedtls_ecp_point q;
     mbedtls_mpi r, s;
-    int ret = -1;
+    /* -2 by default: every failure up to and including the ecdsa_verify
+     * call itself means the signature was never actually checked (a
+     * malformed certificate, a non-EC key, an unreadable signature
+     * encoding) -- see include/rsp.h's failure convention. Only
+     * mbedtls_ecdsa_verify rejecting the signature is a real "no", and
+     * that one site sets ret to -1 explicitly, below. */
+    int ret = -2;
 
     if (!cert_der || cert_len == 0 || !sig || (!tbs && tbs_len != 0)) {
-        return -1;
+        return -2;
     }
     if (mbedtls_sha256(tbs, tbs_len, hash, 0) != 0) {
-        return -1;
+        return -2;
     }
 
     mbedtls_x509_crt_init(&crt);
@@ -153,6 +159,7 @@ int rsp_verify(const uint8_t *cert_der, size_t cert_len,
         goto out;
     }
     if (mbedtls_ecdsa_verify(&grp, hash, sizeof hash, &q, &r, &s) != 0) {
+        ret = -1; /* the question was asked: this signature does not verify */
         goto out;
     }
 

@@ -603,10 +603,17 @@ int rsp_bpp_recover(rsp_session_t *s, const uint8_t *bpp, size_t bpp_len,
     size_t content_len;
     size_t pos;
     rsp_growbuf_t g;
-    int ret = -1;
+    /* -2 by default: everything below other than a segment's MAC actually
+     * failing is "the question was never reached" -- a malformed
+     * envelope, a bad tag, a truncated TLV, an empty sequenceOf86, an
+     * allocation failure -- see include/rsp.h's failure convention. The
+     * one place this function asks a real yes/no question is inside the
+     * segment loop, and there ret is set from rsp_unprotect's own answer
+     * rather than left at this default. */
+    int ret = -2;
 
     if (!s || !bpp || !upp || !upp_len) {
-        return -1;
+        return -2;
     }
     memset(&g, 0, sizeof g);
 
@@ -726,6 +733,13 @@ int rsp_bpp_recover(rsp_session_t *s, const uint8_t *bpp, size_t bpp_len,
             }
             un = rsp_unprotect(s, ev, evlen, plain, evlen);
             if (un < 0) {
+                /* Propagate rsp_unprotect's own answer rather than
+                 * collapsing it: un == -1 means this segment's MAC did
+                 * not match under these session keys, a real "no" this
+                 * function's caller needs to see as -1 too; anything
+                 * else (un == -2) means rsp_unprotect itself never
+                 * reached that question, which stays -2 here as well. */
+                ret = (un == -1) ? -1 : -2;
                 mbedtls_platform_zeroize(plain, evlen);
                 free(plain);
                 goto out;

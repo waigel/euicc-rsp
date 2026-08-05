@@ -76,9 +76,17 @@ int main(void) {
         long enc = rsp_protect(&s1, plain, sizeof plain, seg, sizeof seg);
         ok("a segment was produced", enc > 0);
         seg[enc / 2] ^= 0x01;
+        /* -1, not just negative, either way: the MAC covers this
+           ciphertext byte too, so in the shipped code (MAC checked before
+           any decryption is attempted) this is rejected by the MAC
+           mismatch itself; the comment above is about a counterfactual
+           ablation (MAC checking disabled) that established padding
+           validation would *also* catch it on its own. Whichever check
+           actually trips, include/rsp.h's failure convention calls it a
+           real "no" about this segment's content: -1, not -2. */
         ok("a segment tampered inside the padding block is refused"
-           " (padding validation, not the MAC)",
-           rsp_unprotect(&s2, seg, (size_t)enc, back, sizeof back) < 0);
+           " (padding validation, not the MAC) with -1, a real no",
+           rsp_unprotect(&s2, seg, (size_t)enc, back, sizeof back) == -1);
     }
 
     /* The MAC-only case. This plaintext is four AES blocks of real data,
@@ -104,8 +112,8 @@ int main(void) {
         seg[0] ^= 0x01; /* first ciphertext byte: block 0, four blocks
                             clear of the trailing padding block (block 4) */
         ok("a segment tampered outside the padding block is refused"
-           " (the MAC, not padding)",
-           rsp_unprotect(&s2, seg, (size_t)enc, back, sizeof back) < 0);
+           " (the MAC, not padding) with -1, a real no",
+           rsp_unprotect(&s2, seg, (size_t)enc, back, sizeof back) == -1);
     }
 
     /* fix round 2, finding 2: an absurd plain_len must be rejected before
@@ -194,8 +202,23 @@ int main(void) {
         long enc = rsp_protect(&s1, plain, sizeof plain, seg, sizeof seg);
         ok("a segment was produced for the MAC-last-byte case", enc > 0);
         seg[enc - 1] ^= 0x01; /* only the MAC's last byte */
-        ok("a segment with only the MAC's last byte corrupted is refused",
-           rsp_unprotect(&s2, seg, (size_t)enc, back, sizeof back) < 0);
+        ok("a segment with only the MAC's last byte corrupted is refused"
+           " with -1, a real no",
+           rsp_unprotect(&s2, seg, (size_t)enc, back, sizeof back) == -1);
+    }
+
+    /* -2, not -1: seg_len too small to even hold a MAC is a malformed
+       input, not a case where the MAC was checked and found wanting --
+       the question of whether this segment's MAC matches is never
+       actually reached. */
+    {
+        rsp_session_t s;
+        session(&s);
+        uint8_t seg[4] = { 0, 1, 2, 3 };
+        uint8_t back[16];
+        ok("a segment too short to hold a MAC answers -2, not -1"
+           " (include/rsp.h's failure convention)",
+           rsp_unprotect(&s, seg, sizeof seg, back, sizeof back) == -2);
     }
     return fails ? 1 : 0;
 }

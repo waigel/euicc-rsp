@@ -487,16 +487,23 @@ long rsp_unprotect(rsp_session_t *s, const uint8_t *seg, size_t seg_len,
     uint8_t icv[16];
     uint8_t *padded = NULL;
     size_t pad_idx, min_idx;
-    long ret = -1;
+    /* -2 by default: everything up to and including a successful MAC
+     * check and a successful decrypt is "the question was never
+     * reached" -- a malformed seg_len, an allocation failure, a crypto
+     * primitive refusing its input, a caller buffer too small -- see
+     * include/rsp.h's failure convention. The MAC mismatch and the
+     * invalid-padding checks below are the two places this segment's
+     * validity is actually decided, and each sets ret to -1 explicitly. */
+    long ret = -2;
 
     if (!s || !seg || !out) {
-        return -1;
+        return -2;
     }
     /* At least one full ciphertext block plus the 8-byte MAC, and the
      * ciphertext portion must be a whole number of AES blocks. */
     if (seg_len < 16 + RSP_SCP03T_MAC_LEN ||
         (seg_len - RSP_SCP03T_MAC_LEN) % 16 != 0) {
-        return -1;
+        return -2;
     }
     ciphertext = seg;
     ciphertext_len = seg_len - RSP_SCP03T_MAC_LEN;
@@ -519,6 +526,7 @@ long rsp_unprotect(rsp_session_t *s, const uint8_t *seg, size_t seg_len,
      * an exported entry point that a card's responses will eventually
      * feed, not only this repository's own locally generated segments. */
     if (mbedtls_ct_memcmp(mac16, seg + ciphertext_len, RSP_SCP03T_MAC_LEN) != 0) {
+        ret = -1; /* the question was asked: this segment's MAC does not match */
         goto out;
     }
 
@@ -555,11 +563,18 @@ long rsp_unprotect(rsp_session_t *s, const uint8_t *seg, size_t seg_len,
         pad_idx--;
     }
     if (pad_idx == min_idx || padded[pad_idx - 1] != 0x80) {
+        /* The MAC already matched, so this is still a real answer about
+         * the segment's content -- not an operational failure -- even
+         * though it is only reachable at all because something upstream
+         * (a different, MAC-consistent key derivation, say) is wrong. */
+        ret = -1;
         goto out;
     }
     pad_idx--; /* now the length of the plaintext that was protected */
 
     if (pad_idx > out_cap) {
+        /* -2, not -1: the segment itself is fine, the caller's buffer is
+         * just too small to receive it -- the question was never reached. */
         goto out;
     }
     if (pad_idx) {

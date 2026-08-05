@@ -71,5 +71,35 @@ int main(void) {
         ok("an unknown role is rejected", rsp_pki_dp(2, &unused) == -1);
     }
 
+    ok("a null credential answers -2: the chain/key question was never"
+       " reached, not answered no (include/rsp.h's failure convention)",
+       rsp_pki_verify(NULL) == -2);
+
+    /* DPauth's certificate combined with DPpb's secret key: the
+       certificate itself is real and chains fine (it is unmodified), so
+       this fails specifically at the "does c->sk match this
+       certificate's public key" check -- a real -1 answer, not a -2
+       parse/chain failure, and a deterministic one (unlike corrupting a
+       byte above, which can land on either failure mode depending on
+       which byte). */
+    {
+        rsp_credential_t dpauth, dppb, mismatched;
+        memset(&dpauth, 0, sizeof dpauth);
+        memset(&dppb, 0, sizeof dppb);
+        ok("DPauth loads, for the deterministic key-mismatch case",
+           rsp_pki_dp(0, &dpauth) == 0);
+        ok("DPpb loads, for the deterministic key-mismatch case",
+           rsp_pki_dp(1, &dppb) == 0);
+
+        mismatched = dpauth;
+        memcpy(mismatched.sk, dppb.sk, sizeof mismatched.sk);
+        ok("DPauth's certificate with DPpb's key answers -1: chains fine,"
+           " key does not match (a real no, not a parse failure)",
+           rsp_pki_verify(&mismatched) == -1);
+
+        rsp_credential_free(&dpauth);
+        rsp_credential_free(&dppb);
+    }
+
     return fails ? 1 : 0;
 }

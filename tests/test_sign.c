@@ -141,18 +141,27 @@ int main(void) {
     ok("signing succeeds", rsp_sign(&dp, msg, sizeof msg - 1, sig) == 0);
     ok("the signature verifies with the matching certificate",
        rsp_verify(dp.der, dp.der_len, msg, sizeof msg - 1, sig) == 0);
-    ok("it does not verify with another certificate",
-       rsp_verify(card.der, card.der_len, msg, sizeof msg - 1, sig) != 0);
+    /* -1, not just nonzero: card.der parses fine (it is DPpb's real,
+       well-formed certificate) and the only reason this fails is that
+       mbedtls_ecdsa_verify actually rejects the signature -- the
+       "question was asked, answer is no" case include/rsp.h's failure
+       convention calls -1, distinct from -2's "never got to ask". */
+    ok("it does not verify with another certificate (a real no, not a"
+       " parse failure -- see include/rsp.h's failure convention)",
+       rsp_verify(card.der, card.der_len, msg, sizeof msg - 1, sig) == -1);
+    ok("an unparseable certificate answers -2, not -1: the question of"
+       " whether the signature verifies was never actually reached",
+       rsp_verify(NULL, 0, msg, sizeof msg - 1, sig) == -2);
 
     uint8_t bad[sizeof msg - 1];
     memcpy(bad, msg, sizeof bad);
     bad[0] ^= 0x01;
-    ok("a tampered message does not verify",
-       rsp_verify(dp.der, dp.der_len, bad, sizeof bad, sig) != 0);
+    ok("a tampered message does not verify (-1: a real no)",
+       rsp_verify(dp.der, dp.der_len, bad, sizeof bad, sig) == -1);
 
     sig[0] ^= 0x01;
-    ok("a tampered signature does not verify",
-       rsp_verify(dp.der, dp.der_len, msg, sizeof msg - 1, sig) != 0);
+    ok("a tampered signature does not verify (-1: a real no)",
+       rsp_verify(dp.der, dp.der_len, msg, sizeof msg - 1, sig) == -1);
 
     /* ECDSA is randomised: two signatures over the same message differ, and
        both must verify. An implementation that returns a constant passes
