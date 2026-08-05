@@ -54,7 +54,19 @@ int main(void) {
                  && memcmp(s1.chain, (uint8_t[16]){0}, 16) != 0);
     }
 
-    /* A tampered segment must be refused, not silently decrypted. */
+    /* This plaintext is exactly two AES blocks, so after padding the
+       segment is three ciphertext blocks and the whole third block is
+       padding (an '80' byte then 15 zero bytes). Flipping a bit in the
+       middle of the segment lands inside the *second* ciphertext block;
+       under CBC decryption, corrupting ciphertext block C_i derandomizes
+       plaintext block P_i completely but changes P_{i+1} = Decrypt(C_{i+1})
+       XOR C_i by exactly one predictable bit -- so this bit-flip turns one
+       '00' padding byte into '01', and padding validation rejects it on
+       its own, before the MAC comparison even runs. This test proves
+       rsp_unprotect's padding check works. It does NOT exercise the MAC:
+       see the next test for that, and see "fix round 1" in
+       task-5-report.md for how this was confirmed (by disabling the MAC
+       comparison and observing this assertion stay green). */
     {
         uint8_t plain[32], seg[256], back[256];
         memset(plain, 0xA5, sizeof plain);
@@ -63,7 +75,35 @@ int main(void) {
         long enc = rsp_protect(&s1, plain, sizeof plain, seg, sizeof seg);
         ok("a segment was produced", enc > 0);
         seg[enc / 2] ^= 0x01;
-        ok("a tampered segment is refused",
+        ok("a segment tampered inside the padding block is refused"
+           " (padding validation, not the MAC)",
+           rsp_unprotect(&s2, seg, (size_t)enc, back, sizeof back) < 0);
+    }
+
+    /* The MAC-only case. This plaintext is four AES blocks of real data,
+       so after padding the segment is five ciphertext blocks and the
+       whole fifth block is padding. CBC error propagation from a
+       corrupted ciphertext block C_i only ever reaches P_i and P_{i+1}
+       (see the comment above) -- so tampering block 0 can only affect
+       recovered plaintext blocks 0 and 1, and blocks 2, 3 and the
+       trailing all-padding block 4 are provably untouched. Padding
+       validation therefore cannot catch this one; only the MAC can. If a
+       later reader shortens this plaintext or moves the tamper closer to
+       the end "to simplify the test", the bit-flip will land back inside
+       the padding block and this test will silently start testing padding
+       again instead of the MAC -- which is exactly the mistake this
+       comment exists to prevent. */
+    {
+        uint8_t plain[64], seg[256], back[256];
+        for (size_t k = 0; k < sizeof plain; k++) plain[k] = (uint8_t)(k * 3 + 5);
+        rsp_session_t s1, s2;
+        session(&s1); session(&s2);
+        long enc = rsp_protect(&s1, plain, sizeof plain, seg, sizeof seg);
+        ok("a segment was produced for the MAC-only tamper case", enc > 0);
+        seg[0] ^= 0x01; /* first ciphertext byte: block 0, four blocks
+                            clear of the trailing padding block (block 4) */
+        ok("a segment tampered outside the padding block is refused"
+           " (the MAC, not padding)",
            rsp_unprotect(&s2, seg, (size_t)enc, back, sizeof back) < 0);
     }
     return fails ? 1 : 0;
