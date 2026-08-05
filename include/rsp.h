@@ -154,11 +154,52 @@ int rsp_cmac(const uint8_t key[16], const uint8_t *msg, size_t len,
 /* The Bound Profile Package (SGP.22 v2.6 section 2.5.4): the eUICC's
  * one-time public key already agreed on, this assembles what
  * InitialiseSecureChannel, ConfigureISDP and StoreMetadata need, plus the
- * profile itself protected in tag-'86' segments (section 2.5.3), into the
- * generated BoundProfilePackage_t and out to DER. upp is the Unprotected
- * Profile Package -- the profile, DER, exactly as a profile compiler
- * produces it. This library makes no assumption about the UPP's internal
- * structure; section 2.5.3 itself treats it as "a unique block of data".
+ * profile itself protected in tag-'86' segments (section 2.5.3). upp is
+ * the Unprotected Profile Package -- the profile, DER, exactly as a
+ * profile compiler produces it. This library makes no assumption about
+ * the UPP's internal structure; section 2.5.3 itself treats it as "a
+ * unique block of data".
+ *
+ * The BoundProfilePackage envelope itself (the outer [54] SEQUENCE and
+ * its four SEQUENCE OF fields) is assembled and parsed BY HAND in
+ * src/rsp_bpp.c, not through the generated BoundProfilePackage_t / asn_
+ * DEF_BoundProfilePackage from Task 2. That is not a stopgap: asn1c's
+ * generated encoder and decoder for "SEQUENCE OF [N] OCTET STRING" (the
+ * shape all four of those fields use) cannot agree with each other on
+ * any wire form for this construct, so there is no upgrade of asn1c that
+ * makes the generated pair usable here -- see the long comment at the
+ * top of src/rsp_bpp.c for the two independent defects and the direct
+ * experiment proving it. InitialiseSecureChannelRequest, ConfigureISDPRequest
+ * and StoreMetadataRequest ARE plain SEQUENCEs and unaffected, so those
+ * three are still built with Task 2's generated types.
+ *
+ * Two more scope cuts, beyond the hand-rolled envelope:
+ *
+ *   - ConfigureISDP ('87') and StoreMetadata ('88') are placed in the
+ *     BPP UNPROTECTED -- their own DER-encoded TLV, with no SCP03t
+ *     encryption or MAC at all. rsp_protect/rsp_unprotect above only
+ *     implement the '86' construction (see their own comment); a real
+ *     card requires '87' encrypted-and-MAC'd and '88' MAC'd, and will
+ *     refuse a BPP built by rsp_bpp_build. That protection is a
+ *     different, narrower construction than '86' and is left to
+ *     whichever task first talks to a card.
+ *   - Several InitialiseSecureChannelRequest fields have no source in
+ *     rsp_bpp_input_t and are filled with fixed placeholders, not real
+ *     values: transactionId is the single byte 0x01; controlRefTemplate.
+ *     hostId reuses the 10-byte ICCID, which is NOT the correct field --
+ *     the real hostId is the eUICC's EID, absent from this input struct;
+ *     smdpSign is a zero-length OCTET STRING (wire bytes '5F 37 00'),
+ *     left empty rather than filled with same-length filler so it cannot
+ *     be mistaken for a real signature -- no ECDSA signing primitive
+ *     over arbitrary data exists in this header. A BPP built this way is
+ *     not ready for a real ES9+/ES8+ exchange until whichever task wires
+ *     that flow supplies transactionId, the EID and a real signature.
+ *
+ * rsp_bpp_build's own length encoder refuses a UPP whose encoded
+ * sequenceOf86 or outer content would need a DER length field longer
+ * than 4 octets (a ~4 GiB bound, order of magnitude past any profile
+ * this library will plausibly see); it fails with -1, not a truncation,
+ * if that bound is ever hit.
  */
 typedef struct {
     const uint8_t *upp;        /* the profile package, DER */
@@ -175,7 +216,30 @@ int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
                   uint8_t **out, size_t *out_len);
 
 /* Recover the UPP from a BPP with the same session keys. This exists for the
-   self-check before sending and for the test below. Returns 0 or -1. */
+   self-check before sending and for the test below. Returns 0 or -1.
+
+   *upp is malloc'ed and belongs to the caller on success; it is the
+   profile in the clear, so it carries whatever the profile itself
+   carries (including any key material the profile provisions) -- wipe
+   it (mbedtls_platform_zeroize, not memset: a memset on a buffer that is
+   about to be freed and never read again is dead-store-eliminated at
+   this project's -O2, proven with a stack probe in this project's own
+   history -- see src/rsp_crypto.c's comment on rsp_session_init for the
+   full account) once you are done with it, the same as any other secret
+   this library hands back.
+
+   A BPP whose sequenceOf86 has no segments at all is refused (-1), even
+   though the underlying parse would otherwise succeed with nothing to
+   unprotect: "recovered nothing" must never read as "recovered", which
+   matters most for exactly the self-check-before-sending case this
+   function exists for.
+
+   On a mid-stream segment failure, s->chain is left wherever it was
+   after the segments that verified before the failing one -- advanced,
+   not rolled back -- the same way rsp_bpp_build leaves s->chain advanced
+   through whatever it managed to protect before a later failure. Do not
+   reuse a session after either function returns -1; treat it as
+   consumed. */
 int rsp_bpp_recover(rsp_session_t *s, const uint8_t *bpp, size_t bpp_len,
                     uint8_t **upp, size_t *upp_len);
 

@@ -39,42 +39,81 @@
  * since 1016 > 255) for a 1 + 3 + 1016 = 1020-byte segment -- the spec's
  * own maximum, not a byte more.
  *
- * WHY THE OUTER ENVELOPE IS HAND-WRITTEN, NOT asn1c-GENERATED:
+ * WHY THE OUTER ENVELOPE IS HAND-WRITTEN, PERMANENTLY, NOT asn1c-GENERATED:
  *
  * BoundProfilePackage's firstSequenceOf87/sequenceOf88/secondSequenceOf87/
  * sequenceOf86 fields are each "SEQUENCE OF [N] OCTET STRING" -- an inline
  * tag on the *element* type of a SEQUENCE OF, not on a SEQUENCE member.
- * asn1c-0.9.29's generated code for that shape is internally inconsistent
- * between encode and decode, confirmed by reading dist/constr_SET_OF.c
- * (regenerated from the same asn1c, so this is not a one-off artifact):
+ * asn1c-0.9.29's generated code for that shape cannot produce SGP.22's
+ * wire bytes at all, in either direction, confirmed by reading
+ * dist/constr_SET_OF.c (regenerated fresh from the same asn1c, so this is
+ * not a one-off artifact) and by direct experiment. This is not a single
+ * bug that a future asn1c release fixes back into usefulness -- it is two
+ * independent defects that compound into "no byte sequence the generated
+ * encoder can write is one the generated decoder can read back":
  *
- *   - SET_OF_encode_der and its helper SET_OF__encode_sorted both call
- *     the element's der_encoder with a literal 0 for tag_mode
- *     (constr_SET_OF.c, the `elm->type->op->der_encoder(elm->type,
- *     memb_ptr, 0, elm->tag, ...)` calls), which makes OCTET_STRING's own
- *     encoder ignore elm->tag entirely and write its universal tag
- *     ('04') instead of the intended context tag ('86'/'87'/'88').
- *   - SET_OF_decode_ber's element loop, by contrast, checks the wire tag
- *     against elm->tag before accepting an element (`if(BER_TAGS_EQUAL
- *     (tlv_tag, elm->tag)) ... else RETURN(RC_FAIL)`), i.e. it demands
- *     the context tag the encoder never wrote.
+ *   1. The member table for e.g. firstSequenceOf87's element sets
+ *      tag_mode to +1 ("EXPLICIT tag at current level"), where every
+ *      *other* manually-tagged field in this AUTOMATIC TAGS module gets
+ *      -1 (IMPLICIT) -- initialiseSecureChannelRequest's own [35] does,
+ *      for instance. EXPLICIT tagging adds a wrapping TLV around the
+ *      element's own natural tag rather than replacing it, so even a
+ *      SET_OF encoder that correctly applied tag_mode would emit a
+ *      *nested* `A7 <len> { 04 <len2> <content> }` for tag 7, not
+ *      SGP.22's flat `87 <len> <content>`. Whether this is asn1c
+ *      mis-choosing EXPLICIT for this shape, or the only tag_mode its
+ *      grammar can express for an inline-tagged SEQUENCE OF element, the
+ *      observable fact is that the member table itself never encodes the
+ *      construction SGP.22 wants, independent of the bug below.
+ *   2. SET_OF_encode_der and its helper SET_OF__encode_sorted call the
+ *      element's der_encoder with a literal 0 for tag_mode regardless of
+ *      what the member table says (`elm->type->op->der_encoder(elm->type,
+ *      memb_ptr, 0, elm->tag, ...)`), so in practice neither the (wrong)
+ *      +1 nor a hypothetical correct -1 is ever used: the element is
+ *      written with OCTET_STRING's bare universal tag ('04'). Verified
+ *      with `openssl asn1parse` on the raw output: the element under
+ *      firstSequenceOf87 showed as `prim: OCTET STRING`, tag `04`, not
+ *      `cont [ 7 ]`.
+ *   3. SET_OF_decode_ber's element loop, independently of both of the
+ *      above, checks the wire tag against elm->tag *before* invoking the
+ *      element's own decoder (`if(BER_TAGS_EQUAL(tlv_tag, elm->tag))
+ *      ... else RETURN(RC_FAIL)`), and its own microphase2 then calls
+ *      that decoder with tag_mode hardcoded to 0 too -- so the decoder
+ *      wants the context tag at the outer check and the bare universal
+ *      tag at the position it actually reads from (ber_fetch_tag only
+ *      peeks; it does not advance past the tag it checked).
  *
- * The result: der_encode() and ber_decode() of a BoundProfilePackage_t
- * do not even round-trip against each other, independent of this
- * library's own correctness -- verified directly: encoding a BPP and
- * feeding it back to ber_decode() failed with RC_FAIL at the exact byte
- * offset where the first '87' element begins. Patching the vendored
- * dist/ output is not an option (it is generated fresh by `make` from
- * rsp-2.5.asn and never committed), so the four SEQUENCE OF fields and
- * their outer [54] SEQUENCE are written and read by hand below, with
- * plain BER TLV primitives (ber_fetch_tag/ber_fetch_length, already used
- * throughout the vendored codec, so this reuses proven low-level code --
- * only the SEQUENCE OF *of a tagged element* path is affected).
+ * Concretely, none of the three candidate wire forms round-trips through
+ * asn1c's generated ber_decode(): the as-generated form ('04', what (2)
+ * actually writes) fails (3)'s outer elm->tag check; a hypothetically
+ * tag_mode-correct EXPLICIT form ('A7' wrapping '04') still fails (3)'s
+ * inner universal-tag re-check, because ber_fetch_tag in the outer check
+ * never consumed anything; and SGP.22's own flat form ('87' primitive,
+ * what this file actually writes) fails that same inner re-check for the
+ * identical reason. Verified directly: feeding this file's correct,
+ * spec-conformant output to asn1c's own ber_decode(&asn_DEF_
+ * BoundProfilePackage, ...) still fails with RC_FAIL at the exact byte
+ * offset where the first '87' element begins -- the same offset as
+ * feeding it the buggy as-generated output. Patching dist/ is not an
+ * option regardless (it is generated fresh by `make` from rsp-2.5.asn
+ * and never committed): but even if it were, there is no tag_mode value
+ * that makes constr_SET_OF.c's *decoder* accept a flat context-tagged
+ * primitive element, so this is not a workaround pending an upstream
+ * fix -- it is the only way to get SGP.22's wire bytes out of this exact
+ * ASN.1 shape with this asn1c/skeleton pair, and will remain so unless
+ * asn1c's SET_OF decode strategy changes for tagged elements, not merely
+ * its tag_mode handling.
+ *
+ * The four SEQUENCE OF fields and their outer [54] SEQUENCE are
+ * therefore written and read by hand below, with plain BER TLV
+ * primitives (ber_fetch_tag/ber_fetch_length, already used throughout
+ * the vendored codec, so this reuses proven low-level code -- only the
+ * SEQUENCE OF *of a tagged element* path is affected).
  * InitialiseSecureChannelRequest, ConfigureISDPRequest and
  * StoreMetadataRequest are plain SEQUENCEs, unaffected (their member tags
- * go through constr_SEQUENCE.c, which correctly threads elm->tag_mode),
- * so those three are still built and DER-encoded with Task 2's generated
- * types, as the brief asks.
+ * go through constr_SEQUENCE.c, which correctly threads elm->tag_mode
+ * and elm->tag both), so those three are still built and DER-encoded
+ * with Task 2's generated types, as the brief asks.
  */
 #include "rsp.h"
 
@@ -102,12 +141,17 @@
 #define TAG_BYTE(class2, constructed, num) \
     (uint8_t)(((class2) << 6) | ((constructed) ? 0x20 : 0) | (num))
 
-#define TAG_ISCR_OUTER   0xBF  /* BoundProfilePackage's own [54], high-tag
-                                   form: 0xBF 0x36 (54 needs 2 tag octets) */
+/* BoundProfilePackage's own [54], high-tag form: two tag octets, since 54
+   does not fit the 5-bit low-tag-number form (< 31). TAG_BPP_FIRST is the
+   class/constructed/high-tag-number-marker octet (0xBF: context,
+   constructed, 0x1F); TAG_BPP_SECOND is 54's single base-128 byte (54 fits
+   with no continuation bit). There is no [2]-wrapper constant: secondSequenceOf87
+   is always absent here (see the comment where it is omitted, below), so
+   nothing ever writes its tag by hand; decode still checks for it. */
+#define TAG_BPP_FIRST    0xBF
 #define TAG_BPP_SECOND   0x36
 #define TAG_F87_WRAPPER  TAG_BYTE(2, 1, 0)  /* firstSequenceOf87  [0], SEQUENCE OF: constructed */
 #define TAG_88_WRAPPER   TAG_BYTE(2, 1, 1)  /* sequenceOf88       [1] */
-#define TAG_S87_WRAPPER  TAG_BYTE(2, 1, 2)  /* secondSequenceOf87 [2], OPTIONAL */
 #define TAG_86_WRAPPER   TAG_BYTE(2, 1, 3)  /* sequenceOf86       [3] */
 #define TAG_87_ELEMENT   TAG_BYTE(2, 0, 7)  /* '87' TLV, primitive */
 #define TAG_88_ELEMENT   TAG_BYTE(2, 0, 8)  /* '88' TLV, primitive */
@@ -146,8 +190,20 @@ static int growbuf_append(rsp_growbuf_t *g, const void *data, size_t n)
     return 0;
 }
 
+/* Every growbuf this file frees might be holding recovered UPP plaintext
+   (rsp_bpp_recover's rejection path) or, less critically, DER destined
+   for the wire anyway -- rather than reason case by case about which
+   call sites are secret-carrying, this wipes the whole allocation
+   unconditionally before releasing it, the same way the per-segment
+   scratch buffers around it already do (see rsp_bpp_recover). Zeroizing
+   bytes beyond g->len (up to g->cap) is deliberate too: a previous grow
+   may have left old content further out that was never explicitly
+   copied over by a later append. */
 static void growbuf_free(rsp_growbuf_t *g)
 {
+    if (g->buf) {
+        mbedtls_platform_zeroize(g->buf, g->cap);
+    }
     free(g->buf);
     g->buf = NULL;
     g->len = 0;
@@ -182,9 +238,22 @@ static int der_encode_alloc(asn_TYPE_descriptor_t *td, const void *sptr,
 
 /* Minimal DER length octets (no leading zero byte) -- the same rule
    src/rsp_crypto.c uses for SCP03t's own length field, restated here
-   because that copy is private to that file. Supports up to a 3-octet
-   length (65535 bytes), comfortably past anything this file assembles. */
-static int der_len_octets(size_t len, uint8_t out[3], size_t *n)
+   because that copy is private to that file, extended past that copy's
+   3-octet form to 4 (RSP_BPP_LEN_OCTETS_MAX below): a first review round
+   found the 3-octet cap (65535 bytes) refused any UPP whose sequenceOf86
+   content -- or the BoundProfilePackage's own outer content -- crossed
+   that boundary, measured at a 64527-byte UPP, well inside profiles that
+   carry applets. Nothing in SGP.22 imposes 65535 as a limit, and
+   ber_fetch_length (dist/ber_tlv_length.c) already decodes length forms
+   longer than 3 octets without complaint, so build was refusing packages
+   recover could read -- an asymmetry with no basis in the spec. The
+   4-octet form here caps at 0xFFFFFFFF bytes (4 GiB), past any UPP this
+   library will plausibly see; a UPP that size is refused here (see
+   RSP_BPP_LEN_OCTETS_MAX and its use in rsp_bpp_build), not silently
+   truncated. */
+#define RSP_BPP_LEN_OCTETS_MAX 5  /* 1 tag-of-length byte + up to 4 length bytes */
+static int der_len_octets(size_t len, uint8_t out[RSP_BPP_LEN_OCTETS_MAX],
+                           size_t *n)
 {
     if (len < 0x80) {
         out[0] = (uint8_t)len;
@@ -198,6 +267,19 @@ static int der_len_octets(size_t len, uint8_t out[3], size_t *n)
         out[1] = (uint8_t)(len >> 8);
         out[2] = (uint8_t)len;
         *n = 3;
+    } else if (len <= 0xFFFFFFUL) {
+        out[0] = 0x83;
+        out[1] = (uint8_t)(len >> 16);
+        out[2] = (uint8_t)(len >> 8);
+        out[3] = (uint8_t)len;
+        *n = 4;
+    } else if (len <= 0xFFFFFFFFUL) {
+        out[0] = 0x84;
+        out[1] = (uint8_t)(len >> 24);
+        out[2] = (uint8_t)(len >> 16);
+        out[3] = (uint8_t)(len >> 8);
+        out[4] = (uint8_t)len;
+        *n = 5;
     } else {
         return -1;
     }
@@ -208,7 +290,7 @@ static int der_len_octets(size_t len, uint8_t out[3], size_t *n)
 static int put_tlv(rsp_growbuf_t *g, uint8_t tag, const uint8_t *content,
                     size_t len)
 {
-    uint8_t lo[3];
+    uint8_t lo[RSP_BPP_LEN_OCTETS_MAX];
     size_t n;
 
     if (der_len_octets(len, lo, &n) != 0) {
@@ -331,18 +413,33 @@ static void build_configure(ConfigureISDPRequest_t *cfg)
    the module's own SIZE constraints on serviceProviderName (0..32) and
    profileName (0..64); asn1c's generic der_encode does not enforce SIZE,
    so a caller string that is too long would otherwise be encoded as a
-   silently non-conformant TLV instead of being refused here. */
+   silently non-conformant TLV instead of being refused here.
+
+   The check is strlen() -- bytes -- against a SIZE that counts UTF8String
+   characters, not bytes. That is conservative, never permissive: it can
+   refuse a compliant string that uses enough multi-byte characters to
+   push its byte length past the character limit while staying within it
+   in characters, but it can never accept a string that is actually too
+   long. Given this project's plain-ASCII test material, that gap is
+   unexercised; a caller passing profile or provider names rich in
+   multi-byte UTF-8 should not rely on this check for the exact SGP.22
+   boundary. */
 static int build_metadata(StoreMetadataRequest_t *md,
                            const rsp_bpp_input_t *in)
 {
     size_t name_len = strlen(in->profile_name);
     size_t sp_len = strlen(in->service_provider_name);
 
+    /* Zeroed before the very first failure return, unlike an earlier
+       version of this function -- so that a caller can unconditionally
+       ASN_STRUCT_RESET md even when this returns -1, the same way
+       build_isc already guarantees. */
+    memset(md, 0, sizeof *md);
+
     if (name_len > 64 || sp_len > 32) {
         return -1;
     }
 
-    memset(md, 0, sizeof *md);
     if (OCTET_STRING_fromBuf(&md->iccid, (const char *)in->iccid, 10) != 0) {
         return -1;
     }
@@ -384,14 +481,21 @@ int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
 
     {
         InitialiseSecureChannelRequest_t isc;
-        int rc;
-        if (build_isc(&isc, in) != 0) {
-            goto out;
+        int build_rc = build_isc(&isc, in);
+        int rc = 0;
+        /* build_isc zeroes isc as its first act (see build_isc), so even
+           when it fails partway -- some OCTET_STRING_fromBuf calls
+           already succeeded and allocated, one then failed -- isc is
+           always in a state ASN_STRUCT_RESET can safely walk. Skipping
+           the reset on build_rc != 0, as an earlier version of this file
+           did, leaked whatever OCTET STRINGs build_isc had already
+           allocated before hitting its own failing call. */
+        if (build_rc == 0) {
+            rc = der_encode_alloc(&asn_DEF_InitialiseSecureChannelRequest,
+                                   &isc, &isc_der, &isc_len);
         }
-        rc = der_encode_alloc(&asn_DEF_InitialiseSecureChannelRequest, &isc,
-                               &isc_der, &isc_len);
         ASN_STRUCT_RESET(asn_DEF_InitialiseSecureChannelRequest, &isc);
-        if (rc != 0) {
+        if (build_rc != 0 || rc != 0) {
             goto out;
         }
     }
@@ -427,14 +531,14 @@ int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
 
     {
         StoreMetadataRequest_t md;
-        int rc;
-        if (build_metadata(&md, in) != 0) {
-            goto out;
+        int build_rc = build_metadata(&md, in);
+        int rc = 0;
+        if (build_rc == 0) {
+            rc = der_encode_alloc(&asn_DEF_StoreMetadataRequest, &md,
+                                   &metadata_der, &metadata_len);
         }
-        rc = der_encode_alloc(&asn_DEF_StoreMetadataRequest, &md,
-                               &metadata_der, &metadata_len);
         ASN_STRUCT_RESET(asn_DEF_StoreMetadataRequest, &md);
-        if (rc != 0) {
+        if (build_rc != 0 || rc != 0) {
             goto out;
         }
     }
@@ -493,7 +597,7 @@ int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
        else in this file). */
     {
         rsp_growbuf_t g;
-        uint8_t lo[3];
+        uint8_t lo[RSP_BPP_LEN_OCTETS_MAX];
         size_t n;
 
         memset(&g, 0, sizeof g);
@@ -501,7 +605,7 @@ int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
             goto out;
         }
         {
-            static const uint8_t outer_tag[2] = { TAG_ISCR_OUTER, TAG_BPP_SECOND };
+            static const uint8_t outer_tag[2] = { TAG_BPP_FIRST, TAG_BPP_SECOND };
             if (growbuf_append(&g, outer_tag, 2) != 0 ||
                 growbuf_append(&g, lo, n) != 0 ||
                 growbuf_append(&g, content.buf, content.len) != 0) {
@@ -549,13 +653,15 @@ int rsp_bpp_recover(rsp_session_t *s, const uint8_t *bpp, size_t bpp_len,
     pos = 0;
 
     /* initialiseSecureChannelRequest: not needed to recover the UPP, so
-       it is skipped as a raw TLV rather than decoded. */
+       its content is skipped as a raw TLV rather than decoded -- but its
+       tag is still checked, so a BPP missing it entirely is rejected
+       rather than accepted with whatever happens to occupy that slot. */
     {
         ber_tlv_tag_t t;
         const uint8_t *v;
         size_t vlen;
         ssize_t n = read_tlv(content + pos, content_len - pos, &t, &v, &vlen);
-        if (n < 0) {
+        if (n < 0 || t != PACKED_TAG(2, 35)) {
             goto out;
         }
         pos += (size_t)n;
@@ -615,6 +721,7 @@ int rsp_bpp_recover(rsp_session_t *s, const uint8_t *bpp, size_t bpp_len,
         const uint8_t *seq86;
         size_t seq86_len;
         size_t p;
+        size_t segments_seen = 0;
         ssize_t n = read_tlv(content + pos, content_len - pos, &t,
                               &seq86, &seq86_len);
         if (n < 0 || t != PACKED_TAG(2, 3)) {
@@ -640,6 +747,7 @@ int rsp_bpp_recover(rsp_session_t *s, const uint8_t *bpp, size_t bpp_len,
                 goto out;
             }
             p += (size_t)en;
+            segments_seen++;
 
             /* The recovered plaintext is never longer than the
                ciphertext (it had padding removed), so the element's own
@@ -661,6 +769,20 @@ int rsp_bpp_recover(rsp_session_t *s, const uint8_t *bpp, size_t bpp_len,
             }
             mbedtls_platform_zeroize(plain, evlen);
             free(plain);
+        }
+
+        /* sequenceOf86 with zero elements is not a package this function
+           ever produces (rsp_bpp_build's do/while always writes at least
+           one segment, even for an empty UPP), and it must not be
+           mistaken for one that recovered a genuinely empty UPP: that
+           case still goes through the loop above exactly once, with
+           un == 0. An empty sequenceOf86 instead means "nothing was
+           recovered because there was nothing to recover", which is not
+           success -- the header promises *upp is malloc'ed and the
+           caller's self-check-before-sending path needs "recovered
+           nothing" to never read as "recovered". */
+        if (segments_seen == 0) {
+            goto out;
         }
     }
 
