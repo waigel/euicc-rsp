@@ -1,0 +1,4 @@
+*.o
+*.a
+tests/run-*
+!tests/run-tests
