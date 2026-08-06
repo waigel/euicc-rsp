@@ -327,4 +327,32 @@ int rsp_record_open(rsp_transport_t *inner, const char *path,
 int rsp_es10_send(rsp_transport_t *t, const uint8_t *req, size_t req_len,
                   uint8_t **out, size_t *out_len, unsigned *sw);
 
+/* What a card says about itself, decoded from GetEUICCInfo2 (EUICCInfo2,
+   SGP.22 v2.6 section 5.7.13) and GetEID (GetEuiccDataResponse, section
+   5.7.11). Strings are NUL-terminated; ci_ids holds ci_count identifiers
+   of ci_id_len bytes each, concatenated -- the Certificate Issuer
+   SubjectKeyIdentifiers the card lists in euiccCiPKIdListForVerification,
+   the ones rsp_card_trusts answers questions about. */
+typedef struct {
+    uint8_t eid[16];
+    int     have_eid;
+    char    svn[16];            /* "2.2.0" */
+    uint8_t *ci_ids;            /* for verification */
+    size_t   ci_count;
+    size_t   ci_id_len;
+} rsp_card_info_t;
+
+/* Select the ISD-R, then read EUICCInfo2 and the EID. Returns 0, -1 if the
+   card refused, -2 if it could not be asked. */
+int rsp_card_read_info(rsp_transport_t *t, rsp_card_info_t *out);
+
+/* Release an rsp_card_info_t obtained from rsp_card_read_info. Safe to call
+   on a zeroed struct. Nothing here is secret (see testdata/cards/README.md,
+   "What is safe to commit"), so there is no wipe. */
+void rsp_card_info_free(rsp_card_info_t *i);
+
+/* Does this card accept the issuer whose SubjectKeyIdentifier is `id`?
+   Returns 1 for yes, 0 for no. */
+int rsp_card_trusts(const rsp_card_info_t *i, const uint8_t *id, size_t id_len);
+
 #endif /* RSP_H */

@@ -70,10 +70,14 @@
  * section 5.7.2 allows; deciding what to do about a pending proactive
  * command is left to whichever caller needs it, not this function.
  */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "rsp.h"
+
+#include "EUICCInfo2.h"
+#include "GetEuiccDataResponse.h"
 
 #define ES10_MAX_BLOCK 255u  /* SGP.22 v2.6 section 2.5.5 / 5.7.6 */
 
@@ -201,4 +205,180 @@ int rsp_es10_send(rsp_transport_t *t, const uint8_t *req, size_t req_len,
             return -1;
         }
     }
+}
+
+/*
+ * rsp_card_select_isdr / rsp_card_read_info / rsp_card_info_free /
+ * rsp_card_trusts -- the three read-only ES10 commands this round asks of a
+ * card, plus the yes/no question the round exists to answer.
+ *
+ * The ISD-R AID below (A0 00 00 05 59 10 10 FF FF FF FF 89 00 00 01 00) is
+ * the one the eUICC card-reading task brief gives; it must be selected
+ * before any ES10 STORE DATA exchange, since ES10 commands are ISD-R
+ * application commands, not commands the card answers on whatever applet
+ * happened to be selected before. SELECT itself is plain ISO/IEC 7816-4
+ * (CLA '00', INS 'A4', P1 '04' select-by-name, P2 '00' first-or-only
+ * occurrence), not part of SGP.22 or GPCS's STORE DATA mechanism above, so
+ * it does not go through rsp_es10_send.
+ */
+
+#define ISDR_AID_LEN 16
+
+static const uint8_t isdr_aid[ISDR_AID_LEN] = {
+    0xA0, 0x00, 0x00, 0x05, 0x59, 0x10, 0x10, 0xFF,
+    0xFF, 0xFF, 0xFF, 0x89, 0x00, 0x00, 0x01, 0x00
+};
+
+/* Select the ISD-R. Returns 0, -1 if the card refused (a non-9000 status,
+   whatever it carries -- there is no *sw out-parameter here since nothing
+   above needs to distinguish one refusal from another for a SELECT), -2 if
+   the exchange could not happen at all. */
+static int rsp_card_select_isdr(rsp_transport_t *t)
+{
+    uint8_t cmd[5 + ISDR_AID_LEN + 1];
+    uint8_t resp[258];
+
+    cmd[0] = 0x00; /* CLA */
+    cmd[1] = 0xA4; /* INS: SELECT */
+    cmd[2] = 0x04; /* P1: select by name (DF name / AID) */
+    cmd[3] = 0x00; /* P2: first or only occurrence, no FCI return requested */
+    cmd[4] = (uint8_t)ISDR_AID_LEN; /* Lc */
+    memcpy(cmd + 5, isdr_aid, ISDR_AID_LEN);
+    cmd[5 + ISDR_AID_LEN] = 0x00; /* Le */
+
+    long n = t->transceive(t, cmd, sizeof cmd, resp, sizeof resp);
+    if (n < 2) return -2;
+
+    unsigned sw = (unsigned)((resp[(size_t)n - 2] << 8) | resp[(size_t)n - 1]);
+    if (sw != 0x9000u) return -1;
+    return 0;
+}
+
+/* Both requests are the fixed, argument-less encodings the brief gives
+   directly from rsp-2.5.asn, so they are written out here rather than
+   assembled through the generated encoder -- there is nothing for an
+   encoder to get wrong about three and six constant bytes. */
+static const uint8_t es10_info2_req[] = { 0xBF, 0x22, 0x00 };
+static const uint8_t es10_eid_req[]   = { 0xBF, 0x3E, 0x03, 0x5C, 0x01, 0x5A };
+
+int rsp_card_read_info(rsp_transport_t *t, rsp_card_info_t *out)
+{
+    if (!t || !t->transceive || !out) return -2;
+    memset(out, 0, sizeof *out);
+
+    int rc = rsp_card_select_isdr(t);
+    if (rc != 0) return rc;
+
+    uint8_t *resp = NULL;
+    size_t resp_len = 0;
+    unsigned sw = 0;
+
+    rc = rsp_es10_send(t, es10_info2_req, sizeof es10_info2_req,
+                       &resp, &resp_len, &sw);
+    if (rc != 0) return rc;
+
+    EUICCInfo2_t *info2 = NULL;
+    asn_dec_rval_t dr = ber_decode(NULL, &asn_DEF_EUICCInfo2, (void **)&info2,
+                                   resp, resp_len);
+    free(resp);
+    if (dr.code != RC_OK) {
+        if (info2) ASN_STRUCT_FREE(asn_DEF_EUICCInfo2, info2);
+        return -2;
+    }
+
+    if (info2->svn.size == 3) {
+        snprintf(out->svn, sizeof out->svn, "%u.%u.%u",
+                 info2->svn.buf[0], info2->svn.buf[1], info2->svn.buf[2]);
+    }
+
+    size_t n = (size_t)info2->euiccCiPKIdListForVerification.list.count;
+    if (n > 0) {
+        /* rsp_card_info_t's own contract (include/rsp.h) is a single
+           ci_id_len for every entry in ci_ids; a card whose list is not
+           actually uniform cannot be represented that way, so that shape
+           is treated the same as any other answer this function cannot
+           make sense of: -2, not a silent truncation to the entries that
+           happen to fit. */
+        size_t id_len = info2->euiccCiPKIdListForVerification.list.array[0]->size;
+        uint8_t *ids = malloc(n * id_len);
+        if (!ids) {
+            ASN_STRUCT_FREE(asn_DEF_EUICCInfo2, info2);
+            return -2;
+        }
+        int uniform = 1;
+        for (size_t i = 0; i < n; i++) {
+            SubjectKeyIdentifier_t *ski =
+                info2->euiccCiPKIdListForVerification.list.array[i];
+            if (ski->size != id_len) { uniform = 0; break; }
+            memcpy(ids + i * id_len, ski->buf, id_len);
+        }
+        if (!uniform) {
+            free(ids);
+            ASN_STRUCT_FREE(asn_DEF_EUICCInfo2, info2);
+            return -2;
+        }
+        out->ci_ids = ids;
+        out->ci_count = n;
+        out->ci_id_len = id_len;
+    }
+
+    ASN_STRUCT_FREE(asn_DEF_EUICCInfo2, info2);
+
+    resp = NULL;
+    resp_len = 0;
+    sw = 0;
+    rc = rsp_es10_send(t, es10_eid_req, sizeof es10_eid_req,
+                       &resp, &resp_len, &sw);
+    if (rc != 0) {
+        free(out->ci_ids);
+        out->ci_ids = NULL;
+        out->ci_count = 0;
+        out->ci_id_len = 0;
+        return rc;
+    }
+
+    GetEuiccDataResponse_t *eidresp = NULL;
+    dr = ber_decode(NULL, &asn_DEF_GetEuiccDataResponse, (void **)&eidresp,
+                    resp, resp_len);
+    free(resp);
+    if (dr.code != RC_OK || eidresp->eidValue.size != 16) {
+        if (eidresp) ASN_STRUCT_FREE(asn_DEF_GetEuiccDataResponse, eidresp);
+        free(out->ci_ids);
+        out->ci_ids = NULL;
+        out->ci_count = 0;
+        out->ci_id_len = 0;
+        return -2;
+    }
+
+    memcpy(out->eid, eidresp->eidValue.buf, 16);
+    out->have_eid = 1;
+    ASN_STRUCT_FREE(asn_DEF_GetEuiccDataResponse, eidresp);
+
+    return 0;
+}
+
+void rsp_card_info_free(rsp_card_info_t *i)
+{
+    if (!i) return;
+    free(i->ci_ids);
+    i->ci_ids = NULL;
+    i->ci_count = 0;
+    i->ci_id_len = 0;
+    i->have_eid = 0;
+}
+
+int rsp_card_trusts(const rsp_card_info_t *i, const uint8_t *id, size_t id_len)
+{
+    if (!i || !id || id_len != i->ci_id_len) return 0;
+
+    /* Plain memcmp, not mbedtls_ct_memcmp: both operands are public
+       identifiers (a Certificate Issuer's SubjectKeyIdentifier -- the hash
+       of a public key, not a secret), and this project's constant-time
+       rule exists for comparisons where a timing side channel could leak
+       something an attacker should not learn. Nothing compared here is
+       secret, so there is nothing for a timing channel to leak. */
+    for (size_t k = 0; k < i->ci_count; k++) {
+        if (memcmp(i->ci_ids + k * i->ci_id_len, id, id_len) == 0) return 1;
+    }
+    return 0;
 }
