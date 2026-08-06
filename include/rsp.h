@@ -304,7 +304,16 @@ struct rsp_transport {
 int rsp_replay_open(const char *path, rsp_transport_t *out);
 
 /* Wrap any transport so every exchange is appended to `path`. The wrapper
-   takes ownership of `inner` and must itself be closed. Returns 0 or -2. */
+   takes ownership of `inner` and must itself be closed. Returns 0 or -2.
+
+   "Takes ownership" is literal, not a suggestion: rsp_record_open copies
+   *inner's fields into the wrapper's own storage, and out->close calls
+   the inner transport's close for you. Do not call inner->close yourself
+   afterward -- the caller's original `inner` struct and the wrapper's
+   copy of it both still point at the same underlying resource (the same
+   ctx), so closing both is a double close/double free of whatever inner
+   owns, not two independent releases. Close the wrapper (`out`) once,
+   and treat the `inner` you passed in as consumed. */
 int rsp_record_open(rsp_transport_t *inner, const char *path,
                     rsp_transport_t *out);
 

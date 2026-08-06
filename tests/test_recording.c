@@ -90,5 +90,96 @@ int main(void) {
     ok("and answers the same", n == 2 && resp[0] == 0x90);
     again.close(&again);
 
+    /* Fix round 1, finding 1: recording a FAILED exchange must reproduce
+       the same failure on replay, not a blank "< " line that reads back
+       as a fake zero-length success. The inner transport below has only
+       one recorded exchange, so its second call genuinely fails (-1,
+       exhausted) -- the same shape a real card refusing something during
+       a live session (Task 5) will take. */
+    {
+        const char *shortpath = "/tmp/rsp-test-one-exchange.log";
+        const char *failpath = "/tmp/rsp-test-failure.log";
+        write_file(shortpath, "> AABBCC\n< 9000\n");
+
+        rsp_transport_t innerFail, recFail;
+        ok("a one-exchange recording opens",
+           rsp_replay_open(shortpath, &innerFail) == 0);
+        ok("the failure-capturing recorder opens",
+           rsp_record_open(&innerFail, failpath, &recFail) == 0);
+
+        const uint8_t cmdA[] = { 0xAA, 0xBB, 0xCC };
+        const uint8_t cmdB[] = { 0xDD, 0xEE, 0xFF };
+        long r1 = recFail.transceive(&recFail, cmdA, sizeof cmdA, resp, sizeof resp);
+        ok("the first exchange still succeeds through the recorder",
+           r1 == 2 && resp[0] == 0x90 && resp[1] == 0x00);
+
+        long r2 = recFail.transceive(&recFail, cmdB, sizeof cmdB, resp, sizeof resp);
+        ok("the inner transport's second call genuinely fails",
+           r2 == -1);
+        recFail.close(&recFail);
+
+        /* The literal bug the review reproduced: a blank "< " line that
+           replays as a fake zero-length success. Confirm the file holds
+           the failure marker instead of that blank line. */
+        FILE *ff = fopen(failpath, "r");
+        char buf[256];
+        size_t got = ff ? fread(buf, 1, sizeof buf - 1, ff) : 0;
+        if (ff) fclose(ff);
+        buf[got] = '\0';
+        ok("the recording holds a failure marker, not a blank response line",
+           strstr(buf, "!-1") != NULL && strstr(buf, "< \n") == NULL);
+
+        rsp_transport_t replayedFail;
+        ok("the recording of a failed exchange replays",
+           rsp_replay_open(failpath, &replayedFail) == 0);
+        long p1 = replayedFail.transceive(&replayedFail, cmdA, sizeof cmdA, resp, sizeof resp);
+        ok("the first, successful exchange still replays as success",
+           p1 == 2 && resp[0] == 0x90 && resp[1] == 0x00);
+
+        memset(resp, 0xAA, sizeof resp); /* poison, to prove it stays untouched */
+        long p2 = replayedFail.transceive(&replayedFail, cmdB, sizeof cmdB, resp, sizeof resp);
+        ok("the failed exchange replays as the same failure, not a fake success",
+           p2 == -1);
+        ok("a replayed failure does not touch the caller's response buffer",
+           resp[0] == 0xAA);
+        replayedFail.close(&replayedFail);
+    }
+
+    /* Fix round 1, finding 2: every malformed-file path rsp_replay_open
+       defends against gets its own recorded assertion. Each must be -2 --
+       "cannot be parsed" -- since a hand-edited recording is the normal
+       case for this format, per the brief, not an exotic one. */
+    {
+        rsp_transport_t bad;
+
+        write_file("/tmp/rsp-bad-odd.log", "> ABC\n< 9000\n");
+        ok("an odd number of hex digits is -2",
+           rsp_replay_open("/tmp/rsp-bad-odd.log", &bad) == -2);
+
+        write_file("/tmp/rsp-bad-nonhex.log", "> AABBZZ\n< 9000\n");
+        ok("a non-hex character is -2",
+           rsp_replay_open("/tmp/rsp-bad-nonhex.log", &bad) == -2);
+
+        write_file("/tmp/rsp-bad-orphan.log", "< 9000\n");
+        ok("a response with no preceding command is -2",
+           rsp_replay_open("/tmp/rsp-bad-orphan.log", &bad) == -2);
+
+        write_file("/tmp/rsp-bad-double.log", "> AABBCC\n> DDEEFF\n< 9000\n");
+        ok("two commands in a row with no response between them is -2",
+           rsp_replay_open("/tmp/rsp-bad-double.log", &bad) == -2);
+
+        write_file("/tmp/rsp-bad-trailing.log", "> AABBCC\n");
+        ok("a trailing command with no response is -2",
+           rsp_replay_open("/tmp/rsp-bad-trailing.log", &bad) == -2);
+
+        write_file("/tmp/rsp-bad-empty.log", "");
+        ok("an empty file is -2",
+           rsp_replay_open("/tmp/rsp-bad-empty.log", &bad) == -2);
+
+        write_file("/tmp/rsp-bad-comments-only.log", "# nothing but comments\n\n");
+        ok("a file with only comments and blank lines is also -2",
+           rsp_replay_open("/tmp/rsp-bad-comments-only.log", &bad) == -2);
+    }
+
     return fails ? 1 : 0;
 }

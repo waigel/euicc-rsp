@@ -18,6 +18,15 @@
  * not itself produce (a wrong status word, a truncated response, a
  * reordered exchange).
  *
+ * A "< " line has one more shape besides hex: "< !-1" or "< !-2" records
+ * that the exchange itself failed -- transceive returned that negative
+ * value instead of a response, per include/rsp.h's failure convention --
+ * rather than that the card answered with zero bytes. rsp_record_open
+ * writes this marker whenever the transport it wraps returns negative,
+ * and rsp_replay_open turns it straight back into the same negative
+ * return, so a failure recorded during a live session (Task 5) replays
+ * as the same failure, not as a fake zero-length success.
+ *
  * The whole file is parsed at rsp_replay_open into a fixed array of
  * exchanges; nothing under transceive() allocates. A transport that could
  * fail to answer for a reason unrelated to the card (an allocation failing
@@ -44,18 +53,25 @@ static int hex_digit(char c)
     return -1;
 }
 
-/* Decodes the hex digits in s (whitespace between them is skipped, per the
- * format's own rule) into a freshly malloc'ed buffer. Returns 0, or -1 if
- * s holds anything other than whitespace and hex digits, an odd number of
- * digits, or the allocation fails. A zero-digit line decodes to a valid,
- * zero-length buffer (out set to a one-byte allocation, *out_len 0) rather
- * than NULL, so the caller can always free() it uniformly. */
-static int parse_hexline(const char *s, uint8_t **out, size_t *out_len)
+/* Decodes the hex digits in s[0..slen) (whitespace between them is
+ * skipped, per the format's own rule) into a freshly malloc'ed buffer.
+ * Returns 0, or -1 if that range holds anything other than whitespace and
+ * hex digits, an odd number of digits, or the allocation fails. A
+ * zero-digit line decodes to a valid, zero-length buffer (out set to a
+ * one-byte allocation, *out_len 0) rather than NULL, so the caller can
+ * always free() it uniformly.
+ *
+ * Takes an explicit length rather than reading to s's NUL: getline's own
+ * length (what every call site here passes) is the true extent of the
+ * line, and a line that happens to contain an embedded NUL byte before
+ * that point must be rejected as unparseable, not silently truncated
+ * there with everything past it dropped. */
+static int parse_hexline(const char *s, size_t slen, uint8_t **out, size_t *out_len)
 {
     size_t ndigits = 0;
-    for (const char *p = s; *p; p++) {
-        if (isspace((unsigned char)*p)) continue;
-        if (hex_digit(*p) < 0) return -1;
+    for (size_t i = 0; i < slen; i++) {
+        if (isspace((unsigned char)s[i])) continue;
+        if (hex_digit(s[i]) < 0) return -1;
         ndigits++;
     }
     if (ndigits % 2 != 0) return -1;
@@ -66,9 +82,9 @@ static int parse_hexline(const char *s, uint8_t **out, size_t *out_len)
 
     size_t bi = 0;
     int hi = -1;
-    for (const char *p = s; *p; p++) {
-        if (isspace((unsigned char)*p)) continue;
-        int v = hex_digit(*p);
+    for (size_t i = 0; i < slen; i++) {
+        if (isspace((unsigned char)s[i])) continue;
+        int v = hex_digit(s[i]);
         if (hi < 0) {
             hi = v;
         } else {
@@ -88,11 +104,35 @@ static void print_hex(FILE *f, const uint8_t *b, size_t n)
     }
 }
 
+/* s/slen is a "< " line's content, already past the "< " prefix. Returns
+ * 0 and sets *code if it is exactly the failure marker "!-1" or "!-2" (the
+ * only two negative values include/rsp.h's convention allows). Returns -1
+ * if it does not even start with '!' -- not a marker at all, so the
+ * caller should try parsing it as hex instead. Returns -2 if it starts
+ * with '!' but is not one of the two recognized markers, which the
+ * caller should treat as unparseable rather than silently falling back to
+ * hex (a stray '!' is never valid hex either, so there is no ambiguity to
+ * preserve). */
+static int parse_fail_marker(const char *s, size_t slen, long *code)
+{
+    if (slen == 0 || s[0] != '!') return -1;
+    if (slen == 3 && s[1] == '-' && s[2] == '1') { *code = -1; return 0; }
+    if (slen == 3 && s[1] == '-' && s[2] == '2') { *code = -2; return 0; }
+    return -2;
+}
+
 /* ---- replay ------------------------------------------------------------- */
 
 typedef struct {
     uint8_t *cmd;
     size_t   cmd_len;
+    /* fail_code is 0 for an exchange that succeeded, in which case resp/
+     * resp_len hold the recorded answer (resp non-NULL even when
+     * resp_len is 0, so free() is always valid). Otherwise fail_code is
+     * the negative value transceive returned instead of a response
+     * (-1 or -2, include/rsp.h's convention), resp is NULL and resp_len
+     * is 0: the "< !-1" / "< !-2" marker line, see the file header. */
+    long     fail_code;
     uint8_t *resp;
     size_t   resp_len;
 } rsp_exchange_t;
@@ -134,6 +174,13 @@ static long replay_transceive(rsp_transport_t *t, const uint8_t *cmd,
         print_hex(stderr, cmd, cmd_len);
         fprintf(stderr, "\n");
         return -1;
+    }
+
+    if (e->fail_code != 0) {
+        fprintf(stderr, "rsp_replay: exchange %zu: recorded as a failed "
+                         "exchange (%ld)\n", st->pos, e->fail_code);
+        st->pos++;
+        return e->fail_code;
     }
 
     if (e->resp_len > resp_cap) {
@@ -193,7 +240,7 @@ int rsp_replay_open(const char *path, rsp_transport_t *out)
                 malformed = 1;
                 break;
             }
-            if (parse_hexline(line + 2, &pending_cmd, &pending_cmd_len) != 0) {
+            if (parse_hexline(line + 2, len - 2, &pending_cmd, &pending_cmd_len) != 0) {
                 fprintf(stderr, "rsp_replay_open: %s: unparseable command "
                                  "line: %s\n", path, line);
                 malformed = 1;
@@ -207,14 +254,26 @@ int rsp_replay_open(const char *path, rsp_transport_t *out)
                 malformed = 1;
                 break;
             }
-            uint8_t *resp;
-            size_t resp_len;
-            if (parse_hexline(line + 2, &resp, &resp_len) != 0) {
-                fprintf(stderr, "rsp_replay_open: %s: unparseable response "
-                                 "line: %s\n", path, line);
+            long fail_code = 0;
+            uint8_t *resp = NULL;
+            size_t resp_len = 0;
+            int mret = parse_fail_marker(line + 2, len - 2, &fail_code);
+            if (mret == -2) {
+                fprintf(stderr, "rsp_replay_open: %s: unrecognized failure "
+                                 "marker (only !-1 and !-2 exist): %s\n",
+                        path, line);
                 free(pending_cmd);
                 malformed = 1;
                 break;
+            } else if (mret == -1) {
+                /* not a marker; an ordinary hex response */
+                if (parse_hexline(line + 2, len - 2, &resp, &resp_len) != 0) {
+                    fprintf(stderr, "rsp_replay_open: %s: unparseable "
+                                     "response line: %s\n", path, line);
+                    free(pending_cmd);
+                    malformed = 1;
+                    break;
+                }
             }
             if (n == cap) {
                 size_t newcap = cap ? cap * 2 : 8;
@@ -230,6 +289,7 @@ int rsp_replay_open(const char *path, rsp_transport_t *out)
             }
             ex[n].cmd = pending_cmd;
             ex[n].cmd_len = pending_cmd_len;
+            ex[n].fail_code = fail_code;
             ex[n].resp = resp;
             ex[n].resp_len = resp_len;
             n++;
@@ -248,6 +308,17 @@ int rsp_replay_open(const char *path, rsp_transport_t *out)
         fprintf(stderr, "rsp_replay_open: %s: a trailing command has no "
                          "response\n", path);
         free(pending_cmd);
+        malformed = 1;
+    }
+
+    /* An empty file (or one holding only comments/blank lines) has
+     * nothing wrong with it syntactically, but it is not a recording of
+     * anything either -- there is no exchange for a first transceive()
+     * call to answer. Read "cannot be parsed" to include "parsed to
+     * nothing usable" rather than opening a transport that immediately,
+     * and silently, refuses its very first call. */
+    if (!malformed && n == 0) {
+        fprintf(stderr, "rsp_replay_open: %s: no exchanges recorded\n", path);
         malformed = 1;
     }
 
@@ -292,7 +363,13 @@ static long record_transceive(rsp_transport_t *t, const uint8_t *cmd,
     fprintf(st->f, "> ");
     print_hex(st->f, cmd, cmd_len);
     fprintf(st->f, "\n< ");
-    if (n > 0) {
+    if (n < 0) {
+        /* The exchange itself failed -- write the marker rsp_replay_open
+         * turns back into this same negative return, not a blank line
+         * that would replay as a fake zero-length success. See the file
+         * header and include/rsp.h's comment on rsp_record_open. */
+        fprintf(st->f, "!%ld", n);
+    } else if (n > 0) {
         print_hex(st->f, resp, (size_t)n);
     }
     fprintf(st->f, "\n");
