@@ -135,6 +135,13 @@ static long pcsc_transceive(rsp_transport_t *t, const uint8_t *cmd,
             fprintf(stderr, "rsp_pcsc: another process holds the card; on "
                              "macOS this is usually the system's own card "
                              "services\n");
+        } else if (rv == (LONG)SCARD_E_INSUFFICIENT_BUFFER) {
+            /* Still -2, not -1: resp_cap is this function's own argument,
+             * not something the card said "no" to, so this is closer to
+             * "the exchange could not happen as asked" than to "the card
+             * answered and made no sense." */
+            fprintf(stderr, "rsp_pcsc: the card's answer did not fit the "
+                             "buffer given to it\n");
         } else {
             fprintf(stderr, "rsp_pcsc: the exchange failed: %s\n", pcsc_stringify_error(rv));
         }
@@ -258,12 +265,16 @@ int rsp_pcsc_open(const char *reader, rsp_transport_t *out)
     }
 
     if (connected_at > 0) {
+        /* Only worth a line when the fallback actually fired: this is
+         * exactly the moment the negotiated protocol is diagnostic, not
+         * routine chatter on every ordinary open (rsp_replay_open and
+         * rsp_record_open say nothing on success either). */
         fprintf(stderr, "rsp_pcsc: asking for T0|T1 failed (%s); fell back "
-                         "to asking for %s alone\n",
-                pcsc_stringify_error(first_rv), protocol_names[connected_at]);
+                         "to asking for %s alone -- connected, negotiated "
+                         "protocol %s\n",
+                pcsc_stringify_error(first_rv), protocol_names[connected_at],
+                active_protocol == SCARD_PROTOCOL_T1 ? "T=1" : "T=0");
     }
-    fprintf(stderr, "rsp_pcsc: connected, negotiated protocol %s\n",
-            active_protocol == SCARD_PROTOCOL_T1 ? "T=1" : "T=0");
 
     rsp_pcsc_state_t *st = malloc(sizeof *st);
     if (!st) {
