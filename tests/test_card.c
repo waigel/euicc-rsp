@@ -1,12 +1,18 @@
 /* The real card. Not part of `make check`: it needs a reader, and a test
  * that silently passes when the hardware is absent is worse than no test.
- * Run it with `make check-card`. */
+ * Run it with `make check-card`.
+ *
+ * An optional first argument names a file: when given, every exchange with
+ * the card is also appended to it via rsp_record_open, producing a
+ * recording later rounds can replay with no reader attached (Task 5). Plain
+ * `make check-card` passes no argument, so the default run neither writes
+ * nor depends on one. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "rsp.h"
 
-int main(void) {
+int main(int argc, char **argv) {
     char *readers = NULL;
     long n = rsp_pcsc_readers(&readers);
     if(n <= 0) {
@@ -20,6 +26,18 @@ int main(void) {
     rsp_transport_t t;
     int rc = rsp_pcsc_open(NULL, &t);
     if(rc != 0) { fprintf(stderr, "cannot open the card: %d\n", rc); return 2; }
+
+    if(argc > 1) {
+        /* rsp_record_open takes ownership of t: the pcsc transport passed
+           in must not be closed separately afterward (include/rsp.h). */
+        rsp_transport_t recorded;
+        rc = rsp_record_open(&t, argv[1], &recorded);
+        if(rc != 0) {
+            fprintf(stderr, "cannot open the recording %s: %d\n", argv[1], rc);
+            return 2;
+        }
+        t = recorded;
+    }
 
     rsp_card_info_t info;
     memset(&info, 0, sizeof info);

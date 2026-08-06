@@ -1,6 +1,9 @@
 /* The commands, end to end against a recording: select, EUICCInfo2, EID.
-   The response DER here was produced with the generated encoder, not written
-   by hand -- see testdata/cards/README.md for the command that makes it. */
+   The main flow below drives testdata/cards/omnikey-info.log, captured
+   verbatim from Task 5's session with this project's own test eUICC over
+   PC/SC (see testdata/cards/README.md) -- so this is no longer a synthetic
+   payload the generated encoder produced, but the real card's own bytes,
+   asserted against the real card's own answer. */
 #include <stdio.h>
 #include <string.h>
 #include "rsp.h"
@@ -14,14 +17,24 @@ static void ok(const char *what, int cond) {
 int main(void) {
     rsp_transport_t t;
     ok("the recording opens",
-       rsp_replay_open("testdata/cards/synthetic-info.log", &t) == 0);
+       rsp_replay_open("testdata/cards/omnikey-info.log", &t) == 0);
 
     rsp_card_info_t info;
     memset(&info, 0, sizeof info);
     ok("the card is read", rsp_card_read_info(&t, &info) == 0);
     ok("the EID arrived", info.have_eid);
+
+    /* What the card in the OMNIKEY reader actually answered during Task 5's
+       session, byte for byte, per testdata/cards/omnikey-info.log. */
+    static const uint8_t expected_eid[16] = {
+        0x89, 0x04, 0x90, 0x32, 0x12, 0x34, 0x51, 0x23,
+        0x45, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x35
+    };
+    ok("the EID is the real card's own",
+       memcmp(info.eid, expected_eid, sizeof expected_eid) == 0);
     ok("the version is parsed", strcmp(info.svn, "2.2.0") == 0);
-    ok("at least one issuer is listed", info.ci_count >= 1);
+    ok("the issuer count matches what the real card listed",
+       info.ci_count == 2);
 
     /* The identifier the recording carries must be recognised, and one that
        differs in a single byte must not be. */
@@ -73,12 +86,13 @@ int main(void) {
        SELECT of the ISD-R with '61 21', ISO/IEC 7816-4 response chaining,
        not a bare '9000' -- and the first version of rsp_card_select_isdr
        treated anything but an exact '9000' as a refusal, so it never got
-       past the very first exchange against real hardware. synthetic-info.log
-       above now carries exactly that '61xx' shape, copied byte-for-byte
-       from a probe against the real card, so "the card is read" already
-       exercises the chaining. This second recording pins the other shape
-       ISO/IEC 7816-4 also permits -- a SELECT answering 9000 directly,
-       with no FCI at all -- so that path stays covered too. */
+       past the very first exchange against real hardware. omnikey-info.log
+       above carries exactly that '61xx' shape, straight from the card
+       itself now (Task 5), so "the card is read" already exercises the
+       chaining. This second, still-synthetic recording pins the other
+       shape ISO/IEC 7816-4 also permits -- a SELECT answering 9000
+       directly, with no FCI at all -- a shape this particular card does
+       not itself produce, so it stays covered only here. */
     rsp_transport_t t2;
     ok("the direct-SELECT recording opens",
        rsp_replay_open("testdata/cards/synthetic-info-direct-select.log", &t2) == 0);

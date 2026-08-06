@@ -33,6 +33,15 @@ fetching public identifiers such as the EID. None of that is secret, and
 a recording of it is public data, safe to commit and safe to paste into
 an issue or a review comment.
 
+That said, a recording made against real hardware -- `omnikey-info.log`
+below, unlike the hand-built `synthetic-*.log` files above it -- carries a
+real device's identity: its actual EID, and the SubjectKeyIdentifiers of
+the certificate issuers that actual card trusts. Not secret, in the sense
+that a card readily hands both to anything that asks. But it is one real
+eUICC's own identity, not an invented placeholder, and worth remembering
+that before treating every recording in this directory as equally
+disposable.
+
 That stops being true the moment a recording covers a *write* session --
 loading a profile, or any exchange that carries SCP03t-protected
 segments, session keys, or profile content. Those recordings carry
@@ -235,3 +244,63 @@ secondary fixture, so that path (no GET RESPONSE needed) stays covered
 too. It is not what this project's own card does, and `tests/test_es10.c`
 does not drive its main assertions against it for that reason; the
 realistic, real-hardware shape is what the main flow now uses.
+
+## `omnikey-info.log`
+
+This one is not synthetic at all, and not a single exchange hand-copied
+from a probe either: it is a whole session, every command and response,
+captured straight off the wire by wrapping the PC/SC transport in
+`rsp_record_open` (Task 5). `tests/test_card.c` takes an optional first
+argument for exactly this: given a path, it records the session it reads
+to that file as well as printing it. It was produced with:
+
+```
+cd ~/git/waigel/euicc-rsp
+make tests/run-card
+./tests/run-card testdata/cards/omnikey-info.log
+```
+
+against the OMNIKEY AG Smart Card Reader USB and this project's own test
+eUICC. The card answered:
+
+```
+EID  89049032123451234512345678901235
+SVN  2.2.0
+issuers 2
+CI[0] C0BC70BA36929D43B467FF57570530E57AB8FCD8
+CI[1] F54172BDF98A95D65CBEB88A38A1C11D800A85C3
+```
+
+`tests/test_es10.c` now drives its main assertions against this
+recording instead of `synthetic-info.log`, and asserts that exact EID,
+`"2.2.0"`, and an issuer count of 2 -- the real card's own answer, not an
+invented one. `synthetic-info.log` and `synthetic-info-direct-select.log`
+stay in the tree and in the suite for the reasons given above: the direct
+SELECT (`9000`, no FCI) shape they cover is one this particular card does
+not itself produce, and losing that coverage to gain realism elsewhere
+would be a poor trade.
+
+Two lines are deliberately absent from this file even though the same
+run printed them to the terminal: PC/SC's own protocol-negotiation
+messages ("asking for T0|T1 failed... fell back to asking for T0 alone",
+"connected, negotiated protocol T=0"). Those come from `rsp_pcsc_open`,
+which runs and finishes before `rsp_record_open` ever wraps the
+resulting transport, so nothing about the negotiation is or could be
+part of the recorded exchange; the file begins directly with the ISD-R
+SELECT.
+
+This recording also settles the question the whole round existed to
+answer: does this card trust the GSMA SGP.26 test CI our test DPauth/DPpb
+credentials chain to?
+
+```
+openssl x509 -in testdata/sgp26/ci.der -inform DER -noout -text | grep -A1 "Subject Key Identifier"
+```
+
+reports `F5:41:72:BD:F9:8A:95:D6:5C:BE:B8:8A:38:A1:C1:1D:80:0A:85:C3`,
+byte-for-byte `CI[1]` above with the colons removed. It does: this card's
+own trust list carries our test CI. `CI[0]` is a second, distinct trusted
+issuer this recording does not otherwise identify; the identifier's shape
+is consistent with GSMA's production root CI, but that is a probable
+identification from context, not something this recording or this round
+confirms on its own.
