@@ -317,6 +317,19 @@ int rsp_replay_open(const char *path, rsp_transport_t *out);
 int rsp_record_open(rsp_transport_t *inner, const char *path,
                     rsp_transport_t *out);
 
+/* The transport that carries bytes to actual hardware, over PC/SC. See
+   src/rsp_pcsc.c for the citation trail and the three failures a person
+   actually hits when using it. */
+
+/* Connect to a reader. `reader` names one, or is NULL to take the only one
+   attached. Returns 0; -2 with a message on stderr when there is no reader,
+   no card, or the card is held by another process. */
+int rsp_pcsc_open(const char *reader, rsp_transport_t *out);
+
+/* The attached readers, NUL-separated and terminated by an empty string.
+   The caller frees. Returns the count, or -2. */
+long rsp_pcsc_readers(char **out);
+
 /* Send one ES10 request to the ISD-R and collect the whole answer, driving
    command chaining outward and 61xx/GET RESPONSE inward (SGP.22 v2.6
    section 5.7.2 -- see src/rsp_es10.c for the full citation trail). `req`

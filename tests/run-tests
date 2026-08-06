@@ -9,6 +9,13 @@ for t in "$here"/run-*; do
     # "run-*" matches this script's own name (run-tests). Without this
     # guard the loop invokes itself and recurses until fork() fails.
     [ "$(basename "$t")" = "run-tests" ] && continue
+    # run-card needs a real reader and is deliberately excluded from
+    # "make check" (see the Makefile's TESTS filter-out). Without this
+    # guard, a run-card binary left over from an earlier "make check-card"
+    # would still be sitting in this directory and this glob -- unlike
+    # make's own dependency list -- has no idea it is supposed to be
+    # skipped, so "make check" would go on to run it anyway.
+    [ "$(basename "$t")" = "run-card" ] && continue
     "$t" || status=1
 done
 exit $status

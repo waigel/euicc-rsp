@@ -30,7 +30,17 @@ ifeq ($(shell uname -s),Darwin)
 EXTRA   += -D_DARWIN_C_SOURCE
 endif
 
-ALL_CFLAGS = $(STD) $(WARN) $(CFLAGS) $(EXTRA) $(INC) $(DEF)
+# PC/SC is the system smartcard library. macOS ships it as a framework;
+# Linux needs the pcsc-lite headers, the one dependency this project asks a
+# Linux user to install.
+ifeq ($(shell uname -s),Darwin)
+PCSC_LIBS := -framework PCSC
+else
+PCSC_CFLAGS := $(shell pkg-config --cflags libpcsclite 2>/dev/null)
+PCSC_LIBS   := $(shell pkg-config --libs libpcsclite 2>/dev/null || echo -lpcsclite)
+endif
+
+ALL_CFLAGS = $(STD) $(WARN) $(CFLAGS) $(EXTRA) $(INC) $(DEF) $(PCSC_CFLAGS)
 
 # build/sgp26_material.c embeds the published SGP.26 test material (see
 # testdata/sgp26/) as byte arrays, generated with tools/bin2c so the
@@ -138,9 +148,13 @@ GEN_INC := -idirafter $(DIST)
 # passed without ever running the new test -- a green suite that quietly
 # checked less than it claimed to. Derived from the test sources themselves
 # instead: adding tests/test_whatever.c is now sufficient on its own.
-TESTS   := $(patsubst tests/test_%.c,tests/run-%,$(wildcard tests/test_*.c))
+#
+# tests/run-card is the one exception, filtered back out: it needs a real
+# reader, CI has none, and a hardware test that passes when the hardware is
+# absent proves nothing. It gets its own target, check-card, below.
+TESTS   := $(filter-out tests/run-card,$(patsubst tests/test_%.c,tests/run-%,$(wildcard tests/test_*.c)))
 
-.PHONY: all check clean mbedtls codec
+.PHONY: all check check-card clean mbedtls codec
 
 # build/sgp26_material.c is the first target textually in this file, so
 # without this, GNU Make's default goal (what bare "make" builds) would be
@@ -198,7 +212,7 @@ $(LIB): $(OBJS)
 	ar rcs $@ $(OBJS)
 
 tests/run-%: tests/test_%.c $(LIB) $(MBED_LIBS) $(DIST)/.stamp
-	$(CC) $(ALL_CFLAGS) $(GEN_INC) $< $(LIB) $(DIST)/*.o $(MBED_LIBS) -o $@
+	$(CC) $(ALL_CFLAGS) $(GEN_INC) $< $(LIB) $(DIST)/*.o $(MBED_LIBS) $(PCSC_LIBS) -o $@
 	@# On Darwin, a -g link auto-generates a companion run-%.dSYM directory.
 	@# tests/run-tests globs "run-*", so that bundle would be picked up and
 	@# "run" as if it were a test binary. Drop it: it is a build byproduct,
@@ -208,12 +222,21 @@ tests/run-%: tests/test_%.c $(LIB) $(MBED_LIBS) $(DIST)/.stamp
 check: $(TESTS)
 	./tests/run-tests
 
+# The real card. Excluded from `check` on purpose: CI has no reader, and a
+# hardware test that passes when the hardware is missing proves nothing.
+check-card: tests/run-card
+	./tests/run-card
+
+tests/run-card: tests/test_card.c $(LIB) $(MBED_LIBS) $(DIST)/.stamp
+	$(CC) $(ALL_CFLAGS) $(GEN_INC) $< $(LIB) $(DIST)/*.o $(MBED_LIBS) $(PCSC_LIBS) -o $@
+	@rm -rf $@.dSYM
+
 # tools/bpp-dump builds a Bound Profile Package and prints its structure, so
 # a person can look at the artifact the suite only proves correct. It is a
 # demonstration and stays out of the way: "all" does not build it and "check"
 # does not run it, so it can never be why a build or a test run fails.
 tools/bpp-dump: tools/bpp-dump.c $(LIB) $(MBED_LIBS) $(DIST)/.stamp
-	$(CC) $(ALL_CFLAGS) $(GEN_INC) $< $(LIB) $(DIST)/*.o $(MBED_LIBS) -o $@
+	$(CC) $(ALL_CFLAGS) $(GEN_INC) $< $(LIB) $(DIST)/*.o $(MBED_LIBS) $(PCSC_LIBS) -o $@
 	@rm -rf $@.dSYM
 
 clean:
