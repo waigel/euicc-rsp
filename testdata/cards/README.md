@@ -190,17 +190,48 @@ BF226E810302010082030202008303060000840881020100820201008502000088020000A92C0414
 BF3E125A10890330121122334455667788990011FF
 ```
 
-The SELECT of the ISD-R and the STORE DATA framing (CLA/INS/P1/P2/Lc/Le)
-around each ES10 request and response are hand-assembled in
-`synthetic-info.log` itself, per the citations in `src/rsp_es10.c`'s file
-header -- only the two ES10 payloads above needed the generated encoder,
-since those are the only two fields a hand-written blob could get subtly
-wrong without the decoder noticing. `svn` is `02 02 00`, decoding to
-"2.2.0"; the EID and both CI identifier lists are otherwise arbitrary
-synthetic bytes, not tied to any real card or issuer.
+The STORE DATA framing (CLA/INS/P1/P2/Lc/Le) around each ES10 request and
+response is hand-assembled in `synthetic-info.log` itself, per the
+citations in `src/rsp_es10.c`'s file header -- only the two ES10 payloads
+above needed the generated encoder, since those are the only two fields a
+hand-written blob could get subtly wrong without the decoder noticing.
+`svn` is `02 02 00`, decoding to "2.2.0"; the EID and both CI identifier
+lists are otherwise arbitrary synthetic bytes, not tied to any real card
+or issuer.
 
 To regenerate: save the program above, compile and run it exactly as its
 own header comment says, then splice its two hex lines into
 `synthetic-info.log` in place of the current `EUICCInfo2`/
 `GetEuiccDataResponse` response lines (keep the trailing ` 9000` each
 already carries).
+
+## The SELECT exchange: real hardware, not an assumption
+
+`synthetic-info.log`'s SELECT of the ISD-R is not hand-assembled and not
+generated either -- fix round 2 replaced it with a byte-for-byte copy of a
+real probe against this project's own test eUICC over PC/SC at T=0, once
+Task 4 first reached the card:
+
+```
+SELECT ISD-R -> 6121
+GET RESPONSE -> 6F1F 8410 A0000005591010FFFFFFFF8900000100 A504 9F6501FF E005 82030202 00 9000
+```
+
+Fix round 1's fixture had SELECT answer a bare `9000`, guessed rather than
+observed -- and no real card that returns an FCI on SELECT actually does
+that. `rsp_card_select_isdr` matched that guess (treating anything but an
+exact `9000` as a refusal), and the test agreed with both, so the defect
+survived until real hardware exposed it: the card's actual `61 21` ("33
+more bytes waiting") was read as a refusal, and `rsp_card_select_isdr`
+never sent the GET RESPONSE that status asks for. The FCI the GET
+RESPONSE above carries is itself informative -- `84 10 <AID>` echoes the
+AID just selected, and `E0 05 82 03 02 02 00` is the card's own SGP.22
+version, "2.2.0", the same version `EUICCInfo2.svn` reports later in the
+same recording.
+
+`synthetic-info-direct-select.log` keeps the other shape ISO/IEC 7816-4
+also permits -- SELECT answering `9000` directly, no FCI at all -- as a
+secondary fixture, so that path (no GET RESPONSE needed) stays covered
+too. It is not what this project's own card does, and `tests/test_es10.c`
+does not drive its main assertions against it for that reason; the
+realistic, real-hardware shape is what the main flow now uses.

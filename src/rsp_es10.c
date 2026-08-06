@@ -127,16 +127,18 @@
  * under the same P2. */
 #define ES10_MAX_BLOCKS 256u
 
-/* Bounds on the inward response-collection loop: GPCS section 11.1.5
- * caps one exchange's response data at 256 bytes and every other length
- * field in the spec at a 3-byte BER-TLV encoding, i.e. 65535 -- the
- * largest total response this function accumulates before giving up.
- * Reaching that many bytes at 256 per round trip takes at most 256 GET
- * RESPONSE calls, so more than that -- with or without data arriving on
- * each one -- is a chain that is not terminating, not a legitimately
- * large answer. */
-#define ES10_MAX_RESPONSE 65535u
-#define ES10_MAX_GETRESP  256u
+/* Bounds on the inward response-collection loop (iso_collect_response,
+ * below): GPCS section 11.1.5 caps one exchange's response data at 256
+ * bytes and every other length field in the spec at a 3-byte BER-TLV
+ * encoding, i.e. 65535 -- the largest total response that loop
+ * accumulates before giving up. Reaching that many bytes at 256 per round
+ * trip takes at most 256 GET RESPONSE calls, so more than that -- with or
+ * without data arriving on each one -- is a chain that is not
+ * terminating, not a legitimately large answer. Named CHAIN_ rather than
+ * ES10_: this loop is shared with rsp_card_select_isdr's plain SELECT, not
+ * exclusive to STORE DATA -- see iso_collect_response's own comment. */
+#define CHAIN_MAX_RESPONSE 65535u
+#define CHAIN_MAX_GETRESP  256u
 
 /* Growable output buffer: appends data (n bytes) to *buf, growing *cap as
  * needed and updating *len. Returns 0, or -1 on an allocation failure
@@ -159,6 +161,90 @@ static int es10_append(uint8_t **buf, size_t *len, size_t *cap,
     return 0;
 }
 
+/* Collects the full response to one APDU exchange that may be chained
+ * through ISO/IEC 7816-4's '61xx'/GET RESPONSE mechanism (see the
+ * top-of-file comment for the citations: SGP.22 v2.6 section 5.7.2 for an
+ * ES10 STORE DATA response, GPCS section 11.1.5.2 restating the same rule
+ * for any GlobalPlatform command, ISO/IEC 7816-4 itself for GET RESPONSE's
+ * own encoding). This is the one piece rsp_es10_send's STORE DATA framing
+ * and rsp_card_select_isdr's plain SELECT actually share: both send a
+ * single APDU (the last STORE DATA block, or the SELECT itself) and then
+ * face exactly the same inward chaining rule on whatever comes back. The
+ * two callers' outward framing does not share anything to factor -- STORE
+ * DATA's block splitting and SELECT's fixed AID payload are genuinely
+ * different wire shapes -- so only this inward half is a single copy;
+ * writing it twice would have been the "two implementations of one rule"
+ * duplication this project's first half already had to unpick once.
+ *
+ * On entry, n is t->transceive's return value for the exchange the caller
+ * already sent, and resp/resp_cap is the buffer that answer landed in --
+ * the same buffer this function goes on reusing for every GET RESPONSE it
+ * sends. Returns 0 with *out (malloc'ed, the caller's) and *out_len set to
+ * the accumulated data with its status bytes stripped; -1 if the chain
+ * ended in a real refusal, with *sw set to that status; -2 if the
+ * exchange could not happen, or the chain would not terminate within
+ * CHAIN_MAX_RESPONSE/CHAIN_MAX_GETRESP. */
+static int iso_collect_response(rsp_transport_t *t, long n,
+                                uint8_t *resp, size_t resp_cap,
+                                uint8_t **out, size_t *out_len, unsigned *sw)
+{
+    uint8_t *acc = NULL;
+    size_t acc_len = 0, acc_cap = 0;
+    unsigned getresp_count = 0;
+
+    for (;;) {
+        if (n < 2) {
+            free(acc);
+            return -2;
+        }
+
+        unsigned this_sw = (unsigned)((resp[(size_t)n - 2] << 8) |
+                                      resp[(size_t)n - 1]);
+        size_t data_len = (size_t)n - 2;
+
+        if ((this_sw & 0xFF00u) == 0x6100u) {
+            if (es10_append(&acc, &acc_len, &acc_cap, resp, data_len) != 0) {
+                free(acc);
+                return -2;
+            }
+            if (acc_len > CHAIN_MAX_RESPONSE) {
+                fprintf(stderr, "rsp_es10: response exceeds %u bytes, "
+                                "refusing to keep chaining\n",
+                        CHAIN_MAX_RESPONSE);
+                free(acc);
+                return -2;
+            }
+            if (++getresp_count > CHAIN_MAX_GETRESP) {
+                fprintf(stderr, "rsp_es10: %u GET RESPONSE round trips "
+                                "without the chain ending, refusing to "
+                                "keep waiting\n", getresp_count - 1);
+                free(acc);
+                return -2;
+            }
+            uint8_t gr[5] = {
+                (uint8_t)GETRESP_CLA, (uint8_t)GETRESP_INS,
+                0x00, 0x00, (uint8_t)(this_sw & 0xFFu)
+            };
+            n = t->transceive(t, gr, sizeof gr, resp, resp_cap);
+            continue;
+        }
+
+        if (this_sw == 0x9000u) {
+            if (es10_append(&acc, &acc_len, &acc_cap, resp, data_len) != 0) {
+                free(acc);
+                return -2;
+            }
+            *out = acc;
+            *out_len = acc_len;
+            return 0;
+        }
+
+        free(acc);
+        *sw = this_sw;
+        return -1;
+    }
+}
+
 int rsp_es10_send(rsp_transport_t *t, const uint8_t *req, size_t req_len,
                   uint8_t **out, size_t *out_len, unsigned *sw)
 {
@@ -174,15 +260,11 @@ int rsp_es10_send(rsp_transport_t *t, const uint8_t *req, size_t req_len,
         (req_len + ES10_MAX_BLOCK - 1) / ES10_MAX_BLOCK : 1;
     if (needed_blocks > ES10_MAX_BLOCKS) return -2;
 
-    uint8_t *acc = NULL;
-    size_t acc_len = 0, acc_cap = 0;
-
     uint8_t cmd[6 + ES10_MAX_BLOCK]; /* CLA,INS,P1,P2,Lc + up to 255 data + Le */
     uint8_t resp[258]; /* up to 256 bytes of data plus the two status bytes */
 
     size_t sent = 0;
     unsigned block_no = 0;
-    unsigned getresp_count = 0;
 
     for (;;) {
         size_t remain = req_len - sent;
@@ -207,16 +289,17 @@ int rsp_es10_send(rsp_transport_t *t, const uint8_t *req, size_t req_len,
              * intermediate block of data of a BPP TLV, the response
              * message SHALL not contain data field") -- see the
              * top-of-file comment for why this is 5.7.6's rule, not
-             * GPCS's. */
+             * GPCS's. Nothing has been accumulated yet at this point (the
+             * accumulator lives inside iso_collect_response, entered only
+             * once the last block is sent below), so there is nothing to
+             * free on any of these early returns. */
             if (n < 2) {
-                free(acc);
                 return -2;
             }
             unsigned isw = (unsigned)((resp[(size_t)n - 2] << 8) |
                                       resp[(size_t)n - 1]);
             if (isw != 0x9000u) {
                 /* A real refusal, whatever bytes came with it. */
-                free(acc);
                 *sw = isw;
                 return -1;
             }
@@ -235,66 +318,16 @@ int rsp_es10_send(rsp_transport_t *t, const uint8_t *req, size_t req_len,
                                 "response carried %zu bytes of data; "
                                 "section 5.7.6 forbids that\n",
                         block_no - 1, (size_t)n - 2);
-                free(acc);
                 return -2;
             }
             continue;
         }
 
         /* The last block was just sent: collect the (possibly chained)
-         * response that follows it. */
-        for (;;) {
-            if (n < 2) {
-                free(acc);
-                return -2;
-            }
-
-            unsigned this_sw = (unsigned)((resp[(size_t)n - 2] << 8) |
-                                          resp[(size_t)n - 1]);
-            size_t data_len = (size_t)n - 2;
-
-            if ((this_sw & 0xFF00u) == 0x6100u) {
-                if (es10_append(&acc, &acc_len, &acc_cap, resp, data_len) != 0) {
-                    free(acc);
-                    return -2;
-                }
-                if (acc_len > ES10_MAX_RESPONSE) {
-                    fprintf(stderr, "rsp_es10_send: response exceeds "
-                                    "%u bytes, refusing to keep "
-                                    "chaining\n", ES10_MAX_RESPONSE);
-                    free(acc);
-                    return -2;
-                }
-                if (++getresp_count > ES10_MAX_GETRESP) {
-                    fprintf(stderr, "rsp_es10_send: %u GET RESPONSE "
-                                    "round trips without the chain "
-                                    "ending, refusing to keep waiting\n",
-                            getresp_count - 1);
-                    free(acc);
-                    return -2;
-                }
-                uint8_t gr[5] = {
-                    (uint8_t)GETRESP_CLA, (uint8_t)GETRESP_INS,
-                    0x00, 0x00, (uint8_t)(this_sw & 0xFFu)
-                };
-                n = t->transceive(t, gr, sizeof gr, resp, sizeof resp);
-                continue;
-            }
-
-            if (this_sw == 0x9000u) {
-                if (es10_append(&acc, &acc_len, &acc_cap, resp, data_len) != 0) {
-                    free(acc);
-                    return -2;
-                }
-                *out = acc;
-                *out_len = acc_len;
-                return 0;
-            }
-
-            free(acc);
-            *sw = this_sw;
-            return -1;
-        }
+         * response that follows it -- the same inward chaining
+         * rsp_card_select_isdr's plain SELECT also faces, so it is one
+         * shared function rather than a second copy of this loop. */
+        return iso_collect_response(t, n, resp, sizeof resp, out, out_len, sw);
     }
 }
 
@@ -310,7 +343,21 @@ int rsp_es10_send(rsp_transport_t *t, const uint8_t *req, size_t req_len,
  * happened to be selected before. SELECT itself is plain ISO/IEC 7816-4
  * (CLA '00', INS 'A4', P1 '04' select-by-name, P2 '00' first-or-only
  * occurrence), not part of SGP.22 or GPCS's STORE DATA mechanism above, so
- * it does not go through rsp_es10_send.
+ * its outward framing does not go through rsp_es10_send.
+ *
+ * Its inward half is a different matter. Fix round 2, real hardware: this
+ * project's own eUICC answers SELECT of the ISD-R with '61 21' -- ISO/IEC
+ * 7816-4 response chaining, "33 more bytes are waiting", the card's FCI
+ * carrying its AID and SGP.22 version back -- not a bare '9000'. The first
+ * version of this function treated anything but an exact '9000' as a
+ * refusal and never sent the GET RESPONSE that '61xx' asks for, so it
+ * could not get past the very first exchange against a real card. That
+ * chaining is exactly what iso_collect_response already implements for
+ * rsp_es10_send's STORE DATA responses, so SELECT calls the same function
+ * rather than a second, narrower copy of the same rule -- this project's
+ * first half already had to unpick two implementations of one thing once.
+ * SELECT's FCI data itself is not used by anything above and is freed
+ * unread; only the chaining, and the final status word, matter here.
  */
 
 #define ISDR_AID_LEN 16
@@ -320,10 +367,12 @@ static const uint8_t isdr_aid[ISDR_AID_LEN] = {
     0xFF, 0xFF, 0xFF, 0x89, 0x00, 0x00, 0x01, 0x00
 };
 
-/* Select the ISD-R. Returns 0, -1 if the card refused (a non-9000 status,
-   whatever it carries -- there is no *sw out-parameter here since nothing
-   above needs to distinguish one refusal from another for a SELECT), -2 if
-   the exchange could not happen at all. */
+/* Select the ISD-R. Returns 0, -1 if the card refused (a non-9000,
+   non-61xx status, whatever it carries -- there is no *sw out-parameter
+   here since nothing above needs to distinguish one refusal from another
+   for a SELECT), -2 if the exchange could not happen at all, including a
+   chain that would not terminate within iso_collect_response's own
+   bounds. */
 static int rsp_card_select_isdr(rsp_transport_t *t)
 {
     uint8_t cmd[5 + ISDR_AID_LEN + 1];
@@ -338,11 +387,13 @@ static int rsp_card_select_isdr(rsp_transport_t *t)
     cmd[5 + ISDR_AID_LEN] = 0x00; /* Le */
 
     long n = t->transceive(t, cmd, sizeof cmd, resp, sizeof resp);
-    if (n < 2) return -2;
 
-    unsigned sw = (unsigned)((resp[(size_t)n - 2] << 8) | resp[(size_t)n - 1]);
-    if (sw != 0x9000u) return -1;
-    return 0;
+    uint8_t *fci = NULL;
+    size_t fci_len = 0;
+    unsigned sw = 0;
+    int rc = iso_collect_response(t, n, resp, sizeof resp, &fci, &fci_len, &sw);
+    free(fci); /* the FCI template: unread, nothing above needs it */
+    return rc;
 }
 
 /* Both requests are the fixed, argument-less encodings the brief gives

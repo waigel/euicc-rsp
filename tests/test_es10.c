@@ -68,5 +68,26 @@ int main(void) {
 
     rsp_card_info_free(&info);
     t.close(&t);
+
+    /* Fix round 2, real hardware: this project's own test eUICC answers
+       SELECT of the ISD-R with '61 21', ISO/IEC 7816-4 response chaining,
+       not a bare '9000' -- and the first version of rsp_card_select_isdr
+       treated anything but an exact '9000' as a refusal, so it never got
+       past the very first exchange against real hardware. synthetic-info.log
+       above now carries exactly that '61xx' shape, copied byte-for-byte
+       from a probe against the real card, so "the card is read" already
+       exercises the chaining. This second recording pins the other shape
+       ISO/IEC 7816-4 also permits -- a SELECT answering 9000 directly,
+       with no FCI at all -- so that path stays covered too. */
+    rsp_transport_t t2;
+    ok("the direct-SELECT recording opens",
+       rsp_replay_open("testdata/cards/synthetic-info-direct-select.log", &t2) == 0);
+    rsp_card_info_t info2;
+    memset(&info2, 0, sizeof info2);
+    ok("the card is read when SELECT answers 9000 directly",
+       rsp_card_read_info(&t2, &info2) == 0);
+    rsp_card_info_free(&info2);
+    t2.close(&t2);
+
     return fails ? 1 : 0;
 }
