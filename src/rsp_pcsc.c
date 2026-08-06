@@ -195,14 +195,51 @@ int rsp_pcsc_open(const char *reader, rsp_transport_t *out)
         use = list;   /* the sole name, NUL-terminated */
     }
 
+    /* SCARD_PROTOCOL_T0|SCARD_PROTOCOL_T1 is the right request to make --
+     * it asks PC/SC to negotiate whichever protocol the card actually
+     * supports, and it is what every portable PC/SC client sends. But at
+     * least one real combination (an OMNIKEY AG Smart Card Reader USB on
+     * macOS, confirmed against real hardware, not a guess) answers that
+     * combined request with SCARD_W_UNRESPONSIVE_CARD even though the
+     * exact same card connects fine when asked for T0 alone -- the stack
+     * mishandles the combined request, not the request itself, and there
+     * is nothing on this side of the interface that makes that go away.
+     *
+     * So: ask for the combined mask first, since it is correct and works
+     * everywhere that does not have this quirk. If that fails, retry with
+     * each single protocol in turn. A silent fallback that happens to
+     * work is only marginally better than a loud failure that does not --
+     * either way the next person has no way to tell what actually
+     * happened -- so every attempt after the first, and the protocol that
+     * ultimately got negotiated, is reported on stderr. If every attempt
+     * fails, the error reported and returned is the first attempt's: the
+     * combined request is the one whose failure is actually diagnostic,
+     * where "protocol mismatch" from a single-protocol retry is not
+     * telling you anything you did not already ask for. */
+    static const DWORD protocols[] = {
+        SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1,
+        SCARD_PROTOCOL_T0,
+        SCARD_PROTOCOL_T1,
+    };
+    static const char *const protocol_names[] = { "T0|T1", "T0", "T1" };
+
     SCARDHANDLE card;
     DWORD active_protocol = 0;
-    rv = SCardConnect(ctx, use, SCARD_SHARE_SHARED,
-                      SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1,
-                      &card, &active_protocol);
+    LONG first_rv = SCARD_S_SUCCESS;
+    size_t connected_at = (size_t)-1;
+    for (size_t i = 0; i < sizeof protocols / sizeof protocols[0]; i++) {
+        rv = SCardConnect(ctx, use, SCARD_SHARE_SHARED, protocols[i],
+                          &card, &active_protocol);
+        if (i == 0) first_rv = rv;
+        if (rv == SCARD_S_SUCCESS) {
+            connected_at = i;
+            break;
+        }
+    }
     free(list);
 
-    if (rv != SCARD_S_SUCCESS) {
+    if (connected_at == (size_t)-1) {
+        rv = first_rv;   /* the combined request's failure is the diagnostic one */
         if (rv == (LONG)SCARD_E_NO_SMARTCARD) {
             fprintf(stderr, "rsp_pcsc: the reader is there, but no card is "
                              "in it\n");
@@ -219,6 +256,14 @@ int rsp_pcsc_open(const char *reader, rsp_transport_t *out)
         SCardReleaseContext(ctx);
         return -2;
     }
+
+    if (connected_at > 0) {
+        fprintf(stderr, "rsp_pcsc: asking for T0|T1 failed (%s); fell back "
+                         "to asking for %s alone\n",
+                pcsc_stringify_error(first_rv), protocol_names[connected_at]);
+    }
+    fprintf(stderr, "rsp_pcsc: connected, negotiated protocol %s\n",
+            active_protocol == SCARD_PROTOCOL_T1 ? "T=1" : "T=0");
 
     rsp_pcsc_state_t *st = malloc(sizeof *st);
     if (!st) {
