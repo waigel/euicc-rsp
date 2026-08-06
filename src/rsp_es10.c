@@ -69,6 +69,37 @@
  * proactive command) reads as a refusal here. That is narrower than
  * section 5.7.2 allows; deciding what to do about a pending proactive
  * command is left to whichever caller needs it, not this function.
+ *
+ * What an intermediate block's response must look like is section 5.7.6's,
+ * not GPCS's: SGP.22 v2.6 section 5.7.6 (LoadBoundProfilePackage),
+ * "Response Data": "The data presence in the response message depends on
+ * the block status: For an intermediate block of data of a BPP TLV, the
+ * response message SHALL not contain data field." (GPCS section 11.1.5.1
+ * states a same-shaped rule for its own "more commands" chaining, but that
+ * clause opens by naming exactly which commands it governs -- DELETE,
+ * INSTALL and PUT KEY -- and STORE DATA is not one of them, so it is not
+ * this rule's source.) A bare '90 00' is therefore the only response an
+ * intermediate block may legitimately receive; a '90 00' that arrives
+ * with a data field anyway is the card breaking that rule, not a status
+ * this function's caller can reason about through *sw the way rsp.h
+ * documents it (a genuine refusal status) -- so that case is reported as
+ * -2, same as any other exchange that could not happen, not as -1 with
+ * *sw holding the paradox of "refused, status 9000".
+ *
+ * The inward response-collection loop is bounded in both directions a
+ * non-terminating chain could otherwise exploit: GPCS section 11.1.5
+ * caps what one exchange can carry ("a maximum length of 256 bytes of
+ * response data") and caps every other length field in the spec at a
+ * 3-byte BER-TLV encoding ("3 bytes for a length up to 65535, except
+ * where otherwise stated") -- so 65535 bytes total and, since reaching
+ * that many bytes at 256 per round trip takes at most 256 round trips,
+ * 256 GET RESPONSE round trips are the ceiling this function accepts
+ * before refusing to keep chaining. Both bounds exist because a card (or
+ * a hand-edited recording) that keeps answering '61xx' forever is the
+ * same failure the brief warns about elsewhere -- "a card that simply
+ * stops answering" -- wearing a different hat: a card that never stops
+ * *promising* an answer hangs this function exactly as badly as one that
+ * never answers at all, unless something here refuses to keep waiting.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -88,6 +119,24 @@
 
 #define GETRESP_CLA 0x00u
 #define GETRESP_INS 0xC0u    /* GET RESPONSE, ISO/IEC 7816-4 */
+
+/* P2 (the block number) is one byte -- GPCS section 11.11.2.2 codes it
+ * "sequentially from '00' to 'FF'" -- so a request needing more than 256
+ * blocks has no representable P2 for its later blocks; refuse it outright
+ * rather than silently wrapping block_no back to 0 and sending two blocks
+ * under the same P2. */
+#define ES10_MAX_BLOCKS 256u
+
+/* Bounds on the inward response-collection loop: GPCS section 11.1.5
+ * caps one exchange's response data at 256 bytes and every other length
+ * field in the spec at a 3-byte BER-TLV encoding, i.e. 65535 -- the
+ * largest total response this function accumulates before giving up.
+ * Reaching that many bytes at 256 per round trip takes at most 256 GET
+ * RESPONSE calls, so more than that -- with or without data arriving on
+ * each one -- is a chain that is not terminating, not a legitimately
+ * large answer. */
+#define ES10_MAX_RESPONSE 65535u
+#define ES10_MAX_GETRESP  256u
 
 /* Growable output buffer: appends data (n bytes) to *buf, growing *cap as
  * needed and updating *len. Returns 0, or -1 on an allocation failure
@@ -119,6 +168,12 @@ int rsp_es10_send(rsp_transport_t *t, const uint8_t *req, size_t req_len,
     *out_len = 0;
     *sw = 0;
 
+    /* A block count that would need a P2 past 'FF' has no way to be sent
+       at all -- see ES10_MAX_BLOCKS's comment. */
+    size_t needed_blocks = req_len ?
+        (req_len + ES10_MAX_BLOCK - 1) / ES10_MAX_BLOCK : 1;
+    if (needed_blocks > ES10_MAX_BLOCKS) return -2;
+
     uint8_t *acc = NULL;
     size_t acc_len = 0, acc_cap = 0;
 
@@ -127,6 +182,7 @@ int rsp_es10_send(rsp_transport_t *t, const uint8_t *req, size_t req_len,
 
     size_t sent = 0;
     unsigned block_no = 0;
+    unsigned getresp_count = 0;
 
     for (;;) {
         size_t remain = req_len - sent;
@@ -146,21 +202,41 @@ int rsp_es10_send(rsp_transport_t *t, const uint8_t *req, size_t req_len,
         block_no++;
 
         if (!last) {
-            /* An intermediate block carries no response data of its own
-             * (GPCS section 11.1.5.1: "a response of '9000' with no
-             * additional response data shall be returned" for every
-             * command in the sequence but the last); anything else means
-             * the exchange cannot continue. */
+            /* An intermediate block's response must not carry a data
+             * field (SGP.22 v2.6 section 5.7.6, "Response Data": "For an
+             * intermediate block of data of a BPP TLV, the response
+             * message SHALL not contain data field") -- see the
+             * top-of-file comment for why this is 5.7.6's rule, not
+             * GPCS's. */
             if (n < 2) {
                 free(acc);
                 return -2;
             }
             unsigned isw = (unsigned)((resp[(size_t)n - 2] << 8) |
                                       resp[(size_t)n - 1]);
-            if (n != 2 || isw != 0x9000u) {
+            if (isw != 0x9000u) {
+                /* A real refusal, whatever bytes came with it. */
                 free(acc);
                 *sw = isw;
                 return -1;
+            }
+            if (n != 2) {
+                /* The card said success but attached a data field
+                 * anyway -- section 5.7.6 forbids that for an
+                 * intermediate block, so this is the card breaking the
+                 * protocol, not a status rsp.h's *sw contract can carry
+                 * ("*sw set to that status" only applies to the -1 case,
+                 * a genuine refusal). Reporting -1 with *sw = 0x9000
+                 * would read as "refused, status: success", which the
+                 * caller cannot reason about; -2 says the exchange did
+                 * not go as an ES10 exchange can, same as any other
+                 * case this function gives up on. */
+                fprintf(stderr, "rsp_es10_send: intermediate block %u's "
+                                "response carried %zu bytes of data; "
+                                "section 5.7.6 forbids that\n",
+                        block_no - 1, (size_t)n - 2);
+                free(acc);
+                return -2;
             }
             continue;
         }
@@ -179,6 +255,21 @@ int rsp_es10_send(rsp_transport_t *t, const uint8_t *req, size_t req_len,
 
             if ((this_sw & 0xFF00u) == 0x6100u) {
                 if (es10_append(&acc, &acc_len, &acc_cap, resp, data_len) != 0) {
+                    free(acc);
+                    return -2;
+                }
+                if (acc_len > ES10_MAX_RESPONSE) {
+                    fprintf(stderr, "rsp_es10_send: response exceeds "
+                                    "%u bytes, refusing to keep "
+                                    "chaining\n", ES10_MAX_RESPONSE);
+                    free(acc);
+                    return -2;
+                }
+                if (++getresp_count > ES10_MAX_GETRESP) {
+                    fprintf(stderr, "rsp_es10_send: %u GET RESPONSE "
+                                    "round trips without the chain "
+                                    "ending, refusing to keep waiting\n",
+                            getresp_count - 1);
                     free(acc);
                     return -2;
                 }
