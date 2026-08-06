@@ -287,4 +287,25 @@ int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
 int rsp_bpp_recover(rsp_session_t *s, const uint8_t *bpp, size_t bpp_len,
                     uint8_t **upp, size_t *upp_len);
 
+/* A transport carries APDUs and knows nothing else. */
+typedef struct rsp_transport rsp_transport_t;
+struct rsp_transport {
+    /* Send one command APDU, receive one response APDU including its two
+       status bytes. Returns the response length, -1 if the card answered
+       something unusable, -2 if the exchange could not happen at all. */
+    long (*transceive)(rsp_transport_t *t, const uint8_t *cmd, size_t cmd_len,
+                       uint8_t *resp, size_t resp_cap);
+    void (*close)(rsp_transport_t *t);
+    void *ctx;
+};
+
+/* A transport that answers from a recording. Returns 0, or -2 if the file
+   cannot be read or parsed. */
+int rsp_replay_open(const char *path, rsp_transport_t *out);
+
+/* Wrap any transport so every exchange is appended to `path`. The wrapper
+   takes ownership of `inner` and must itself be closed. Returns 0 or -2. */
+int rsp_record_open(rsp_transport_t *inner, const char *path,
+                    rsp_transport_t *out);
+
 #endif /* RSP_H */
