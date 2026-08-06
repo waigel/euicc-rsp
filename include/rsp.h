@@ -308,4 +308,14 @@ int rsp_replay_open(const char *path, rsp_transport_t *out);
 int rsp_record_open(rsp_transport_t *inner, const char *path,
                     rsp_transport_t *out);
 
+/* Send one ES10 request to the ISD-R and collect the whole answer, driving
+   command chaining outward and 61xx/GET RESPONSE inward (SGP.22 v2.6
+   section 5.7.2 -- see src/rsp_es10.c for the full citation trail). `req`
+   is the DER of the request; `*out` is malloc'ed and belongs to the
+   caller and holds the response without its status bytes. Returns 0;
+   -1 when the card answered with a status other than 9000 or 61xx, with
+   *sw set to that status; -2 when the exchange could not happen. */
+int rsp_es10_send(rsp_transport_t *t, const uint8_t *req, size_t req_len,
+                  uint8_t **out, size_t *out_len, unsigned *sw);
+
 #endif /* RSP_H */
