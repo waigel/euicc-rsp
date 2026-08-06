@@ -377,10 +377,20 @@ int rsp_card_read_info(rsp_transport_t *t, rsp_card_info_t *out)
         return -2;
     }
 
-    if (info2->svn.size == 3) {
-        snprintf(out->svn, sizeof out->svn, "%u.%u.%u",
-                 info2->svn.buf[0], info2->svn.buf[1], info2->svn.buf[2]);
+    /* VersionType_constraint() (dist/VersionType.c) is the module's own
+       SIZE(3) check on this field, and ber_decode never calls it -- the
+       same gap src/rsp_bpp.c's own comment records for der_encode. So a
+       3-byte svn is not guaranteed by "the decode succeeded"; it must be
+       checked here, and treated the same as the non-uniform ci_ids list
+       below: a card whose answer does not fit what this function returns
+       is a case this function cannot make sense of (-2), not a success
+       with an empty string standing in for a version nobody sent. */
+    if (info2->svn.size != 3) {
+        ASN_STRUCT_FREE(asn_DEF_EUICCInfo2, info2);
+        return -2;
     }
+    snprintf(out->svn, sizeof out->svn, "%u.%u.%u",
+             info2->svn.buf[0], info2->svn.buf[1], info2->svn.buf[2]);
 
     size_t n = (size_t)info2->euiccCiPKIdListForVerification.list.count;
     if (n > 0) {
@@ -391,7 +401,26 @@ int rsp_card_read_info(rsp_transport_t *t, rsp_card_info_t *out)
            make sense of: -2, not a silent truncation to the entries that
            happen to fit. */
         size_t id_len = info2->euiccCiPKIdListForVerification.list.array[0]->size;
-        uint8_t *ids = malloc(n * id_len);
+
+        /* n * id_len below cannot overflow in practice -- both come from
+           one decoded response, and rsp_es10_send bounds how much data an
+           exchange can accumulate (see its ES10_MAX_RESPONSE) -- but the
+           multiplication's operands are not re-checked at the point of
+           use, so guard it directly rather than trust a bound enforced
+           two calls away. */
+        if (id_len != 0 && n > SIZE_MAX / id_len) {
+            ASN_STRUCT_FREE(asn_DEF_EUICCInfo2, info2);
+            return -2;
+        }
+        size_t bytes = n * id_len;
+
+        /* malloc(0) is not what "id_len == 0" should mean here: some
+           implementations answer it with NULL, which the check below
+           would then misreport as an allocation failure (-2, could not
+           be asked) rather than "the card listed id_len == 0 issuers" (an
+           odd but decodable answer). rsp_transport.c's parse_hexline
+           guards the same malloc(0) case for the same reason. */
+        uint8_t *ids = malloc(bytes ? bytes : 1);
         if (!ids) {
             ASN_STRUCT_FREE(asn_DEF_EUICCInfo2, info2);
             return -2;
@@ -401,7 +430,11 @@ int rsp_card_read_info(rsp_transport_t *t, rsp_card_info_t *out)
             SubjectKeyIdentifier_t *ski =
                 info2->euiccCiPKIdListForVerification.list.array[i];
             if (ski->size != id_len) { uniform = 0; break; }
-            memcpy(ids + i * id_len, ski->buf, id_len);
+            /* ski->buf may be NULL when id_len is 0 (an empty OCTET
+               STRING decodes that way); memcpy's arguments must be valid
+               pointers even for a zero-length copy, so skip the call
+               entirely rather than pass a NULL source. */
+            if (id_len) memcpy(ids + i * id_len, ski->buf, id_len);
         }
         if (!uniform) {
             free(ids);

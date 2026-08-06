@@ -109,9 +109,16 @@ int main(void) {
     set_bits(&info.rspCapability, 0x00);
 
     /* Two Certificate Issuer identifiers "supported for verification" --
-     * SubjectKeyIdentifier is a bare OCTET_STRING (no SIZE constraint of
-     * its own), but a real SKI is the 20-byte SHA-1 of the issuer's public
-     * key (RFC 5280 section 4.2.1.2), so 20 bytes here too. */
+     * SubjectKeyIdentifier is a bare OCTET_STRING with no length fixed by
+     * either the module (SGP.22's SubjectKeyIdentifier ::= KeyIdentifier
+     * ::= OCTET STRING) or by RFC 5280 section 4.2.1.2, which names two
+     * common constructions (a 160-bit SHA-1 hash, or a 4-bit type field
+     * plus the low 60 bits of that hash -- 8 bytes) and then says other
+     * methods are acceptable too. 20 bytes here is simply the common
+     * case (the first of those two constructions), not a length either
+     * specification requires -- rsp_card_read_info (src/rsp_es10.c)
+     * accepts whatever length a real card sends, as long as every entry
+     * in the list agrees with the others. */
     static const uint8_t ci_a[20] = {
         0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A,
         0x0B,0x0C,0x0D,0x0E,0x0F,0x10,0x11,0x12,0x13,0x14
