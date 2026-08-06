@@ -208,8 +208,17 @@ tests/run-%: tests/test_%.c $(LIB) $(MBED_LIBS) $(DIST)/.stamp
 check: $(TESTS)
 	./tests/run-tests
 
+# tools/bpp-dump builds a Bound Profile Package and prints its structure, so
+# a person can look at the artifact the suite only proves correct. It is a
+# demonstration and stays out of the way: "all" does not build it and "check"
+# does not run it, so it can never be why a build or a test run fails.
+tools/bpp-dump: tools/bpp-dump.c $(LIB) $(MBED_LIBS) $(DIST)/.stamp
+	$(CC) $(ALL_CFLAGS) $(GEN_INC) $< $(LIB) $(DIST)/*.o $(MBED_LIBS) -o $@
+	@rm -rf $@.dSYM
+
 clean:
-	rm -f $(OBJS) $(LIB)
+	rm -f $(OBJS) $(LIB) tools/bpp-dump
+	@rm -rf tools/bpp-dump.dSYM
 	@# Not "rm -f $(TESTS)": $(TESTS) is derived from the test sources that
 	@# exist right now, so a binary left over from a test that was since
 	@# renamed or deleted would not be in that list at all, would survive
