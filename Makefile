@@ -214,13 +214,25 @@ mbedtls: $(MBED_LIBS)
 # friends) directly, so every object -- not just the tests -- now needs
 # $(DIST)/.stamp built first and $(GEN_INC) on its command line. -idirafter,
 # not -I, for the same case-insensitive-Time.h reason the tests use it.
-%.o: %.c $(HDRS) $(MBED_LIBS) $(DIST)/.stamp
+#
+# Makefile itself is a prerequisite too, for the same reason euicc-lpa's
+# Makefile names itself against its objects and its tests/run-% rule: ALL_CFLAGS
+# (VERSION via -D, warning flags, include paths) is compiled in, not read at
+# run time, so an edit to a flag or to VERSION here is invisible to make
+# without this -- make tracks prerequisite mtimes, not recipe or variable
+# text. Without it, bumping VERSION and running "make check" can report green
+# while still linking the stale object built under the old value.
+%.o: %.c $(HDRS) $(MBED_LIBS) $(DIST)/.stamp Makefile
 	$(CC) $(ALL_CFLAGS) $(GEN_INC) -c $< -o $@
 
 $(LIB): $(OBJS)
 	ar rcs $@ $(OBJS)
 
-tests/run-%: tests/test_%.c $(LIB) $(MBED_LIBS) $(DIST)/.stamp
+# Makefile is a prerequisite here for the same reason as the %.o rule above:
+# this recipe's own link line lives here, not in any test_*.c, so make has
+# no other way to notice the line changed and would otherwise reuse an
+# already-built tests/run-% binary that no longer matches this recipe.
+tests/run-%: tests/test_%.c $(LIB) $(MBED_LIBS) $(DIST)/.stamp Makefile
 	$(CC) $(ALL_CFLAGS) $(GEN_INC) $< $(LIB) $(DIST)/*.o $(MBED_LIBS) $(PCSC_LIBS) -o $@
 	@# On Darwin, a -g link auto-generates a companion run-%.dSYM directory.
 	@# tests/run-tests globs "run-*", so that bundle would be picked up and
