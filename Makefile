@@ -163,7 +163,7 @@ GEN_INC := -idirafter $(DIST)
 # absent proves nothing. It gets its own target, check-card, below.
 TESTS   := $(filter-out tests/run-card,$(patsubst tests/test_%.c,tests/run-%,$(wildcard tests/test_*.c)))
 
-.PHONY: all check check-card clean mbedtls codec
+.PHONY: all check check-card record-card clean mbedtls codec
 
 # build/sgp26_material.c is the first target textually in this file, so
 # without this, GNU Make's default goal (what bare "make" builds) would be
@@ -239,6 +239,43 @@ check-card: tests/run-card
 tests/run-card: tests/test_card.c $(LIB) $(MBED_LIBS) $(DIST)/.stamp
 	$(CC) $(ALL_CFLAGS) $(GEN_INC) $< $(LIB) $(DIST)/*.o $(MBED_LIBS) $(PCSC_LIBS) -o $@
 	@rm -rf $@.dSYM
+
+# Captures a session against the real reader TWICE and only writes OUT if
+# both agree, byte for byte. testdata/cards/README.md's own review found a
+# live capture desync once in fourteen attempts on this project's shared
+# rig -- SCardConnect in shared mode does not force a cold reset, so
+# leftover state from whatever last touched the card can bleed into a
+# capture. That is invisible by looking at the file afterward: a desynced
+# recording still parses, still replays, and reads exactly like a good
+# one, right up until it is trusted as ground truth for what the card
+# actually said. Two independent captures agreeing is the cheapest check
+# available that does not require a person to already know what the right
+# answer looks like.
+#
+# OUT defaults to a scratch path under /tmp rather than committing anything
+# by default -- this is a capture tool, not a promise that its result
+# belongs in testdata/cards/. Point OUT at a real destination to keep one:
+#   make record-card OUT=testdata/cards/card.log
+OUT ?= /tmp/rsp-record-card.log
+
+record-card: tests/run-card
+	@out="$(OUT)"; \
+	 tmp1=$$(mktemp) && tmp2=$$(mktemp) || exit 1; \
+	 trap 'rm -f "$$tmp1" "$$tmp2"' EXIT; \
+	 echo "record-card: capture 1/2..."; \
+	 ./tests/run-card "$$tmp1" || { echo "record-card: first capture failed" >&2; exit 1; }; \
+	 echo "record-card: capture 2/2..."; \
+	 ./tests/run-card "$$tmp2" || { echo "record-card: second capture failed" >&2; exit 1; }; \
+	 if ! cmp -s "$$tmp1" "$$tmp2"; then \
+	     echo "record-card: the two captures do not agree -- not writing $$out" >&2; \
+	     echo "record-card: (a shared reader can desync between passes;" >&2; \
+	     echo "record-card:  see testdata/cards/README.md); try again" >&2; \
+	     diff -u "$$tmp1" "$$tmp2" >&2 || true; \
+	     exit 1; \
+	 fi; \
+	 mkdir -p "$$(dirname "$$out")"; \
+	 cp "$$tmp1" "$$out"; \
+	 echo "record-card: wrote $$out, confirmed by two agreeing captures"
 
 # tools/bpp-dump builds a Bound Profile Package and prints its structure, so
 # a person can look at the artifact the suite only proves correct. It is a
