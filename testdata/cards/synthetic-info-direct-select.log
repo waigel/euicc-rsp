@@ -8,7 +8,7 @@
 # This is the SECONDARY fixture: a SELECT that answers a bare 9000 with no
 # FCI at all, the shape ISO/IEC 7816-4 also permits and rsp_card_select_isdr
 # must still accept. It is not what the project's own test eUICC actually
-# sends -- see synthetic-info.log for that, real hardware bytes, and the
+# sends -- see omnikey-info.log for that, real hardware bytes, and the
 # fixture the main test_es10.c flow drives. Kept here only so the
 # no-chaining-needed path stays covered too.
 
