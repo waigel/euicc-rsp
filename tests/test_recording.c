@@ -90,12 +90,29 @@ int main(void) {
     ok("and answers the same", n == 2 && resp[0] == 0x90);
     again.close(&again);
 
+    /* Finding F: every file rsp_record_open writes opens with a "#" header
+       saying what it holds -- read as an ordinary comment by
+       rsp_replay_open, per the format's own rule, which is exactly why
+       the round trip above already worked without any parser change. */
+    {
+        FILE *hf = fopen("/tmp/rsp-test-rerecorded.log", "r");
+        char hbuf[4096];
+        size_t hgot = hf ? fread(hbuf, 1, sizeof hbuf - 1, hf) : 0;
+        if (hf) fclose(hf);
+        hbuf[hgot] = '\0';
+        ok("a re-recorded file opens with a '#' header",
+           hbuf[0] == '#' && strstr(hbuf, "protected material") != NULL);
+    }
+
     /* Fix round 1, finding 1: recording a FAILED exchange must reproduce
        the same failure on replay, not a blank "< " line that reads back
        as a fake zero-length success. The inner transport below has only
-       one recorded exchange, so its second call genuinely fails (-1,
-       exhausted) -- the same shape a real card refusing something during
-       a live session (Task 5) will take. */
+       one recorded exchange, so its second call genuinely fails -- an
+       exhausted recording is "we could not ask", -2, per finding E's
+       later pass that made replay's exhaustion/mismatch/buffer-too-small
+       cases agree with PC/SC's own -2 for the same class of failure
+       (include/rsp.h's failure convention) -- the same shape a real card
+       refusing something during a live session (Task 5) will take. */
     {
         const char *shortpath = "/tmp/rsp-test-one-exchange.log";
         const char *failpath = "/tmp/rsp-test-failure.log";
@@ -115,19 +132,26 @@ int main(void) {
 
         long r2 = recFail.transceive(&recFail, cmdB, sizeof cmdB, resp, sizeof resp);
         ok("the inner transport's second call genuinely fails",
-           r2 == -1);
+           r2 == -2);
         recFail.close(&recFail);
 
         /* The literal bug the review reproduced: a blank "< " line that
            replays as a fake zero-length success. Confirm the file holds
-           the failure marker instead of that blank line. */
+           the failure marker instead of that blank line.
+
+           4096, not 256: rsp_record_open now opens every file with a "#"
+           header (finding F) ahead of the actual exchange lines, and a
+           buffer too small to hold header-plus-exchanges would silently
+           truncate before ever reaching the marker this assertion is
+           looking for -- passing for the wrong reason, or failing for one
+           unrelated to what it claims to check. */
         FILE *ff = fopen(failpath, "r");
-        char buf[256];
+        char buf[4096];
         size_t got = ff ? fread(buf, 1, sizeof buf - 1, ff) : 0;
         if (ff) fclose(ff);
         buf[got] = '\0';
         ok("the recording holds a failure marker, not a blank response line",
-           strstr(buf, "!-1") != NULL && strstr(buf, "< \n") == NULL);
+           strstr(buf, "!-2") != NULL && strstr(buf, "< \n") == NULL);
 
         rsp_transport_t replayedFail;
         ok("the recording of a failed exchange replays",
@@ -139,7 +163,7 @@ int main(void) {
         memset(resp, 0xAA, sizeof resp); /* poison, to prove it stays untouched */
         long p2 = replayedFail.transceive(&replayedFail, cmdB, sizeof cmdB, resp, sizeof resp);
         ok("the failed exchange replays as the same failure, not a fake success",
-           p2 == -1);
+           p2 == -2);
         ok("a replayed failure does not touch the caller's response buffer",
            resp[0] == 0xAA);
         replayedFail.close(&replayedFail);

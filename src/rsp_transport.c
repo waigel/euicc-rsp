@@ -32,6 +32,12 @@
  * fail to answer for a reason unrelated to the card (an allocation failing
  * mid-replay) would defeat the point of replaying at all.
  *
+ * rsp_record_open writes a "#" header, below, as the first thing in every
+ * file it creates -- ordinary comment lines by this same format's own
+ * rule, so rsp_replay_open already skips them without any change; see the
+ * header text itself for why it exists. A hand-written fixture (every one
+ * under testdata/) has no such header and does not need one.
+ *
  * Nothing in a recording is treated as secret in this round -- see
  * testdata/cards/README.md -- so mismatches are reported on stderr with
  * both the expected and the received bytes, and no buffer here is wiped.
@@ -152,6 +158,15 @@ static void free_exchanges(rsp_exchange_t *ex, size_t n)
     free(ex);
 }
 
+/* All three failures below are "we could not ask", not "the card said no",
+ * so each returns -2 -- the same convention src/rsp_pcsc.c already applies
+ * to a real transport's own could-not-happen cases (an unreachable reader,
+ * a response too big for the caller's buffer). A recording running out, a
+ * command not matching what was expected, and a response that would
+ * overflow resp_cap are all cases where no card was ever actually asked
+ * anything; -1 stays reserved for e->fail_code below, which passes through
+ * whatever the ORIGINAL live exchange decided (see rsp_record_open) rather
+ * than deciding anything itself. */
 static long replay_transceive(rsp_transport_t *t, const uint8_t *cmd,
                               size_t cmd_len, uint8_t *resp, size_t resp_cap)
 {
@@ -161,7 +176,7 @@ static long replay_transceive(rsp_transport_t *t, const uint8_t *cmd,
         fprintf(stderr,
             "rsp_replay: no recorded exchange left to answer command %zu "
             "(the recording has %zu)\n", st->pos, st->n);
-        return -1;
+        return -2;
     }
 
     rsp_exchange_t *e = &st->ex[st->pos];
@@ -173,7 +188,7 @@ static long replay_transceive(rsp_transport_t *t, const uint8_t *cmd,
         fprintf(stderr, "\n  received: ");
         print_hex(stderr, cmd, cmd_len);
         fprintf(stderr, "\n");
-        return -1;
+        return -2;
     }
 
     if (e->fail_code != 0) {
@@ -184,10 +199,15 @@ static long replay_transceive(rsp_transport_t *t, const uint8_t *cmd,
     }
 
     if (e->resp_len > resp_cap) {
+        /* A caller-supplied buffer too small for the answer is exactly
+         * src/rsp_pcsc.c's SCARD_E_INSUFFICIENT_BUFFER case, and that file
+         * spells out why it is -2 rather than -1: resp_cap is this
+         * function's own argument, not something the card was asked and
+         * said "no" to. */
         fprintf(stderr, "rsp_replay: exchange %zu: recorded response is "
                          "%zu bytes, resp_cap is only %zu\n",
                 st->pos, e->resp_len, resp_cap);
-        return -1;
+        return -2;
     }
 
     memcpy(resp, e->resp, e->resp_len);
@@ -357,6 +377,13 @@ static long record_transceive(rsp_transport_t *t, const uint8_t *cmd,
                               size_t cmd_len, uint8_t *resp, size_t resp_cap)
 {
     rsp_record_state_t *st = t->ctx;
+    /* rsp_record_open copies *inner by value (its own doc comment,
+     * include/rsp.h), so a caller that passed a half-built rsp_transport_t
+     * -- transceive left NULL -- reaches this call with no chance for
+     * rsp_record_open itself to have caught it. src/rsp_pcsc.c's own
+     * transceive checks its arguments the same defensive way; there is
+     * nothing card-specific about it. */
+    if (!st || !st->inner.transceive) return -2;
 
     long n = st->inner.transceive(&st->inner, cmd, cmd_len, resp, resp_cap);
 
@@ -392,6 +419,32 @@ static void record_close(rsp_transport_t *t)
     t->ctx = NULL;
 }
 
+/* Written as the first thing into every file rsp_record_open creates, as
+ * ordinary "#" comment lines -- rsp_replay_open already skips those (see
+ * this file's top comment), so no parser change was needed to make it
+ * skippable; a recording with this header opens exactly like one without
+ * it, and a recording made by hand (every fixture under testdata/) simply
+ * never has it, which is fine, since nothing here requires it.
+ *
+ * It exists because a machine-produced recording is the one a person with
+ * a problem actually sends: this round's are all read-only ES10 queries
+ * and hold only public data (EID, version numbers, certificate issuer key
+ * identifiers), but a recording of a WRITE session -- installing,
+ * enabling, deleting a profile -- would carry protected material instead,
+ * and nobody should paste one into an issue without a line in the file
+ * itself saying so. */
+static const char RECORDING_HEADER[] =
+    "# A euicc-rsp session, recorded by rsp_record_open: one line per\n"
+    "# direction, hex APDUs (see this project's src/rsp_transport.c for the\n"
+    "# exact format). This is a log, not something to run.\n"
+    "#\n"
+    "# Whether this file is safe to share depends on what was asked of the\n"
+    "# card during the session it captures, and this header cannot know\n"
+    "# that in general -- a read-only query (EID, versions, key\n"
+    "# identifiers) is public; a write session (installing, enabling,\n"
+    "# deleting a profile) can carry protected material. Check what is\n"
+    "# actually below before pasting this into an issue.\n";
+
 int rsp_record_open(rsp_transport_t *inner, const char *path,
                     rsp_transport_t *out)
 {
@@ -399,6 +452,11 @@ int rsp_record_open(rsp_transport_t *inner, const char *path,
 
     FILE *f = fopen(path, "w");
     if (!f) return -2;
+
+    if (fputs(RECORDING_HEADER, f) < 0) {
+        fclose(f);
+        return -2;
+    }
 
     rsp_record_state_t *st = malloc(sizeof *st);
     if (!st) {

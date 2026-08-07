@@ -1,10 +1,14 @@
 /*
  * rsp.h -- the SM-DP+ role of SGP.22, as a library.
  *
- * It builds a Bound Profile Package for one eUICC. It does not speak to a
- * card and it opens no socket: the caller supplies what the card said, and
- * gets back what to send. That split is what makes the whole path testable
- * without hardware.
+ * It builds a Bound Profile Package for one eUICC, and it can now also
+ * read one: a transport abstraction (rsp_transport_t) carries APDUs over a
+ * text recording, over a wrapper that records one, or over a real reader
+ * through PC/SC (rsp_pcsc_open); on top of that, rsp_es10_send drives one
+ * ES10 request to the ISD-R and rsp_card_read_info reads what a card says
+ * about itself. The replay transport is what keeps the read path testable
+ * without hardware -- the caller supplies what the card said (recorded or
+ * live) and gets back what to send.
  *
  * No card accepts the BPP rsp_bpp_build produces yet: '87'/'88' groups are
  * placed unprotected, transactionId is a fixed placeholder, hostId is the
@@ -24,20 +28,33 @@
  * primitive that refused its input -- and for those, plain -1 covers it;
  * there is nothing a caller could usefully tell apart.
  *
- * Four functions are different: their entire job is answering a
- * cryptographic yes/no question (does this verify? does this MAC match?),
- * and each of them used to return the same -1 both when the answer was a
- * real "no" and when the question was never actually reached at all --
- * indistinguishable to a caller, even though the two cases call for
- * different responses (retry/report-and-stop, versus reject-and-move-on).
- * This mirrors the exit-code contract the CLI built on top of this
- * library needs one level up (0 done, 1 a real negative answer, 2 could
- * not answer): for rsp_pki_verify, rsp_sign_verify, rsp_unprotect and
- * rsp_bpp_recover, -1 means the question was asked and the answer is no
- * -- a signature that does not verify, a certificate that does not chain,
- * a MAC that does not match. -2 means the question was never reached --
- * a malformed input, a buffer too small, an allocation or RNG failure.
- * Each of the four says so again at its own declaration below. */
+ * Seven functions are different: each of them can fail in two ways that
+ * call for different responses (retry/report-and-stop, versus
+ * reject-and-move-on), and used to collapse both into the same -1 --
+ * indistinguishable to a caller. This mirrors the exit-code contract the
+ * CLI built on top of this library needs one level up (0 done, 1 a real
+ * negative answer, 2 could not answer), and splits into two senses
+ * depending on what the function actually asks a question of:
+ *
+ * For rsp_pki_verify, rsp_sign_verify, rsp_unprotect and rsp_bpp_recover,
+ * the question is put to a cryptographic primitive: -1 means the question
+ * was asked and the answer is no -- a signature that does not verify, a
+ * certificate that does not chain, a MAC that does not match. -2 means the
+ * question was never reached -- a malformed input, a buffer too small, an
+ * allocation or RNG failure.
+ *
+ * For rsp_transport_t.transceive, rsp_es10_send and rsp_card_read_info,
+ * the question is put to a card: -1 means an answer came back and it is a
+ * no -- a status word other than 9000/61xx, or bytes too short to even
+ * carry one. -2 means no usable answer came back at all -- the reader is
+ * gone, the recording ran out or does not match, a caller-supplied buffer
+ * was too small for what arrived, or (for rsp_es10_send) a chain that
+ * would not terminate. All three transports (src/rsp_transport.c's replay
+ * and record, src/rsp_pcsc.c's PC/SC) agree on this split, including the
+ * caller-buffer-too-small case: it is -2, because the buffer is the
+ * caller's own argument, not something the card was asked and said no to.
+ *
+ * Each of the seven says so again at its own declaration below. */
 
 /* The library version, for a bug report. */
 const char *rsp_version(void);
@@ -292,7 +309,14 @@ typedef struct rsp_transport rsp_transport_t;
 struct rsp_transport {
     /* Send one command APDU, receive one response APDU including its two
        status bytes. Returns the response length, -1 if the card answered
-       something unusable, -2 if the exchange could not happen at all. */
+       something unusable (fewer than two bytes -- no room for a status
+       word), -2 if the exchange could not happen at all: no reader or no
+       recorded exchange to answer with, a command that does not match
+       what a recording expects, or resp_cap too small for what came back
+       -- the last one is -2 rather than -1 in every transport here
+       (src/rsp_pcsc.c, src/rsp_transport.c's replay and record), because
+       resp_cap is the caller's own argument, not something the card was
+       asked and said no to. */
     long (*transceive)(rsp_transport_t *t, const uint8_t *cmd, size_t cmd_len,
                        uint8_t *resp, size_t resp_cap);
     void (*close)(rsp_transport_t *t);
@@ -305,6 +329,13 @@ int rsp_replay_open(const char *path, rsp_transport_t *out);
 
 /* Wrap any transport so every exchange is appended to `path`. The wrapper
    takes ownership of `inner` and must itself be closed. Returns 0 or -2.
+
+   The file opens with a "#" header explaining what it is and, since this
+   function has no way to know whether the session it is about to capture
+   is read-only or not, warning that a write session's recording can carry
+   protected material -- see src/rsp_transport.c's own comment on
+   RECORDING_HEADER for the exact text. rsp_replay_open skips it like any
+   other comment.
 
    "Takes ownership" is literal, not a suggestion: rsp_record_open copies
    *inner's fields into the wrapper's own storage, and out->close calls
@@ -336,7 +367,10 @@ long rsp_pcsc_readers(char **out);
    is the DER of the request; `*out` is malloc'ed and belongs to the
    caller and holds the response without its status bytes. Returns 0;
    -1 when the card answered with a status other than 9000 or 61xx, with
-   *sw set to that status; -2 when the exchange could not happen. */
+   *sw set to that status, or when the transport itself already reported
+   the answer as unusable (*sw left at 0: there is no status word for a
+   transport-level -1 to carry); -2 when the exchange could not happen,
+   or the chain would not terminate within this file's own bounds. */
 int rsp_es10_send(rsp_transport_t *t, const uint8_t *req, size_t req_len,
                   uint8_t **out, size_t *out_len, unsigned *sw);
 
@@ -365,7 +399,19 @@ int rsp_card_read_info(rsp_transport_t *t, rsp_card_info_t *out);
 void rsp_card_info_free(rsp_card_info_t *i);
 
 /* Does this card accept the issuer whose SubjectKeyIdentifier is `id`?
-   Returns 1 for yes, 0 for no. */
+   Returns 1 for yes, 0 for no.
+
+   This is the one function in this header where 0 is not "the question
+   was asked and the answer is no" in the -1/-2 sense the rest of this
+   file documents above -- there is no -1/-2 split here at all, only 1 and
+   0. A null `i` or `id`, or an `id_len` that does not match this card's
+   own identifier length, answers 0 too, indistinguishable from a real
+   "this card does not trust that issuer." That is deliberate: a caller
+   with no info to ask the question of has no card to be wrong about
+   either, so collapsing "could not ask" into "no" costs nothing a caller
+   could otherwise usefully act on differently -- but it does mean a 0
+   here is not on its own proof that a real card was consulted and
+   disagreed, the way an -1 elsewhere in this file is. */
 int rsp_card_trusts(const rsp_card_info_t *i, const uint8_t *id, size_t id_len);
 
 #endif /* RSP_H */

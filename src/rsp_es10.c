@@ -106,6 +106,7 @@
 #include <string.h>
 
 #include "rsp.h"
+#include "rsp_internal.h"
 
 #include "EUICCInfo2.h"
 #include "GetEuiccDataResponse.h"
@@ -140,28 +141,15 @@
 #define CHAIN_MAX_RESPONSE 65535u
 #define CHAIN_MAX_GETRESP  256u
 
-/* Growable output buffer: appends data (n bytes) to *buf, growing *cap as
- * needed and updating *len. Returns 0, or -1 on an allocation failure
- * (the caller frees *buf either way). */
-static int es10_append(uint8_t **buf, size_t *len, size_t *cap,
-                       const uint8_t *data, size_t n)
-{
-    if (n == 0) return 0;
-
-    if (*len + n > *cap) {
-        size_t newcap = *cap ? *cap * 2 : 64;
-        while (newcap < *len + n) newcap *= 2;
-        uint8_t *p = realloc(*buf, newcap);
-        if (!p) return -1;
-        *buf = p;
-        *cap = newcap;
-    }
-    memcpy(*buf + *len, data, n);
-    *len += n;
-    return 0;
-}
-
-/* Collects the full response to one APDU exchange that may be chained
+/* The inward accumulator below used to be a fourth hand-rolled growable
+ * buffer (started at 64, freed without wiping) alongside src/rsp_bpp.c's
+ * two -- and had already drifted from them before anyone noticed. It is
+ * now rsp_growbuf_t from rsp_internal.h: same growth, but zeroized on
+ * free, which matters the day this accumulates a ProfileInstallationResult
+ * instead of an EID or an EUICCInfo2 answer. See that header's own
+ * top comment for the full account.
+ *
+ * Collects the full response to one APDU exchange that may be chained
  * through ISO/IEC 7816-4's '61xx'/GET RESPONSE mechanism (see the
  * top-of-file comment for the citations: SGP.22 v2.6 section 5.7.2 for an
  * ES10 STORE DATA response, GPCS section 11.1.5.2 restating the same rule
@@ -181,21 +169,37 @@ static int es10_append(uint8_t **buf, size_t *len, size_t *cap,
  * the same buffer this function goes on reusing for every GET RESPONSE it
  * sends. Returns 0 with *out (malloc'ed, the caller's) and *out_len set to
  * the accumulated data with its status bytes stripped; -1 if the chain
- * ended in a real refusal, with *sw set to that status; -2 if the
- * exchange could not happen, or the chain would not terminate within
- * CHAIN_MAX_RESPONSE/CHAIN_MAX_GETRESP. */
+ * ended in a real refusal (a status other than 9000/61xx, with *sw set to
+ * it) or if the transport itself already said the card's answer was
+ * unusable; -2 if the exchange could not happen at all, or the chain would
+ * not terminate within CHAIN_MAX_RESPONSE/CHAIN_MAX_GETRESP.
+ *
+ * transceive's own -1/-2 is not re-decided here, it is passed straight
+ * through: n < 0 is exactly what the transport already concluded (rsp.h's
+ * struct comment on transceive), and re-deciding it as a flat -2 -- as
+ * this used to do -- would erase the one distinction include/rsp.h
+ * documents for this function's caller (-1 "the card said no" vs. -2 "we
+ * could not ask"), the same distinction rsp_transport.c's three transceive
+ * implementations were just made to agree on. Only a positive-but-short
+ * answer (fewer than 2 bytes -- no room for a status word) is this
+ * function's own call to make, and it reads as -1: an answer that arrived
+ * and made no sense is "the card said no" in the same sense a bad status
+ * word is, not "the exchange could not happen." */
 static int iso_collect_response(rsp_transport_t *t, long n,
                                 uint8_t *resp, size_t resp_cap,
                                 uint8_t **out, size_t *out_len, unsigned *sw)
 {
-    uint8_t *acc = NULL;
-    size_t acc_len = 0, acc_cap = 0;
+    rsp_growbuf_t acc = {0};
     unsigned getresp_count = 0;
 
     for (;;) {
+        if (n < 0) {
+            rsp_growbuf_free(&acc);
+            return (int)n;
+        }
         if (n < 2) {
-            free(acc);
-            return -2;
+            rsp_growbuf_free(&acc);
+            return -1;
         }
 
         unsigned this_sw = (unsigned)((resp[(size_t)n - 2] << 8) |
@@ -203,22 +207,22 @@ static int iso_collect_response(rsp_transport_t *t, long n,
         size_t data_len = (size_t)n - 2;
 
         if ((this_sw & 0xFF00u) == 0x6100u) {
-            if (es10_append(&acc, &acc_len, &acc_cap, resp, data_len) != 0) {
-                free(acc);
+            if (rsp_growbuf_append(&acc, resp, data_len) != 0) {
+                rsp_growbuf_free(&acc);
                 return -2;
             }
-            if (acc_len > CHAIN_MAX_RESPONSE) {
+            if (acc.len > CHAIN_MAX_RESPONSE) {
                 fprintf(stderr, "rsp_es10: response exceeds %u bytes, "
                                 "refusing to keep chaining\n",
                         CHAIN_MAX_RESPONSE);
-                free(acc);
+                rsp_growbuf_free(&acc);
                 return -2;
             }
             if (++getresp_count > CHAIN_MAX_GETRESP) {
                 fprintf(stderr, "rsp_es10: %u GET RESPONSE round trips "
                                 "without the chain ending, refusing to "
                                 "keep waiting\n", getresp_count - 1);
-                free(acc);
+                rsp_growbuf_free(&acc);
                 return -2;
             }
             uint8_t gr[5] = {
@@ -230,16 +234,16 @@ static int iso_collect_response(rsp_transport_t *t, long n,
         }
 
         if (this_sw == 0x9000u) {
-            if (es10_append(&acc, &acc_len, &acc_cap, resp, data_len) != 0) {
-                free(acc);
+            if (rsp_growbuf_append(&acc, resp, data_len) != 0) {
+                rsp_growbuf_free(&acc);
                 return -2;
             }
-            *out = acc;
-            *out_len = acc_len;
+            *out = acc.buf;
+            *out_len = acc.len;
             return 0;
         }
 
-        free(acc);
+        rsp_growbuf_free(&acc);
         *sw = this_sw;
         return -1;
     }
@@ -292,9 +296,21 @@ int rsp_es10_send(rsp_transport_t *t, const uint8_t *req, size_t req_len,
              * GPCS's. Nothing has been accumulated yet at this point (the
              * accumulator lives inside iso_collect_response, entered only
              * once the last block is sent below), so there is nothing to
-             * free on any of these early returns. */
+             * free on any of these early returns.
+             *
+             * n < 0 is passed straight through, the same as
+             * iso_collect_response does and for the same reason: it is
+             * already transceive's own -1 ("the card answered something
+             * unusable") or -2 ("the exchange could not happen"), not
+             * something this function should re-decide as a flat -2. Only
+             * a positive-but-short answer (no room for a status word) is
+             * this function's own call, and it reads as -1 for the same
+             * reason iso_collect_response's does. */
+            if (n < 0) {
+                return (int)n;
+            }
             if (n < 2) {
-                return -2;
+                return -1;
             }
             unsigned isw = (unsigned)((resp[(size_t)n - 2] << 8) |
                                       resp[(size_t)n - 1]);
@@ -455,7 +471,7 @@ int rsp_card_read_info(rsp_transport_t *t, rsp_card_info_t *out)
 
         /* n * id_len below cannot overflow in practice -- both come from
            one decoded response, and rsp_es10_send bounds how much data an
-           exchange can accumulate (see its ES10_MAX_RESPONSE) -- but the
+           exchange can accumulate (see its CHAIN_MAX_RESPONSE) -- but the
            multiplication's operands are not re-checked at the point of
            use, so guard it directly rather than trust a bound enforced
            two calls away. */

@@ -162,58 +162,17 @@
    see ber_tlv_tag.h. Used only to check the wrapper tags on decode. */
 #define PACKED_TAG(class2, num) (ber_tlv_tag_t)((class2) | ((num) << 2))
 
-/* A plain growable buffer, for hand-assembling TLVs and for der_encode's
-   callback interface and for concatenating recovered segments. */
-typedef struct {
-    uint8_t *buf;
-    size_t   len;
-    size_t   cap;
-} rsp_growbuf_t;
-
-static int growbuf_append(rsp_growbuf_t *g, const void *data, size_t n)
-{
-    if (g->len + n > g->cap) {
-        size_t newcap = g->cap ? g->cap * 2 : 512;
-        while (newcap < g->len + n) {
-            newcap *= 2;
-        }
-        uint8_t *p = realloc(g->buf, newcap);
-        if (!p) {
-            return -1;
-        }
-        g->buf = p;
-        g->cap = newcap;
-    }
-    if (n) {
-        memcpy(g->buf + g->len, data, n);
-    }
-    g->len += n;
-    return 0;
-}
-
-/* Every growbuf this file frees might be holding recovered UPP plaintext
-   (rsp_bpp_recover's rejection path) or, less critically, DER destined
-   for the wire anyway -- rather than reason case by case about which
-   call sites are secret-carrying, this wipes the whole allocation
-   unconditionally before releasing it, the same way the per-segment
-   scratch buffers around it already do (see rsp_bpp_recover). Zeroizing
-   bytes beyond g->len (up to g->cap) is deliberate too: a previous grow
-   may have left old content further out that was never explicitly
-   copied over by a later append. */
-static void growbuf_free(rsp_growbuf_t *g)
-{
-    if (g->buf) {
-        mbedtls_platform_zeroize(g->buf, g->cap);
-    }
-    free(g->buf);
-    g->buf = NULL;
-    g->len = 0;
-    g->cap = 0;
-}
+/* rsp_growbuf_t and its append/free live in rsp_internal.h now, shared
+   with src/rsp_es10.c's inward response accumulator -- see that header's
+   top comment for why a fourth hand-rolled copy is what this move
+   prevents. Every growbuf this file frees might be holding recovered UPP
+   plaintext (rsp_bpp_recover's rejection path) or, less critically, DER
+   destined for the wire anyway; rsp_growbuf_free wipes unconditionally
+   rather than asking call sites to know which. */
 
 static int der_collect(const void *buf, size_t n, void *key)
 {
-    return growbuf_append((rsp_growbuf_t *)key, buf, n) == 0 ? 0 : -1;
+    return rsp_growbuf_append((rsp_growbuf_t *)key, buf, n) == 0 ? 0 : -1;
 }
 
 /* DER-encode an asn1c type into a freshly malloc'ed buffer. Used only for
@@ -229,7 +188,7 @@ static int der_encode_alloc(asn_TYPE_descriptor_t *td, const void *sptr,
     memset(&g, 0, sizeof g);
     r = der_encode(td, sptr, der_collect, &g);
     if (r.encoded < 0) {
-        growbuf_free(&g);
+        rsp_growbuf_free(&g);
         return -1;
     }
     *out = g.buf;
@@ -264,13 +223,13 @@ static int put_tlv(rsp_growbuf_t *g, uint8_t tag, const uint8_t *content,
     if (rsp_der_length_octets(len, lo, &n) != 0) {
         return -1;
     }
-    if (growbuf_append(g, &tag, 1) != 0) {
+    if (rsp_growbuf_append(g, &tag, 1) != 0) {
         return -1;
     }
-    if (growbuf_append(g, lo, n) != 0) {
+    if (rsp_growbuf_append(g, lo, n) != 0) {
         return -1;
     }
-    if (len && growbuf_append(g, content, len) != 0) {
+    if (len && rsp_growbuf_append(g, content, len) != 0) {
         return -1;
     }
     return 0;
@@ -483,7 +442,7 @@ int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
        ChannelRequest's own natural encoding), so it is appended as-is --
        no extra wrapper, matching the ASN.1 (it is a direct SEQUENCE
        member, not a SEQUENCE OF element). */
-    if (growbuf_append(&content, isc_der, isc_len) != 0) {
+    if (rsp_growbuf_append(&content, isc_der, isc_len) != 0) {
         goto out;
     }
 
@@ -503,10 +462,10 @@ int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
         memset(&wrapped, 0, sizeof wrapped);
         if (put_tlv(&wrapped, TAG_87_ELEMENT, configure_der, configure_len) != 0 ||
             put_tlv(&content, TAG_F87_WRAPPER, wrapped.buf, wrapped.len) != 0) {
-            growbuf_free(&wrapped);
+            rsp_growbuf_free(&wrapped);
             goto out;
         }
-        growbuf_free(&wrapped);
+        rsp_growbuf_free(&wrapped);
     }
 
     {
@@ -527,10 +486,10 @@ int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
         memset(&wrapped, 0, sizeof wrapped);
         if (put_tlv(&wrapped, TAG_88_ELEMENT, metadata_der, metadata_len) != 0 ||
             put_tlv(&content, TAG_88_WRAPPER, wrapped.buf, wrapped.len) != 0) {
-            growbuf_free(&wrapped);
+            rsp_growbuf_free(&wrapped);
             goto out;
         }
-        growbuf_free(&wrapped);
+        rsp_growbuf_free(&wrapped);
     }
 
     /* secondSequenceOf87: OPTIONAL, only used for random-key mode. This
@@ -586,10 +545,10 @@ int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
         }
         {
             static const uint8_t outer_tag[2] = { TAG_BPP_FIRST, TAG_BPP_SECOND };
-            if (growbuf_append(&g, outer_tag, 2) != 0 ||
-                growbuf_append(&g, lo, n) != 0 ||
-                growbuf_append(&g, content.buf, content.len) != 0) {
-                growbuf_free(&g);
+            if (rsp_growbuf_append(&g, outer_tag, 2) != 0 ||
+                rsp_growbuf_append(&g, lo, n) != 0 ||
+                rsp_growbuf_append(&g, content.buf, content.len) != 0) {
+                rsp_growbuf_free(&g);
                 goto out;
             }
         }
@@ -602,8 +561,8 @@ out:
     free(isc_der);
     free(configure_der);
     free(metadata_der);
-    growbuf_free(&content);
-    growbuf_free(&seq86);
+    rsp_growbuf_free(&content);
+    rsp_growbuf_free(&seq86);
     return ret;
 }
 
@@ -756,7 +715,7 @@ int rsp_bpp_recover(rsp_session_t *s, const uint8_t *bpp, size_t bpp_len,
                 free(plain);
                 goto out;
             }
-            if (growbuf_append(&g, plain, (size_t)un) != 0) {
+            if (rsp_growbuf_append(&g, plain, (size_t)un) != 0) {
                 mbedtls_platform_zeroize(plain, evlen);
                 free(plain);
                 goto out;
@@ -788,7 +747,7 @@ int rsp_bpp_recover(rsp_session_t *s, const uint8_t *bpp, size_t bpp_len,
 
 out:
     if (ret != 0) {
-        growbuf_free(&g);
+        rsp_growbuf_free(&g);
     }
     return ret;
 }

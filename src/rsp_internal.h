@@ -28,24 +28,37 @@
  *     (tests/test_der_length.c), closes that off structurally rather
  *     than by convention.
  *
- * All three are small enough, and used unevenly enough across the four
- * .c files that would otherwise each carry their own copy, that a header
- * of "static inline" functions is simpler than a fifth .c file plus a
+ * A fourth thing existed twice by the time this round added it, and had
+ * already drifted before anyone noticed: a growable byte buffer, between
+ * src/rsp_bpp.c's growbuf_append/growbuf_free and src/rsp_es10.c's
+ * es10_append. The two disagreed on their starting capacity (512 vs. 64)
+ * and, more importantly, on whether the buffer was wiped before release --
+ * rsp_bpp.c's zeroized, es10_append's did not. Harmless while es10_append
+ * only ever accumulated an EID or an EUICCInfo2 answer, neither secret;
+ * not harmless the first time a write-round caller uses the same
+ * accumulator for a ProfileInstallationResult. rsp_growbuf_t below is the
+ * one implementation both files now call, keeping the zeroizing free.
+ *
+ * All four are small enough, and used unevenly enough across the files
+ * that would otherwise each carry their own copy, that a header of
+ * "static inline" functions is simpler than a fifth .c file plus a
  * prototype header: no new object to add to SRCS, and a TU that does not
  * call one of these does not need to know it exists ("static inline"
  * itself, unlike plain "static", does not warn as unused under -Wall
- * when a given TU only needs some of the three).
+ * when a given TU only needs some of the four).
  */
 #ifndef RSP_INTERNAL_H
 #define RSP_INTERNAL_H
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/entropy.h"
 #include "mbedtls/oid.h"
+#include "mbedtls/platform_util.h"
 #include "mbedtls/x509_crt.h"
 
 /* Seeds ent/drbg from platform entropy, personalized with pers (a short,
@@ -130,6 +143,58 @@ static inline int rsp_der_length_octets(size_t len,
         return -1;
     }
     return 0;
+}
+
+/* A growable byte buffer: appends data (n bytes) to g, growing g->cap as
+ * needed. Returns 0, or -1 on an allocation failure (g->buf is unchanged
+ * and still owned by the caller either way). Shared by src/rsp_bpp.c
+ * (hand-assembling TLVs, der_encode's callback interface, concatenating
+ * recovered segments) and src/rsp_es10.c (accumulating a chained inward
+ * response) -- see this header's own top comment for why a fourth copy
+ * was the one this file exists to prevent. */
+typedef struct {
+    uint8_t *buf;
+    size_t   len;
+    size_t   cap;
+} rsp_growbuf_t;
+
+static inline int rsp_growbuf_append(rsp_growbuf_t *g, const void *data,
+                                      size_t n)
+{
+    if (g->len + n > g->cap) {
+        size_t newcap = g->cap ? g->cap * 2 : 512;
+        while (newcap < g->len + n) {
+            newcap *= 2;
+        }
+        uint8_t *p = realloc(g->buf, newcap);
+        if (!p) {
+            return -1;
+        }
+        g->buf = p;
+        g->cap = newcap;
+    }
+    if (n) {
+        memcpy(g->buf + g->len, data, n);
+    }
+    g->len += n;
+    return 0;
+}
+
+/* Wipes the whole allocation (up to g->cap, not just g->len -- a previous
+ * grow may have left old content further out that was never explicitly
+ * overwritten by a later append) before releasing it, unconditionally: a
+ * caller that only sometimes holds secret material is exactly the case
+ * where deciding "this instance doesn't need it" quietly becomes wrong the
+ * first time a new caller reuses the buffer for something that does. */
+static inline void rsp_growbuf_free(rsp_growbuf_t *g)
+{
+    if (g->buf) {
+        mbedtls_platform_zeroize(g->buf, g->cap);
+    }
+    free(g->buf);
+    g->buf = NULL;
+    g->len = 0;
+    g->cap = 0;
 }
 
 #endif /* RSP_INTERNAL_H */
