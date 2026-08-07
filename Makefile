@@ -235,12 +235,20 @@ tests/run-card: tests/test_card.c $(LIB) $(MBED_LIBS) $(DIST)/.stamp
 # a person can look at the artifact the suite only proves correct. It is a
 # demonstration and stays out of the way: "all" does not build it and "check"
 # does not run it, so it can never be why a build or a test run fails.
-tools/bpp-dump: tools/bpp-dump.c $(LIB) $(MBED_LIBS) $(DIST)/.stamp
+#
+# It compiles to an object through the %.o rule and links as a second step,
+# rather than doing both in one $(CC) call the way tests/run-% does. The build
+# is identical either way; the difference is that an IDE which learns a file's
+# include paths by watching the build only records "-c" compilations. A
+# combined compile-and-link command is invisible to it, so bpp-dump.c would be
+# a file with no known flags -- #include "rsp.h" unresolvable in the editor --
+# for as long as it stayed out of "all".
+tools/bpp-dump: tools/bpp-dump.o $(LIB) $(MBED_LIBS) $(DIST)/.stamp
 	$(CC) $(ALL_CFLAGS) $(GEN_INC) $< $(LIB) $(DIST)/*.o $(MBED_LIBS) $(PCSC_LIBS) -o $@
 	@rm -rf $@.dSYM
 
 clean:
-	rm -f $(OBJS) $(LIB) tools/bpp-dump
+	rm -f $(OBJS) $(LIB) tools/bpp-dump tools/bpp-dump.o
 	@rm -rf tools/bpp-dump.dSYM
 	@# Not "rm -f $(TESTS)": $(TESTS) is derived from the test sources that
 	@# exist right now, so a binary left over from a test that was since
