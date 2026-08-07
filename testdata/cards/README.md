@@ -308,3 +308,235 @@ issuer this recording does not otherwise identify; the identifier's shape
 is consistent with GSMA's production root CI, but that is a probable
 identification from context, not something this recording or this round
 confirms on its own.
+
+## `omnikey-profiles.log`
+
+`rsp_card_read_profiles`'s own recording, captured the same way
+`omnikey-info.log` was, now that `tests/test_card.c` takes a second
+optional argument for the separate ProfileInfoList session:
+
+```
+cd ~/git/waigel/euicc-rsp
+make tests/run-card
+./tests/run-card /tmp/info.log testdata/cards/omnikey-profiles.log
+```
+
+This project's own test eUICC turns out to have no profiles installed at
+all: the ISD-R answers `BF2D00` (an unrestricted ProfileInfoListRequest,
+searching for "every profile") with `BF2D02A0009000` -- `profileInfoListOk`,
+an empty `SEQUENCE OF ProfileInfo`. That is a real and complete answer
+(`rsp_card_read_profiles` returns 0 with `*out_count == 0`), not this
+function failing to find anything, and `tests/test_profiles.c` asserts
+exactly that.
+
+Captured twice, independently, to rule out the desync this project's
+shared reader has shown before (see the top-level task brief this round
+worked from): both captures agreed byte for byte before this file was
+committed. A third and fourth capture, produced by this same
+`tests/run-card` invocation while writing this section, agreed with the
+first two as well.
+
+Because the real card has nothing installed, this recording alone cannot
+exercise a populated list or the error variant -- the next two sections
+cover both by hand.
+
+## `synthetic-profiles.log`
+
+Two `ProfileInfo` entries, hand-built the same way
+`synthetic-info-direct-select.log`'s `EUICCInfo2`/`GetEuiccDataResponse`
+payloads were: with the generated types and `der_encode`, not
+hand-invented DER, since a hand-invented blob the decoder happens to
+accept would prove nothing about the decoder. The SELECT ISD-R exchange
+above the `BF2D00` response is this card's own real FCI, copied from
+`omnikey-info.log` -- only the profile list itself is synthetic.
+
+```c
+/* Throwaway program: builds a ProfileInfoListResponse with two ProfileInfo
+ * entries and encodes it with the generated der_encode. Output is pasted
+ * into testdata/cards/synthetic-profiles.log's one response line. Not
+ * part of the build: compiled and run once by hand.
+ *
+ *   cd ~/git/waigel/euicc-rsp
+ *   cc -std=c99 -Wall -idirafter dist -Idist \
+ *       /path/to/gen_profiles_fixture.c dist/*.o -o /tmp/gen_profiles_fixture
+ *   /tmp/gen_profiles_fixture
+ */
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#include "ProfileInfoListResponse.h"
+#include "ProfileInfo.h"
+
+static void print_hex(const uint8_t *b, size_t n) {
+    for (size_t i = 0; i < n; i++) printf("%02X", b[i]);
+    printf("\n");
+}
+
+static int collect(const void *buf, size_t n, void *key) {
+    struct { uint8_t *p; size_t len; } *o = key;
+    memcpy(o->p + o->len, buf, n);
+    o->len += n;
+    return 0;
+}
+
+static OCTET_STRING_t *mkoctet(const uint8_t *b, size_t n) {
+    OCTET_STRING_t *o = calloc(1, sizeof *o);
+    OCTET_STRING_fromBuf(o, (const char *)b, (int)n);
+    return o;
+}
+
+static long *mklong(long v) {
+    long *p = malloc(sizeof *p);
+    *p = v;
+    return p;
+}
+
+int main(void) {
+    ProfileInfoListResponse_t resp;
+    memset(&resp, 0, sizeof resp);
+    resp.present = ProfileInfoListResponse_PR_profileInfoListOk;
+
+    /* Profile A: every field rsp_card_read_profiles reports, present. */
+    ProfileInfo_t *a = calloc(1, sizeof *a);
+    static const uint8_t iccid_a[10] = {
+        0x89, 0x44, 0x05, 0x89, 0x25, 0x00, 0x12, 0x34, 0x56, 0x7F
+    };
+    a->iccid = mkoctet(iccid_a, sizeof iccid_a);
+    static const uint8_t aid_a[16] = {
+        0xA0, 0x00, 0x00, 0x05, 0x59, 0x10, 0x10, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01
+    };
+    a->isdpAid = mkoctet(aid_a, sizeof aid_a);
+    a->profileState = mklong(1); /* enabled */
+    a->profileNickname = mkoctet((const uint8_t *)"My SIM", 6);
+    a->serviceProviderName = mkoctet((const uint8_t *)"Test Telco", 10);
+    a->profileName = mkoctet((const uint8_t *)"Test Telco Postpaid", 20);
+    a->profileClass = mklong(2); /* operational */
+    ASN_SEQUENCE_ADD(&resp.choice.profileInfoListOk.list, a);
+
+    /* Profile B: only iccid and profileState -- every other field this
+       project decodes is genuinely OPTIONAL in rsp-2.5.asn, and a real
+       card is free to omit any of them. */
+    ProfileInfo_t *b = calloc(1, sizeof *b);
+    static const uint8_t iccid_b[10] = {
+        0x89, 0x44, 0x05, 0x89, 0x25, 0x00, 0x98, 0x76, 0x54, 0x3F
+    };
+    b->iccid = mkoctet(iccid_b, sizeof iccid_b);
+    b->profileState = mklong(0); /* disabled */
+    ASN_SEQUENCE_ADD(&resp.choice.profileInfoListOk.list, b);
+
+    uint8_t buf[1024];
+    struct { uint8_t *p; size_t len; } o = { buf, 0 };
+    asn_enc_rval_t r = der_encode(&asn_DEF_ProfileInfoListResponse, &resp, collect, &o);
+    if (r.encoded < 0) { fprintf(stderr, "encode failed\n"); return 1; }
+
+    printf("# ProfileInfoListResponse, %zu bytes\n", o.len);
+    print_hex(o.p, o.len);
+
+    ASN_STRUCT_RESET(asn_DEF_ProfileInfoListResponse, &resp);
+    return 0;
+}
+```
+
+Its output, spliced into `synthetic-profiles.log`'s one `BF2D00` response
+line (ahead of the trailing ` 9000` the STORE DATA framing itself adds):
+
+```
+# ProfileInfoListResponse, 104 bytes
+BF2D65A063E34F5A0A8944058925001234567F4F10A00000055910100000000000000000019F70010190064D792053494D910A546573742054656C636F9214546573742054656C636F20506F73747061696400950102E3105A0A8944058925009876543F9F700100
+```
+
+`tests/test_profiles.c` asserts every field of both entries against
+exactly the bytes above, not merely that "a list came back."
+
+## `omnikey-profiles-error.log`
+
+A hand-edited copy of `omnikey-profiles.log`, its one STORE DATA response
+changed from `profileInfoListOk` (`A0 00`, an empty `SEQUENCE OF`) to
+`profileInfoListError` (`81 01 01` -- tag `81`, the IMPLICIT INTEGER
+`ProfileInfoListError`, value 1, `incorrectInputValues`). A healthy
+ISD-R has no reason to refuse an unrestricted `ProfileInfoListRequest`
+("give me every profile"), so this is not a case real hardware can be
+made to produce; it exists to prove `rsp_card_read_profiles` reports a
+decoded error as -1 (a real refusal) rather than -2 (could not be asked)
+or a false success, the one path `tests/test_profiles.c` cannot reach
+any other way.
+
+## `synthetic-profiles-bad-request.log`
+
+A deliberately mutated copy of `synthetic-profiles.log`: one byte of the
+STORE DATA request's data field changed from `BF2D00` to `BF2E00`.
+`rsp_card_read_profiles` always sends the real bytes, so replaying this
+file must refuse the exchange by name (`tests/test_profiles.c`'s
+`test_wrong_request_is_refused`) rather than hand back an answer for a
+request nobody actually sent -- replay is a pin on the wire, not a
+lenient stub, the same property `tests/test_recording.c` already covers
+in general and this asserts again against this round's own request.
+
+## `synthetic-profiles-hostile-text.log`
+
+One `ProfileInfo` whose card-chosen text carries every character a JSON
+string cannot hold raw. `profileNickname`, `serviceProviderName` and
+`profileName` are `UTF8String` in `rsp-2.5.asn`, and SGP.22 v2.6 section
+5.7.15 has the eUICC return them verbatim -- the card picks their
+content, this project does not. Every other recording in this directory
+happens to hold nothing but plain ASCII letters and spaces, so without
+this one a decoder that mangled anything unusual, or a formatter that
+escaped nothing at all, would pass the entire suite.
+
+Synthetic for the same reason `synthetic-profiles.log` is: this
+project's test eUICC has no profiles installed, so there is no real card
+to capture such a nickname from. Produced by the same throwaway
+generator, with a different `main` -- only the `BF2D00` response is
+synthetic, the SELECT ISD-R exchange above it is this card's own real
+FCI.
+
+| field | content | what it catches |
+| --- | --- | --- |
+| `profileNickname` | `He said "hi" \n is not a newline` + TAB + `0x01` | a quote, a backslash, a tab, and a C0 control with no short JSON escape of its own. The literal backslash-n catches a formatter that turns it into a real newline, or one that leaves it alone while the tab beside it needs escaping. |
+| `serviceProviderName` | `Acme` + LF + `Telco` | an actual newline, which ends a JSON string early if it is not escaped |
+| `profileName` | u-umlaut, eszett and two CJK characters | multi-byte UTF-8 needs no escaping and must come back unmangled; a formatter working one byte at a time corrupts it |
+
+Two suites read this file, and they assert different things:
+
+- `tests/test_profiles.c` (this repository) pins the decoded bytes
+  themselves -- that `rsp_card_read_profiles` hands the card's text back
+  exactly as it arrived, NUL-terminated at the right length.
+- euicc-tools' `tests/run-tests` pins the escaping, against
+  `euicc card profiles --json`. Escaping belongs to whoever formats the
+  output, not to this library, which is why the proof is split.
+
+The one `main` differs from `synthetic-profiles.log`'s in the fields it
+sets; everything else (the helpers, the `der_encode` call, the compile
+line) is unchanged:
+
+```c
+    ProfileInfo_t *a = calloc(1, sizeof *a);
+    static const uint8_t iccid_a[10] = {
+        0x89, 0x44, 0x05, 0x89, 0x25, 0x00, 0x11, 0x11, 0x11, 0x1F
+    };
+    a->iccid = mkoctet(iccid_a, sizeof iccid_a);
+    a->profileState = mklong(1);
+
+    static const uint8_t nick[] = {
+        'H','e',' ','s','a','i','d',' ','"','h','i','"',
+        ' ','\\','n',' ','i','s',' ','n','o','t',' ','a',' ','n','e','w',
+        'l','i','n','e', 0x09, 0x01
+    };
+    a->profileNickname = mkoctet(nick, sizeof nick);
+
+    static const uint8_t spn[] = { 'A','c','m','e', 0x0A, 'T','e','l','c','o' };
+    a->serviceProviderName = mkoctet(spn, sizeof spn);
+
+    static const uint8_t pname[] = {
+        'G','r', 0xC3,0xBC, 0xC3,0x9F, 'e', ' ',
+        0xE6,0x97,0xA5, 0xE6,0x9C,0xAC
+    };
+    a->profileName = mkoctet(pname, sizeof pname);
+    a->profileClass = mklong(2);
+    ASN_SEQUENCE_ADD(&resp.choice.profileInfoListOk.list, a);
+```
+
+It prints 90 bytes; the recording wraps them in the usual `61 5A` /
+`GET RESPONSE` pair and appends `9000`.

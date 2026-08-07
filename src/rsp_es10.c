@@ -110,6 +110,9 @@
 
 #include "EUICCInfo2.h"
 #include "GetEuiccDataResponse.h"
+#include "ProfileInfoListResponse.h"
+#include "ProfileInfoListError.h"
+#include "ProfileInfo.h"
 
 #define ES10_MAX_BLOCK 255u  /* SGP.22 v2.6 section 2.5.5 / 5.7.6 */
 
@@ -576,4 +579,164 @@ int rsp_card_trusts(const rsp_card_info_t *i, const uint8_t *id, size_t id_len)
         if (memcmp(i->ci_ids + k * i->ci_id_len, id, id_len) == 0) return 1;
     }
     return 0;
+}
+
+/*
+ * rsp_card_read_profiles / rsp_card_profiles_free -- GetProfilesInfo
+ * (ES10c, SGP.22 v2.6 section 5.7.15 -- 5.7.16 is EnableProfile, a write
+ * command this round does not implement), the same shape as GetEUICCInfo2
+ * above: one fixed, argument-less request (every ProfileInfoListRequest
+ * member is OPTIONAL, and an absent searchCriteria means "every
+ * profile"), one CHOICE response to decode.
+ *
+ * The CHOICE is what makes this different from rsp_card_read_info's
+ * EUICCInfo2, which has no error variant of its own: ProfileInfoListResponse
+ * can carry profileInfoListError instead of the list, a genuine "the card
+ * said no" that this function reports as -1 (with *err set), not -2 --
+ * the request reached the ISD-R and was answered, the answer just was not
+ * the list asked for.
+ */
+
+static const uint8_t es10_profile_list_req[] = { 0xBF, 0x2D, 0x00 };
+
+/* NUL-terminates a UTF8String_t/OCTET_STRING_t's bytes into a fresh
+   malloc'ed buffer. Returns NULL on allocation failure, the same
+   convention every other caller in this file uses for "could not be
+   asked" rather than "the field held nothing" (an empty string, size 0,
+   still returns a valid one-byte "\0" buffer, distinct from NULL). */
+static char *dup_utf8string(const OCTET_STRING_t *s)
+{
+    char *p = malloc(s->size + 1);
+    if (!p) return NULL;
+    if (s->size) memcpy(p, s->buf, s->size);
+    p[s->size] = '\0';
+    return p;
+}
+
+/* Fills one rsp_profile_info_t from one decoded ProfileInfo. Returns 0,
+   or -1 if src carries something dst has no way to represent (an iccid
+   whose length is not exactly 10, an isdpAid of length 0 or more than 16
+   -- both violate OctetTo16's own SIZE(1..16), so a card sending one is
+   itself the malformed answer, not a gap in this function) or an
+   allocation failed partway through. Either way, dst is left in a state
+   rsp_card_profiles_free(dst, 1) can safely release: every string
+   pointer is either a completed allocation or still NULL. */
+static int fill_profile_info(rsp_profile_info_t *dst, const ProfileInfo_t *src)
+{
+    memset(dst, 0, sizeof *dst);
+
+    if (src->iccid) {
+        if (src->iccid->size != sizeof dst->iccid) return -1;
+        memcpy(dst->iccid, src->iccid->buf, sizeof dst->iccid);
+        dst->have_iccid = 1;
+    }
+    if (src->isdpAid) {
+        if (src->isdpAid->size == 0 || src->isdpAid->size > sizeof dst->isdp_aid) {
+            return -1;
+        }
+        memcpy(dst->isdp_aid, src->isdpAid->buf, src->isdpAid->size);
+        dst->isdp_aid_len = (size_t)src->isdpAid->size;
+        dst->have_isdp_aid = 1;
+    }
+    if (src->profileState) {
+        dst->profile_state = *src->profileState;
+        dst->have_profile_state = 1;
+    }
+    if (src->profileNickname) {
+        dst->profile_nickname = dup_utf8string(src->profileNickname);
+        if (!dst->profile_nickname) return -1;
+    }
+    if (src->serviceProviderName) {
+        dst->service_provider_name = dup_utf8string(src->serviceProviderName);
+        if (!dst->service_provider_name) return -1;
+    }
+    if (src->profileName) {
+        dst->profile_name = dup_utf8string(src->profileName);
+        if (!dst->profile_name) return -1;
+    }
+    if (src->profileClass) {
+        dst->profile_class = *src->profileClass;
+        dst->have_profile_class = 1;
+    }
+    return 0;
+}
+
+int rsp_card_read_profiles(rsp_transport_t *t, rsp_profile_info_t **out,
+                            size_t *out_count, long *err, int *no_isdr)
+{
+    if (no_isdr) *no_isdr = 0;
+    if (err) *err = 0;
+    if (!t || !t->transceive || !out || !out_count) return -2;
+    *out = NULL;
+    *out_count = 0;
+
+    int rc = rsp_card_select_isdr(t);
+    if (rc != 0) {
+        if (rc == -1 && no_isdr) *no_isdr = 1;
+        return rc;
+    }
+
+    uint8_t *resp = NULL;
+    size_t resp_len = 0;
+    unsigned sw = 0;
+    rc = rsp_es10_send(t, es10_profile_list_req, sizeof es10_profile_list_req,
+                       &resp, &resp_len, &sw);
+    if (rc != 0) return rc;
+
+    ProfileInfoListResponse_t *pl = NULL;
+    asn_dec_rval_t dr = ber_decode(NULL, &asn_DEF_ProfileInfoListResponse,
+                                   (void **)&pl, resp, resp_len);
+    free(resp);
+    if (dr.code != RC_OK || !pl) {
+        if (pl) ASN_STRUCT_FREE(asn_DEF_ProfileInfoListResponse, pl);
+        return -2;
+    }
+
+    if (pl->present == ProfileInfoListResponse_PR_profileInfoListError) {
+        if (err) *err = pl->choice.profileInfoListError;
+        ASN_STRUCT_FREE(asn_DEF_ProfileInfoListResponse, pl);
+        return -1;
+    }
+
+    if (pl->present != ProfileInfoListResponse_PR_profileInfoListOk) {
+        /* Neither branch of the CHOICE: an extension this module does not
+           name, or a decode that left `present` at _PR_NOTHING. Either way
+           this function has nothing to report a list or an error from. */
+        ASN_STRUCT_FREE(asn_DEF_ProfileInfoListResponse, pl);
+        return -2;
+    }
+
+    size_t n = (size_t)pl->choice.profileInfoListOk.list.count;
+    rsp_profile_info_t *arr = NULL;
+    if (n > 0) {
+        arr = calloc(n, sizeof *arr);
+        if (!arr) {
+            ASN_STRUCT_FREE(asn_DEF_ProfileInfoListResponse, pl);
+            return -2;
+        }
+        for (size_t k = 0; k < n; k++) {
+            ProfileInfo_t *pi = pl->choice.profileInfoListOk.list.array[k];
+            if (fill_profile_info(&arr[k], pi) != 0) {
+                rsp_card_profiles_free(arr, k + 1);
+                ASN_STRUCT_FREE(asn_DEF_ProfileInfoListResponse, pl);
+                return -2;
+            }
+        }
+    }
+
+    ASN_STRUCT_FREE(asn_DEF_ProfileInfoListResponse, pl);
+    *out = arr;
+    *out_count = n;
+    return 0;
+}
+
+void rsp_card_profiles_free(rsp_profile_info_t *profiles, size_t count)
+{
+    if (!profiles) return;
+    for (size_t k = 0; k < count; k++) {
+        free(profiles[k].profile_nickname);
+        free(profiles[k].service_provider_name);
+        free(profiles[k].profile_name);
+    }
+    free(profiles);
 }

@@ -28,7 +28,7 @@
  * primitive that refused its input -- and for those, plain -1 covers it;
  * there is nothing a caller could usefully tell apart.
  *
- * Seven functions are different: each of them can fail in two ways that
+ * Eight functions are different: each of them can fail in two ways that
  * call for different responses (retry/report-and-stop, versus
  * reject-and-move-on), and used to collapse both into the same -1 --
  * indistinguishable to a caller. This mirrors the exit-code contract the
@@ -43,18 +43,21 @@
  * question was never reached -- a malformed input, a buffer too small, an
  * allocation or RNG failure.
  *
- * For rsp_transport_t.transceive, rsp_es10_send and rsp_card_read_info,
- * the question is put to a card: -1 means an answer came back and it is a
- * no -- a status word other than 9000/61xx, or bytes too short to even
- * carry one. -2 means no usable answer came back at all -- the reader is
- * gone, the recording ran out or does not match, a caller-supplied buffer
- * was too small for what arrived, or (for rsp_es10_send) a chain that
- * would not terminate. All three transports (src/rsp_transport.c's replay
- * and record, src/rsp_pcsc.c's PC/SC) agree on this split, including the
- * caller-buffer-too-small case: it is -2, because the buffer is the
- * caller's own argument, not something the card was asked and said no to.
+ * For rsp_transport_t.transceive, rsp_es10_send, rsp_card_read_info and
+ * rsp_card_read_profiles, the question is put to a card: -1 means an
+ * answer came back and it is a no -- a status word other than 9000/61xx,
+ * bytes too short to even carry one, or (rsp_card_read_profiles only) a
+ * decoded ProfileInfoListError, the card's own refusal of the request
+ * rather than a transport-level problem. -2 means no usable answer came
+ * back at all -- the reader is gone, the recording ran out or does not
+ * match, a caller-supplied buffer was too small for what arrived, or (for
+ * rsp_es10_send) a chain that would not terminate. All three transports
+ * (src/rsp_transport.c's replay and record, src/rsp_pcsc.c's PC/SC) agree
+ * on this split, including the caller-buffer-too-small case: it is -2,
+ * because the buffer is the caller's own argument, not something the card
+ * was asked and said no to.
  *
- * Each of the seven says so again at its own declaration below. */
+ * Each of the eight says so again at its own declaration below. */
 
 /* The library version, for a bug report. */
 const char *rsp_version(void);
@@ -424,5 +427,77 @@ void rsp_card_info_free(rsp_card_info_t *i);
    here is not on its own proof that a real card was consulted and
    disagreed, the way an -1 elsewhere in this file is. */
 int rsp_card_trusts(const rsp_card_info_t *i, const uint8_t *id, size_t id_len);
+
+/* One profile as GetProfilesInfo lists it (ProfileInfo, SGP.22 v2.6
+   section 5.7.15). Every member of the ASN.1 type is OPTIONAL, and a
+   card is free to omit any of them for any profile -- so, the same way
+   rsp_card_info_t's have_eid says whether the EID actually arrived, each
+   field below that a card can plausibly omit has its own have_* flag
+   set only when the card actually sent it; the field itself is left at
+   0/NULL otherwise, never used to mean "absent" on its own. iconType and
+   icon (up to 1024 bytes of image data, SGP.22's own SIZE bound) are not
+   decoded here at all -- nothing in this struct represents them, and
+   they are freed unread the same way rsp_card_select_isdr already
+   discards a SELECT's FCI in src/rsp_es10.c -- a profile listing is not
+   the place to hand back a kilobyte of icon per entry. Strings are
+   malloc'ed, NUL-terminated, and owned by the struct. */
+typedef struct {
+    uint8_t iccid[10];
+    int     have_iccid;
+
+    uint8_t isdp_aid[16];
+    size_t  isdp_aid_len;      /* 1..16 when have_isdp_aid; 0 otherwise */
+    int     have_isdp_aid;
+
+    long    profile_state;     /* ProfileState_disabled(0) / _enabled(1) */
+    int     have_profile_state;
+
+    char   *profile_nickname;        /* NULL if the card sent none */
+    char   *service_provider_name;
+    char   *profile_name;
+
+    long    profile_class;     /* ProfileClass_test(0)/_provisioning(1)/_operational(2) */
+    int     have_profile_class;
+} rsp_profile_info_t;
+
+/* Select the ISD-R, then ask for every installed profile
+   (ProfileInfoListRequest with every member absent, SGP.22 v2.6 section
+   5.7.15 -- an empty body asks for all of them, not none: 'BF2D 00' is
+   that clause's own worked example of "retrieve the ProfileInfo for all
+   installed Profiles"). *out is
+   malloc'ed on success, an array of *out_count rsp_profile_info_t,
+   released with rsp_card_profiles_free; a card with nothing installed
+   answers 0 with *out_count == 0 and *out == NULL, a complete answer,
+   not this function's failure to find anything.
+
+   Returns 0, or:
+
+   -1 when an answer came back and it is a refusal: the card sent
+   ProfileInfoListError rather than the list. *err, if not NULL, is set
+   to which one (ProfileInfoListError_incorrectInputValues == 1 or
+   ProfileInfoListError_undefinedError == 127, dist/ProfileInfoListError.h)
+   -- a caller that only needs the exit code can pass NULL and ignore the
+   distinction, the same as rsp_card_read_info's no_isdr parameter. *err
+   is left at 0 for every other outcome, including success; check it only
+   after this function itself returns -1.
+
+   -2 when the exchange could not happen, or the response arrived but
+   could not be decoded as ProfileInfoListResponse, or as some ProfileInfo
+   entry this struct cannot represent (an iccid whose length is not
+   exactly 10, an isdpAid longer than isdp_aid can hold or of length 0,
+   or an allocation failure) -- the same "cannot make sense of it" -2
+   rsp_card_read_info already gives a non-uniform ci_ids list.
+
+   no_isdr follows rsp_card_read_info's own convention exactly: set to 1
+   when the very first step -- selecting the ISD-R -- is itself what
+   refused (a -1 there, before ProfileInfoListRequest was ever sent), 0
+   for every other outcome including success. Left untouched if NULL. */
+int rsp_card_read_profiles(rsp_transport_t *t, rsp_profile_info_t **out,
+                            size_t *out_count, long *err, int *no_isdr);
+
+/* Release an array obtained from rsp_card_read_profiles: each entry's
+   owned strings, then the array itself. Safe to call with profiles ==
+   NULL (whether or not count is 0) and safe on a zeroed array. */
+void rsp_card_profiles_free(rsp_profile_info_t *profiles, size_t count);
 
 #endif /* RSP_H */
