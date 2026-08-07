@@ -156,6 +156,74 @@ static long pcsc_transceive(rsp_transport_t *t, const uint8_t *cmd,
     return (long)recv_len;
 }
 
+/* Walks an ATR's interface bytes (ISO/IEC 7816-3) far enough to say which
+ * transmission protocols the card itself offers, without ever connecting
+ * to it -- SCardGetStatusChange (rsp_pcsc_open, below) hands back the ATR
+ * for free, cached by the reader, before any SCardConnect is attempted.
+ *
+ * atr[0] is TS. atr[1] is T0: its high nibble Y1 says which of
+ * TA1/TB1/TC1/TD1 follow; TD1, if present, both says which of
+ * TA2/TB2/TC2/TD2 follow AND carries a protocol number in its own low
+ * nibble, and so on for TD2, TD3... -- each TDi both continues the walk
+ * and announces one more offered protocol, except for one reserved value:
+ * a low nibble of 15 is not a protocol at all, it is ISO 7816-3's marker
+ * that the NEXT group is "global interface bytes" (clock-stop, class
+ * indicator) rather than protocol parameters. A walk that read T=15 as an
+ * offered protocol would go on to ask SCardConnect for a protocol number
+ * that means something else entirely on the wire. If TD1 is absent, the
+ * card offers T=0 alone -- ISO 7816-3's own default, never spelled out in
+ * the bytes at all.
+ *
+ * Returns a bitmask, bit 0 for "offers T=0" and bit 1 for "offers T=1"
+ * (a card can set both). Returns 0 if the ATR is too short to say
+ * anything, or runs out of bytes partway through the walk with nothing
+ * decided yet -- the caller reads a 0 as "unknown," not as "the card
+ * offers nothing," and falls back accordingly. */
+static unsigned atr_protocol_mask(const unsigned char *atr, unsigned len)
+{
+    if (len < 2) return 0;
+
+    unsigned mask = 0;
+    unsigned pos = 2;              /* atr[0] TS, atr[1] T0 already read */
+    unsigned y = (unsigned)(atr[1] >> 4);
+    int have_td = 0;
+
+    for (;;) {
+        if (y & 0x1) {              /* TAi present */
+            if (pos >= len) return mask;
+            pos++;
+        }
+        if (y & 0x2) {              /* TBi present */
+            if (pos >= len) return mask;
+            pos++;
+        }
+        if (y & 0x4) {              /* TCi present */
+            if (pos >= len) return mask;
+            pos++;
+        }
+        if (!(y & 0x8)) {           /* no TDi: the walk ends here */
+            break;
+        }
+        if (pos >= len) return mask;
+        unsigned char td = atr[pos++];
+        unsigned t = (unsigned)(td & 0x0F);
+        have_td = 1;
+        if (t <= 1) {
+            mask |= (1u << t);
+        }
+        /* t == 15: the global-interface-bytes marker, not a protocol --
+         * deliberately not added to mask. Any other value is a protocol
+         * this walk does not know how to request either, so it is also
+         * left out of mask; the caller's fallback path covers both. */
+        y = (unsigned)(td >> 4);
+    }
+
+    if (!have_td) {
+        mask |= 1u;                 /* no TD1 at all: T=0, implicitly */
+    }
+    return mask;
+}
+
 static void pcsc_close(rsp_transport_t *t)
 {
     rsp_pcsc_state_t *st = t->ctx;
@@ -211,30 +279,77 @@ int rsp_pcsc_open(const char *reader, rsp_transport_t *out)
      * exact same card connects fine when asked for T0 alone -- the stack
      * mishandles the combined request, not the request itself, and there
      * is nothing on this side of the interface that makes that go away.
+     * Measured cold (the card left idle ~90s, nothing else asked of it
+     * since): the combined request takes just over 18 seconds to fail
+     * that way before anything gets a chance to retry.
      *
-     * So: ask for the combined mask first, since it is correct and works
-     * everywhere that does not have this quirk. If that fails, retry with
-     * each single protocol in turn. A silent fallback that happens to
-     * work is only marginally better than a loud failure that does not --
-     * either way the next person has no way to tell what actually
-     * happened -- so every attempt after the first, and the protocol that
-     * ultimately got negotiated, is reported on stderr. If every attempt
-     * fails, the error reported and returned is the first attempt's: the
-     * combined request is the one whose failure is actually diagnostic,
-     * where "protocol mismatch" from a single-protocol retry is not
+     * SCardGetStatusChange does not have this cost -- it never talks to
+     * the card at all, only to the reader's own cached notion of what is
+     * inserted, and it hands back the ATR as part of that. So: read the
+     * ATR first, with a zero timeout (asks for the current state, does
+     * not wait for a change), and use atr_protocol_mask to work out which
+     * single protocol the card itself is offering. When that comes back
+     * as exactly one protocol, ask for that one directly, first --
+     * skipping the doomed combined attempt entirely rather than paying
+     * for it and then falling back. When the ATR could not be read, could
+     * not be parsed, or genuinely offers both protocols, there is no
+     * reason yet to expect the combined request to fail, so it is still
+     * asked for first, unchanged from before.
+     *
+     * Either way, the original try-each-protocol sequence stays as the
+     * net: if the ATR's own answer turns out to be wrong for some reason
+     * this walk did not anticipate, or the ATR was unreadable to begin
+     * with, every protocol still gets tried in turn before this function
+     * gives up. A silent fallback that happens to work is only marginally
+     * better than a loud failure that does not -- either way the next
+     * person has no way to tell what actually happened -- so every
+     * attempt after the first, and the protocol that ultimately got
+     * negotiated, is reported on stderr. If every attempt fails, the
+     * error reported and returned is the first attempt's: whichever
+     * request was tried first is the one whose failure is actually
+     * diagnostic, where "protocol mismatch" from a later retry is not
      * telling you anything you did not already ask for. */
-    static const DWORD protocols[] = {
+    unsigned atr_mask = 0;
+    {
+        SCARD_READERSTATE rs;
+        memset(&rs, 0, sizeof rs);
+        rs.szReader = use;
+        rs.dwCurrentState = SCARD_STATE_UNAWARE;
+        if (SCardGetStatusChange(ctx, 0, &rs, 1) == SCARD_S_SUCCESS) {
+            atr_mask = atr_protocol_mask(rs.rgbAtr, rs.cbAtr);
+        }
+    }
+
+    static const DWORD fallback_protocols[] = {
         SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1,
         SCARD_PROTOCOL_T0,
         SCARD_PROTOCOL_T1,
     };
-    static const char *const protocol_names[] = { "T0|T1", "T0", "T1" };
+    static const char *const fallback_names[] = { "T0|T1", "T0", "T1" };
+
+    DWORD protocols[4];
+    const char *protocol_names[4];
+    size_t n_protocols = 0;
+
+    if (atr_mask == 1u || atr_mask == 2u) {
+        protocols[n_protocols] = (atr_mask == 1u) ? SCARD_PROTOCOL_T0 : SCARD_PROTOCOL_T1;
+        protocol_names[n_protocols] = (atr_mask == 1u) ? "T0" : "T1";
+        n_protocols++;
+    }
+    for (size_t i = 0; i < sizeof fallback_protocols / sizeof fallback_protocols[0]; i++) {
+        if (n_protocols > 0 && fallback_protocols[i] == protocols[0]) {
+            continue;   /* already the ATR's own first choice, above */
+        }
+        protocols[n_protocols] = fallback_protocols[i];
+        protocol_names[n_protocols] = fallback_names[i];
+        n_protocols++;
+    }
 
     SCARDHANDLE card;
     DWORD active_protocol = 0;
     LONG first_rv = SCARD_S_SUCCESS;
     size_t connected_at = (size_t)-1;
-    for (size_t i = 0; i < sizeof protocols / sizeof protocols[0]; i++) {
+    for (size_t i = 0; i < n_protocols; i++) {
         rv = SCardConnect(ctx, use, SCARD_SHARE_SHARED, protocols[i],
                           &card, &active_protocol);
         if (i == 0) first_rv = rv;
@@ -243,10 +358,9 @@ int rsp_pcsc_open(const char *reader, rsp_transport_t *out)
             break;
         }
     }
-    free(list);
 
     if (connected_at == (size_t)-1) {
-        rv = first_rv;   /* the combined request's failure is the diagnostic one */
+        rv = first_rv;   /* the first attempt's failure is the diagnostic one */
         if (rv == (LONG)SCARD_E_NO_SMARTCARD) {
             fprintf(stderr, "rsp_pcsc: the reader is there, but no card is "
                              "in it\n");
@@ -256,10 +370,11 @@ int rsp_pcsc_open(const char *reader, rsp_transport_t *out)
                              "services -- close whatever else has it open "
                              "and try again\n");
         } else if (rv == (LONG)SCARD_E_UNKNOWN_READER) {
-            fprintf(stderr, "rsp_pcsc: no reader by that name is attached\n");
+            fprintf(stderr, "rsp_pcsc: no reader named \"%s\" is attached\n", use);
         } else {
             fprintf(stderr, "rsp_pcsc: cannot connect to the card: %s\n", pcsc_stringify_error(rv));
         }
+        free(list);
         SCardReleaseContext(ctx);
         return -2;
     }
@@ -269,12 +384,14 @@ int rsp_pcsc_open(const char *reader, rsp_transport_t *out)
          * exactly the moment the negotiated protocol is diagnostic, not
          * routine chatter on every ordinary open (rsp_replay_open and
          * rsp_record_open say nothing on success either). */
-        fprintf(stderr, "rsp_pcsc: asking for T0|T1 failed (%s); fell back "
+        fprintf(stderr, "rsp_pcsc: asking for %s failed (%s); fell back "
                          "to asking for %s alone -- connected, negotiated "
                          "protocol %s\n",
-                pcsc_stringify_error(first_rv), protocol_names[connected_at],
+                protocol_names[0], pcsc_stringify_error(first_rv),
+                protocol_names[connected_at],
                 active_protocol == SCARD_PROTOCOL_T1 ? "T=1" : "T=0");
     }
+    free(list);
 
     rsp_pcsc_state_t *st = malloc(sizeof *st);
     if (!st) {

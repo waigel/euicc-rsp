@@ -52,21 +52,23 @@ issue, a chat message, or a bug report unexamined -- read what it
 actually contains first, the same as you would before sharing a core
 dump.
 
-## `synthetic-info.log`
+## The synthetic `EUICCInfo2`/`GetEuiccDataResponse` DER
 
-No card was involved in producing this one: `tests/test_es10.c` needs a
-recording whose `EUICCInfo2` and `GetEuiccDataResponse` payloads are real
-DER, and a hand-invented blob that the generated decoder happens to accept
-would prove nothing about the decoder -- it would prove only that two
-mistakes agree. So those two payloads were produced by the generated
-*encoder* instead, with the following throwaway program (compiled and run
-once, not part of the build):
+`synthetic-info-direct-select.log`'s two ES10 response payloads are not
+hand-invented: `tests/test_es10.c` needs a recording whose `EUICCInfo2`
+and `GetEuiccDataResponse` payloads are real DER, and a hand-invented blob
+that the generated decoder happens to accept would prove nothing about the
+decoder -- it would prove only that two mistakes agree. So those two
+payloads were produced by the generated *encoder* instead, with the
+following throwaway program (compiled and run once, not part of the
+build):
 
 ```c
 /* Throwaway program: fills an EUICCInfo2 and a GetEuiccDataResponse with the
  * generated types from ~/git/waigel/euicc-rsp/dist and encodes each with the
  * generated der_encode, then prints the result as hex. The output is pasted
- * into testdata/cards/synthetic-info.log -- see testdata/cards/README.md.
+ * into testdata/cards/synthetic-info-direct-select.log -- see
+ * testdata/cards/README.md.
  *
  * Not part of the build: compiled and run once by hand.
  *
@@ -189,8 +191,8 @@ int main(void) {
 }
 ```
 
-Its output, byte-for-byte what `synthetic-info.log` carries for those two
-exchanges:
+Its output, byte-for-byte what `synthetic-info-direct-select.log` carries
+for those two exchanges:
 
 ```
 # EUICCInfo2, 113 bytes
@@ -200,9 +202,10 @@ BF3E125A10890330121122334455667788990011FF
 ```
 
 The STORE DATA framing (CLA/INS/P1/P2/Lc/Le) around each ES10 request and
-response is hand-assembled in `synthetic-info.log` itself, per the
-citations in `src/rsp_es10.c`'s file header -- only the two ES10 payloads
-above needed the generated encoder, since those are the only two fields a
+response is hand-assembled in `synthetic-info-direct-select.log` itself,
+per the citations in `src/rsp_es10.c`'s file header -- only the two ES10
+payloads above needed the generated encoder, since those are the only two
+fields a
 hand-written blob could get subtly wrong without the decoder noticing.
 `svn` is `02 02 00`, decoding to "2.2.0"; the EID and both CI identifier
 lists are otherwise arbitrary synthetic bytes, not tied to any real card
@@ -210,40 +213,42 @@ or issuer.
 
 To regenerate: save the program above, compile and run it exactly as its
 own header comment says, then splice its two hex lines into
-`synthetic-info.log` in place of the current `EUICCInfo2`/
+`synthetic-info-direct-select.log` in place of the current `EUICCInfo2`/
 `GetEuiccDataResponse` response lines (keep the trailing ` 9000` each
 already carries).
 
 ## The SELECT exchange: real hardware, not an assumption
 
-`synthetic-info.log`'s SELECT of the ISD-R is not hand-assembled and not
-generated either -- fix round 2 replaced it with a byte-for-byte copy of a
-real probe against this project's own test eUICC over PC/SC at T=0, once
-Task 4 first reached the card:
+An earlier revision of this directory carried a second fixture,
+`synthetic-info.log`, whose purpose was to pin a real card's SELECT
+response -- `61 21` ("33 more bytes waiting"), not a bare `9000` -- after
+fix round 2 found `rsp_card_select_isdr` treating anything but an exact
+`9000` as a refusal and so never sending the GET RESPONSE that status
+actually calls for:
 
 ```
 SELECT ISD-R -> 6121
 GET RESPONSE -> 6F1F 8410 A0000005591010FFFFFFFF8900000100 A504 9F6501FF E005 82030202 00 9000
 ```
 
-Fix round 1's fixture had SELECT answer a bare `9000`, guessed rather than
-observed -- and no real card that returns an FCI on SELECT actually does
-that. `rsp_card_select_isdr` matched that guess (treating anything but an
-exact `9000` as a refusal), and the test agreed with both, so the defect
-survived until real hardware exposed it: the card's actual `61 21` ("33
-more bytes waiting") was read as a refusal, and `rsp_card_select_isdr`
-never sent the GET RESPONSE that status asks for. The FCI the GET
-RESPONSE above carries is itself informative -- `84 10 <AID>` echoes the
-AID just selected, and `E0 05 82 03 02 02 00` is the card's own SGP.22
-version, "2.2.0", the same version `EUICCInfo2.svn` reports later in the
-same recording.
+(the FCI here is itself informative -- `84 10 <AID>` echoes the AID just
+selected, and `E0 05 82 03 02 02 00` is the card's own SGP.22 version,
+"2.2.0"). That fixture became redundant the moment `omnikey-info.log`,
+below, started carrying the exact same real-hardware SELECT/GET RESPONSE
+pair as part of a whole captured session, and `tests/test_es10.c` moved
+its main assertions to that recording -- so `synthetic-info.log` was
+removed rather than kept as a second copy of coverage `omnikey-info.log`
+already provides. This section stays to record why that shape matters at
+all, and to explain what `synthetic-info-direct-select.log`, below, is a
+deliberate exception to.
 
-`synthetic-info-direct-select.log` keeps the other shape ISO/IEC 7816-4
+`synthetic-info-direct-select.log` keeps the OTHER shape ISO/IEC 7816-4
 also permits -- SELECT answering `9000` directly, no FCI at all -- as a
 secondary fixture, so that path (no GET RESPONSE needed) stays covered
 too. It is not what this project's own card does, and `tests/test_es10.c`
 does not drive its main assertions against it for that reason; the
-realistic, real-hardware shape is what the main flow now uses.
+realistic, real-hardware shape is what the main flow now uses, from
+`omnikey-info.log`.
 
 ## `omnikey-info.log`
 
@@ -271,12 +276,11 @@ CI[0] C0BC70BA36929D43B467FF57570530E57AB8FCD8
 CI[1] F54172BDF98A95D65CBEB88A38A1C11D800A85C3
 ```
 
-`tests/test_es10.c` now drives its main assertions against this
-recording instead of `synthetic-info.log`, and asserts that exact EID,
-`"2.2.0"`, and an issuer count of 2 -- the real card's own answer, not an
-invented one. `synthetic-info.log` and `synthetic-info-direct-select.log`
-stay in the tree and in the suite for the reasons given above: the direct
-SELECT (`9000`, no FCI) shape they cover is one this particular card does
+`tests/test_es10.c` now drives its main assertions against this recording,
+and asserts that exact EID, `"2.2.0"`, and an issuer count of 2 -- the
+real card's own answer, not an invented one. `synthetic-info-direct-select.log`
+stays in the tree and in the suite for the reason given above: the direct
+SELECT (`9000`, no FCI) shape it covers is one this particular card does
 not itself produce, and losing that coverage to gain realism elsewhere
 would be a poor trade.
 
