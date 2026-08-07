@@ -54,6 +54,15 @@ SRCS    := $(wildcard src/*.c) build/sgp26_material.c
 OBJS    := $(SRCS:.c=.o)
 LIB     := librsp.a
 
+# Neither header is named per source file below: every translation unit in
+# this library reaches rsp.h, directly or through rsp_internal.h, so listing
+# both against every object is an over-approximation, not a guess. Without
+# this, "touch include/rsp.h" changed nothing make could see, and a caller
+# further up the chain (euicc-tools' Makefile delegates to this one and
+# trusts it to know when librsp.a is stale) would link a library that never
+# noticed the header moved.
+HDRS    := include/rsp.h src/rsp_internal.h
+
 MBED_LIBS := $(MBED)/library/libmbedx509.a $(MBED)/library/libmbedcrypto.a
 
 # mbedTLS commits five generated sources for this pinned tag, but its own
@@ -205,7 +214,7 @@ mbedtls: $(MBED_LIBS)
 # friends) directly, so every object -- not just the tests -- now needs
 # $(DIST)/.stamp built first and $(GEN_INC) on its command line. -idirafter,
 # not -I, for the same case-insensitive-Time.h reason the tests use it.
-%.o: %.c $(MBED_LIBS) $(DIST)/.stamp
+%.o: %.c $(HDRS) $(MBED_LIBS) $(DIST)/.stamp
 	$(CC) $(ALL_CFLAGS) $(GEN_INC) -c $< -o $@
 
 $(LIB): $(OBJS)
