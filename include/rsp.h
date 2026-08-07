@@ -390,8 +390,19 @@ typedef struct {
 } rsp_card_info_t;
 
 /* Select the ISD-R, then read EUICCInfo2 and the EID. Returns 0, -1 if the
-   card refused, -2 if it could not be asked. */
-int rsp_card_read_info(rsp_transport_t *t, rsp_card_info_t *out);
+   card refused, -2 if it could not be asked.
+
+   `no_isdr`, if not NULL, is set to 1 when a -1 happened at the very first
+   step -- selecting the ISD-R itself came back refused (a real answer,
+   commonly '6A82' or another SELECT-specific status, not a chain this
+   function did not know how to follow) -- and left at 0 for every other
+   outcome, including success and -2. That distinction is for a caller
+   like euicc-tools' `card info`: an ISD-R that never answers at all reads
+   very differently from a later ES10 request the ISD-R accepted and then
+   refused -- the first says the card in the reader may not be an eUICC at
+   all, or its ISD-R is locked; the second says it is one, and it said no
+   to something specific asked of it. */
+int rsp_card_read_info(rsp_transport_t *t, rsp_card_info_t *out, int *no_isdr);
 
 /* Release an rsp_card_info_t obtained from rsp_card_read_info. Safe to call
    on a zeroed struct. Nothing here is secret (see testdata/cards/README.md,

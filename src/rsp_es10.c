@@ -419,13 +419,17 @@ static int rsp_card_select_isdr(rsp_transport_t *t)
 static const uint8_t es10_info2_req[] = { 0xBF, 0x22, 0x00 };
 static const uint8_t es10_eid_req[]   = { 0xBF, 0x3E, 0x03, 0x5C, 0x01, 0x5A };
 
-int rsp_card_read_info(rsp_transport_t *t, rsp_card_info_t *out)
+int rsp_card_read_info(rsp_transport_t *t, rsp_card_info_t *out, int *no_isdr)
 {
+    if (no_isdr) *no_isdr = 0;
     if (!t || !t->transceive || !out) return -2;
     memset(out, 0, sizeof *out);
 
     int rc = rsp_card_select_isdr(t);
-    if (rc != 0) return rc;
+    if (rc != 0) {
+        if (rc == -1 && no_isdr) *no_isdr = 1;
+        return rc;
+    }
 
     uint8_t *resp = NULL;
     size_t resp_len = 0;

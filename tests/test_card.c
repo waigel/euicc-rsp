@@ -41,7 +41,7 @@ int main(int argc, char **argv) {
 
     rsp_card_info_t info;
     memset(&info, 0, sizeof info);
-    rc = rsp_card_read_info(&t, &info);
+    rc = rsp_card_read_info(&t, &info, NULL);
     if(rc != 0) { fprintf(stderr, "cannot read the card: %d\n", rc); t.close(&t); return rc == -1 ? 1 : 2; }
 
     printf("ok   the card answered\n");

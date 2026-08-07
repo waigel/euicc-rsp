@@ -21,7 +21,7 @@ int main(void) {
 
     rsp_card_info_t info;
     memset(&info, 0, sizeof info);
-    ok("the card is read", rsp_card_read_info(&t, &info) == 0);
+    ok("the card is read", rsp_card_read_info(&t, &info, NULL) == 0);
     ok("the EID arrived", info.have_eid);
 
     /* What the card in the OMNIKEY reader actually answered during Task 5's
@@ -99,9 +99,78 @@ int main(void) {
     rsp_card_info_t info2;
     memset(&info2, 0, sizeof info2);
     ok("the card is read when SELECT answers 9000 directly",
-       rsp_card_read_info(&t2, &info2) == 0);
+       rsp_card_read_info(&t2, &info2, NULL) == 0);
     rsp_card_info_free(&info2);
     t2.close(&t2);
+
+    /* card.c's own message for "no ISD-R" depends on rsp_card_read_info
+       telling the two -1 causes apart: a SELECT of the ISD-R that comes
+       back refused (this may not be an eUICC at all, or its ISD-R is
+       locked) versus a later ES10 request the ISD-R accepted and then
+       refused (the card answered a specific question with no). '6A82' --
+       "file or application not found" -- is what a real card without our
+       AID provisioned answers a SELECT with; it is the shape, not a
+       specific card's own recorded answer, so this fixture is written by
+       hand rather than pulled from real hardware. */
+    {
+        const char *path = "/tmp/rsp-test-no-isdr.log";
+        FILE *f = fopen(path, "w");
+        if (f) {
+            fputs("# SELECT of the ISD-R, refused: no application by that "
+                  "AID -- \"6A82\" is ISO/IEC 7816-4's \"file or application "
+                  "not found\". Same fixed AID rsp_card_select_isdr always\n"
+                  "# asks for (see isdr_aid in src/rsp_es10.c); a card with\n"
+                  "# no ISD-R answers this exact command, not a different one.\n"
+                  "> 00A4040010A0000005591010FFFFFFFF890000010000\n"
+                  "< 6A82\n", f);
+            fclose(f);
+        }
+        rsp_transport_t t3;
+        ok("the no-ISD-R recording opens", rsp_replay_open(path, &t3) == 0);
+        rsp_card_info_t info3;
+        memset(&info3, 0, sizeof info3);
+        int no_isdr = 0;
+        int rc3 = rsp_card_read_info(&t3, &info3, &no_isdr);
+        ok("SELECT refused by the card is reported as -1",
+           rc3 == -1);
+        ok("no_isdr is set: the ISD-R itself never answered",
+           no_isdr == 1);
+        t3.close(&t3);
+
+        /* The distinction only means something if a LATER refusal, past a
+           successful SELECT, leaves no_isdr at 0 -- otherwise it would
+           just be "was there ever any -1", already covered by rc3 alone.
+           Truncate omnikey-info.log's own recording right after its
+           SELECT/GET RESPONSE pair (still a real SELECT), then answer the
+           GetEUICCInfo2 STORE DATA that follows with a refusal instead of
+           its recorded 9000. */
+        const char *path2 = "/tmp/rsp-test-later-refusal.log";
+        FILE *f2 = fopen(path2, "w");
+        if (f2) {
+            fputs("# A real SELECT (see testdata/cards/omnikey-info.log),\n"
+                  "# followed by a GetEUICCInfo2 the ISD-R refuses instead\n"
+                  "# of answering -- unrelated to whether an ISD-R exists.\n"
+                  "> 00A4040010A0000005591010FFFFFFFF890000010000\n"
+                  "< 6121\n"
+                  "> 00C0000021\n"
+                  "< 6F1F8410A0000005591010FFFFFFFF8900000100A5049F6501FFE005820302020"
+                  "09000\n"
+                  "> 80E2910003BF220000\n"
+                  "< 6A88\n", f2);
+            fclose(f2);
+        }
+        rsp_transport_t t4;
+        ok("the later-refusal recording opens", rsp_replay_open(path2, &t4) == 0);
+        rsp_card_info_t info4;
+        memset(&info4, 0, sizeof info4);
+        no_isdr = 1; /* poison, to prove rsp_card_read_info clears it */
+        int rc4 = rsp_card_read_info(&t4, &info4, &no_isdr);
+        ok("a refusal past a successful SELECT is still -1",
+           rc4 == -1);
+        ok("...but no_isdr is 0: the ISD-R itself did answer",
+           no_isdr == 0);
+        t4.close(&t4);
+    }
 
     return fails ? 1 : 0;
 }
