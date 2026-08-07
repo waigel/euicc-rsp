@@ -255,7 +255,19 @@ int rsp_pcsc_open(const char *reader, rsp_transport_t *out)
             return -2;
         }
         if (n == 0) {
-            fprintf(stderr, "rsp_pcsc: no reader is attached\n");
+            /* reader is NULL on every path that reaches here (use == reader,
+             * and this whole block is guarded by !use), so this always takes
+             * the "no name at all" wording below -- but it is written to
+             * check reader rather than assume that, so this branch and the
+             * SCARD_E_UNKNOWN_READER/SCARD_E_NO_READERS_AVAILABLE one in the
+             * SCardConnect failure path below say the same thing the same
+             * way, rather than one of the two silently drifting if either is
+             * ever reached from a changed caller. */
+            if (reader) {
+                fprintf(stderr, "rsp_pcsc: no reader named \"%s\" is attached\n", reader);
+            } else {
+                fprintf(stderr, "rsp_pcsc: no reader is attached\n");
+            }
             free(list);
             SCardReleaseContext(ctx);
             return -2;
@@ -369,8 +381,25 @@ int rsp_pcsc_open(const char *reader, rsp_transport_t *out)
                              "macOS this is usually the system's own card "
                              "services -- close whatever else has it open "
                              "and try again\n");
-        } else if (rv == (LONG)SCARD_E_UNKNOWN_READER) {
-            fprintf(stderr, "rsp_pcsc: no reader named \"%s\" is attached\n", use);
+        } else if (rv == (LONG)SCARD_E_UNKNOWN_READER || rv == (LONG)SCARD_E_NO_READERS_AVAILABLE) {
+            /* A caller-named reader skips pcsc_list entirely above (use ==
+             * reader, unexamined) and goes straight to SCardConnect with
+             * that exact name -- so when it cannot be provided, PC/SC's
+             * answer depends on whether its reader table is empty at that
+             * moment (SCARD_E_NO_READERS_AVAILABLE) or holds readers, just
+             * not this one (SCARD_E_UNKNOWN_READER). Both mean the same
+             * thing to whoever typed the name: it is not attached, whether
+             * because nothing is or because something else is. Collapsing
+             * them into one message, naming the reader, is what keeps this
+             * answer true on a desk with hardware and in CI with none --
+             * a message that only fires on one of the two PC/SC codes reads
+             * differently depending on which environment happens to run it,
+             * which is exactly the defect this fixes. */
+            if (reader) {
+                fprintf(stderr, "rsp_pcsc: no reader named \"%s\" is attached\n", reader);
+            } else {
+                fprintf(stderr, "rsp_pcsc: no reader is attached\n");
+            }
         } else {
             fprintf(stderr, "rsp_pcsc: cannot connect to the card: %s\n", pcsc_stringify_error(rv));
         }
