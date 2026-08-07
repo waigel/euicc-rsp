@@ -25,7 +25,7 @@ static void ok(const char *what, int good) {
 
 /* ---- OpenSSL cross-check vectors (fix round 1) ----
  *
- * Everything above this comment is rsp_sign checked against rsp_verify --
+ * Everything above this comment is rsp_sign checked against rsp_sign_verify --
  * self-consistency, not correctness. A build that swapped r and s (or any
  * other internally-consistent convention bug, in both functions at once)
  * would pass every one of those assertions while every real eUICC and
@@ -52,7 +52,7 @@ static void ok(const char *what, int good) {
  * DER (its top bit is set) -- exactly the r||s edge case the review round
  * checked empirically across 5000 signatures. unwrap_der_sig below turns
  * OpenSSL's DER SEQUENCE { INTEGER r, INTEGER s } into the plain 64-byte
- * r||s pair rsp_verify expects (SGP.22 v2.6 section 2.6.7.2 / GlobalPlatform
+ * r||s pair rsp_sign_verify expects (SGP.22 v2.6 section 2.6.7.2 / GlobalPlatform
  * Amendment E section 3.1.3): it handles short-form lengths only, because
  * both committed DER blobs are under 128 bytes -- a fixed unwrapper for
  * these two vectors, not a general ASN.1 parser, and no OpenSSL, no
@@ -140,7 +140,7 @@ int main(void) {
 
     ok("signing succeeds", rsp_sign(&dp, msg, sizeof msg - 1, sig) == 0);
     ok("the signature verifies with the matching certificate",
-       rsp_verify(dp.der, dp.der_len, msg, sizeof msg - 1, sig) == 0);
+       rsp_sign_verify(dp.der, dp.der_len, msg, sizeof msg - 1, sig) == 0);
     /* -1, not just nonzero: card.der parses fine (it is DPpb's real,
        well-formed certificate) and the only reason this fails is that
        mbedtls_ecdsa_verify actually rejects the signature -- the
@@ -148,20 +148,20 @@ int main(void) {
        convention calls -1, distinct from -2's "never got to ask". */
     ok("it does not verify with another certificate (a real no, not a"
        " parse failure -- see include/rsp.h's failure convention)",
-       rsp_verify(card.der, card.der_len, msg, sizeof msg - 1, sig) == -1);
+       rsp_sign_verify(card.der, card.der_len, msg, sizeof msg - 1, sig) == -1);
     ok("an unparseable certificate answers -2, not -1: the question of"
        " whether the signature verifies was never actually reached",
-       rsp_verify(NULL, 0, msg, sizeof msg - 1, sig) == -2);
+       rsp_sign_verify(NULL, 0, msg, sizeof msg - 1, sig) == -2);
 
     uint8_t bad[sizeof msg - 1];
     memcpy(bad, msg, sizeof bad);
     bad[0] ^= 0x01;
     ok("a tampered message does not verify (-1: a real no)",
-       rsp_verify(dp.der, dp.der_len, bad, sizeof bad, sig) == -1);
+       rsp_sign_verify(dp.der, dp.der_len, bad, sizeof bad, sig) == -1);
 
     sig[0] ^= 0x01;
     ok("a tampered signature does not verify (-1: a real no)",
-       rsp_verify(dp.der, dp.der_len, msg, sizeof msg - 1, sig) == -1);
+       rsp_sign_verify(dp.der, dp.der_len, msg, sizeof msg - 1, sig) == -1);
 
     /* ECDSA is randomised: two signatures over the same message differ, and
        both must verify. An implementation that returns a constant passes
@@ -172,8 +172,8 @@ int main(void) {
     ok("two signatures over the same message differ",
        memcmp(sig2, sig3, 64) != 0);
     ok("both of them verify",
-       rsp_verify(dp.der, dp.der_len, msg, sizeof msg - 1, sig2) == 0
-       && rsp_verify(dp.der, dp.der_len, msg, sizeof msg - 1, sig3) == 0);
+       rsp_sign_verify(dp.der, dp.der_len, msg, sizeof msg - 1, sig2) == 0
+       && rsp_sign_verify(dp.der, dp.der_len, msg, sizeof msg - 1, sig3) == 0);
 
     {
         uint8_t plain_a[64], plain_b[64];
@@ -183,13 +183,13 @@ int main(void) {
         ok("vector B's OpenSSL DER signature unwraps",
            unwrap_der_sig(VEC_B_SIG_DER, sizeof VEC_B_SIG_DER, plain_b) == 0);
         ok("an OpenSSL-produced signature over vector A's message verifies",
-           rsp_verify(dp.der, dp.der_len, VEC_A_MSG, sizeof VEC_A_MSG - 1,
+           rsp_sign_verify(dp.der, dp.der_len, VEC_A_MSG, sizeof VEC_A_MSG - 1,
                       plain_a) == 0);
         ok("an OpenSSL-produced signature over vector B's message verifies",
-           rsp_verify(dp.der, dp.der_len, VEC_B_MSG, sizeof VEC_B_MSG - 1,
+           rsp_sign_verify(dp.der, dp.der_len, VEC_B_MSG, sizeof VEC_B_MSG - 1,
                       plain_b) == 0);
         ok("vector A's signature does not verify against vector B's message",
-           rsp_verify(dp.der, dp.der_len, VEC_B_MSG, sizeof VEC_B_MSG - 1,
+           rsp_sign_verify(dp.der, dp.der_len, VEC_B_MSG, sizeof VEC_B_MSG - 1,
                       plain_a) != 0);
     }
 

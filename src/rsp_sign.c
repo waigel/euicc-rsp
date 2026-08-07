@@ -18,7 +18,7 @@
  * Amendment E's own text, not inferred from this project's prior use of
  * SHA-256 elsewhere.
  *
- * rsp_verify fails closed: every error path -- a certificate that will
+ * rsp_sign_verify fails closed: every error path -- a certificate that will
  * not parse, a key that is not an EC key, a signature that mbedTLS
  * rejects -- falls through to the same "ret = -1" set before any of it
  * ran. There is exactly one place ret becomes 0.
@@ -114,7 +114,7 @@ int rsp_sign(const rsp_credential_t *c, const uint8_t *tbs, size_t tbs_len,
     return ret;
 }
 
-int rsp_verify(const uint8_t *cert_der, size_t cert_len,
+int rsp_sign_verify(const uint8_t *cert_der, size_t cert_len,
                const uint8_t *tbs, size_t tbs_len, const uint8_t sig[64])
 {
     unsigned char hash[32];

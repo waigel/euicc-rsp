@@ -32,7 +32,7 @@
  * different responses (retry/report-and-stop, versus reject-and-move-on).
  * This mirrors the exit-code contract the CLI built on top of this
  * library needs one level up (0 done, 1 a real negative answer, 2 could
- * not answer): for rsp_pki_verify, rsp_verify, rsp_unprotect and
+ * not answer): for rsp_pki_verify, rsp_sign_verify, rsp_unprotect and
  * rsp_bpp_recover, -1 means the question was asked and the answer is no
  * -- a signature that does not verify, a certificate that does not chain,
  * a MAC that does not match. -2 means the question was never reached --
@@ -105,7 +105,7 @@ int rsp_sign(const rsp_credential_t *c, const uint8_t *tbs, size_t tbs_len,
  * never reached: an unparseable certificate, a non-EC key, or a null/empty
  * argument. Every path other than the single success returns a negative
  * value; there is no way for a malformed input to read as accepted. */
-int rsp_verify(const uint8_t *cert_der, size_t cert_len,
+int rsp_sign_verify(const uint8_t *cert_der, size_t cert_len,
                const uint8_t *tbs, size_t tbs_len, const uint8_t sig[64]);
 
 /* The SCP03t session keys derived from the one-time key agreement between
