@@ -293,4 +293,53 @@ int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
 int rsp_bpp_recover(rsp_session_t *s, const uint8_t *bpp, size_t bpp_len,
                     uint8_t **upp, size_t *upp_len);
 
+/* ES9+ (LPA -- SM-DP+), SGP.22 v2.6 section 5.6: the SM-DP+ role's own
+ * side of the RSP session, as opposed to rsp_session_t above (the SCP03t
+ * transport keys, unrelated). src/rsp_es9.c has the full account of
+ * section 5.6.1 vs. 5.7.13, why DPauth and not DPpb, what this returns,
+ * and the two judgement calls its own interface forced (no smdpAddress
+ * input, no CI selection among more than the one this library has).
+ *
+ * One RSP session's server-side state, from InitiateAuthentication to
+ * GetBoundProfilePackage. Carries the transactionId every later step
+ * must echo, and the eUICC identity learned in step 4. Secret once the
+ * session keys land in it; wipe with rsp_dp_session_free. */
+typedef struct rsp_dp_session rsp_dp_session_t;
+
+/* SGP.22 v2.6 section 5.6.1, "InitiateAuthentication": opens an RSP
+ * session and signs the eUICC's first challenge, as ES10b.AuthenticateServer
+ * (section 5.7.13) will require of it. euicc_challenge (16 bytes,
+ * Octet16 -- challenge_len must be exactly 16) and euicc_info1 (an
+ * encoded EUICCInfo1, Table 35; rejected if it does not decode as one)
+ * come from the eUICC by way of the LPA. transaction_id is 16 bytes the
+ * caller supplies, not generated inside: production passes fresh random,
+ * a test passes a fixed value, and that difference is the entire reason
+ * a recorded session can be replayed -- there is no fallback that
+ * generates one internally, so there is no test path that ships that
+ * way by accident.
+ *
+ * On success (0), *out receives a new session (release with
+ * rsp_dp_session_free) and *resp / *resp_len the DER encoding of an
+ * InitiateAuthenticationOkEs9 -- transactionId, serverSigned1,
+ * serverSignature1, euiccCiPKIdToBeUsed and serverCertificate
+ * (CERT.DPauth.ECDSA), all "encoded ... including the tags defined for
+ * them in the AuthenticateServerRequest data object" (Table 36, NOTE 1)
+ * -- malloc'ed, owned by the caller. On failure (-1: a null or malformed
+ * argument, or an internal failure -- allocation, RNG seeding, credential
+ * loading, signing), *out / *resp / *resp_len are untouched. Plain -1, not
+ * split like rsp_pki_verify's four: there is nothing a caller could
+ * usefully tell the two failure kinds apart for here, matching this
+ * header's own failure-convention note. */
+int rsp_dp_initiate_authentication(
+        const uint8_t *euicc_challenge, size_t challenge_len,
+        const uint8_t *euicc_info1, size_t info1_len,
+        const uint8_t transaction_id[16],
+        rsp_dp_session_t **out,
+        uint8_t **resp, size_t *resp_len);
+
+/* Release a session obtained from rsp_dp_initiate_authentication. Wipes
+ * it (mbedtls_platform_zeroize, not memset -- see rsp_bpp_recover's own
+ * comment on *upp for why) before freeing. Safe to call with NULL. */
+void rsp_dp_session_free(rsp_dp_session_t *s);
+
 #endif /* RSP_H */
