@@ -30,14 +30,16 @@
  *
  * A fourth thing existed twice by the time this round added it, and had
  * already drifted before anyone noticed: a growable byte buffer, between
- * src/rsp_bpp.c's growbuf_append/growbuf_free and src/rsp_es10.c's
- * es10_append. The two disagreed on their starting capacity (512 vs. 64)
- * and, more importantly, on whether the buffer was wiped before release --
- * rsp_bpp.c's zeroized, es10_append's did not. Harmless while es10_append
- * only ever accumulated an EID or an EUICCInfo2 answer, neither secret;
- * not harmless the first time a write-round caller uses the same
- * accumulator for a ProfileInstallationResult. rsp_growbuf_t below is the
- * one implementation both files now call, keeping the zeroizing free.
+ * src/rsp_bpp.c's growbuf_append/growbuf_free and es10_append, then in
+ * this same file's src/rsp_es10.c and now in euicc-lpa's, which reaches
+ * this header through the vendored submodule. The two disagreed on their
+ * starting capacity (512 vs. 64) and, more importantly, on whether the
+ * buffer was wiped before release -- rsp_bpp.c's zeroized, es10_append's
+ * did not. Harmless while es10_append only ever accumulated an EID or an
+ * EUICCInfo2 answer, neither secret; not harmless the first time a
+ * write-round caller uses the same accumulator for a
+ * ProfileInstallationResult. rsp_growbuf_t below is the one
+ * implementation both files call, keeping the zeroizing free.
  *
  * All four are small enough, and used unevenly enough across the files
  * that would otherwise each carry their own copy, that a header of
@@ -149,9 +151,10 @@ static inline int rsp_der_length_octets(size_t len,
  * needed. Returns 0, or -1 on an allocation failure (g->buf is unchanged
  * and still owned by the caller either way). Shared by src/rsp_bpp.c
  * (hand-assembling TLVs, der_encode's callback interface, concatenating
- * recovered segments) and src/rsp_es10.c (accumulating a chained inward
- * response) -- see this header's own top comment for why a fourth copy
- * was the one this file exists to prevent. */
+ * recovered segments) and euicc-lpa's src/rsp_es10.c (accumulating a
+ * chained inward response), which reaches this header through the
+ * vendored submodule -- see this header's own top comment for why a
+ * fourth copy was the one this file exists to prevent. */
 typedef struct {
     uint8_t *buf;
     size_t   len;

@@ -48,9 +48,9 @@ LIB     := librsp.a
 # this library reaches rsp.h, directly or through rsp_internal.h, so listing
 # both against every object is an over-approximation, not a guess. Without
 # this, "touch include/rsp.h" changed nothing make could see, and a caller
-# further up the chain (euicc-tools' Makefile delegates to this one and
-# trusts it to know when librsp.a is stale) would link a library that never
-# noticed the header moved.
+# further up the chain (euicc-lpa's Makefile delegates librsp.a's own
+# staleness to this one, and euicc-tools' delegates to euicc-lpa's in turn)
+# would link a library that never noticed the header moved.
 HDRS    := include/rsp.h src/rsp_internal.h
 
 MBED_LIBS := $(MBED)/library/libmbedx509.a $(MBED)/library/libmbedcrypto.a

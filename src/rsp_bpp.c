@@ -163,11 +163,12 @@
 #define PACKED_TAG(class2, num) (ber_tlv_tag_t)((class2) | ((num) << 2))
 
 /* rsp_growbuf_t and its append/free live in rsp_internal.h now, shared
-   with src/rsp_es10.c's inward response accumulator -- see that header's
-   top comment for why a fourth hand-rolled copy is what this move
-   prevents. Every growbuf this file frees might be holding recovered UPP
-   plaintext (rsp_bpp_recover's rejection path) or, less critically, DER
-   destined for the wire anyway; rsp_growbuf_free wipes unconditionally
+   with euicc-lpa's src/rsp_es10.c and its inward response accumulator,
+   which reaches this header through the vendored submodule -- see that
+   header's top comment for why a fourth hand-rolled copy is what this
+   move prevents. Every growbuf this file frees might be holding recovered
+   UPP plaintext (rsp_bpp_recover's rejection path) or, less critically,
+   DER destined for the wire anyway; rsp_growbuf_free wipes unconditionally
    rather than asking call sites to know which. */
 
 static int der_collect(const void *buf, size_t n, void *key)
