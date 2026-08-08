@@ -37,14 +37,21 @@
 #include "mbedtls/sha256.h"
 #include "mbedtls/x509_crt.h"
 
-/* mbedtls_ecdsa_sign needs an RNG for the per-signature nonce k (mbedTLS's
- * plain, non-deterministic ECDSA -- the brief calls for mbedtls_ecdsa_sign,
- * not the RFC 6979 deterministic variant, and the test below relies on two
- * signatures over the same message differing). Seeded once and kept for
- * the life of the process: reseeding an entropy-backed DRBG on every call
- * buys nothing and this library is not multi-threaded anywhere else
- * either. mbedtls_ecdsa_verify takes no RNG parameter at all -- verifying
- * an ECDSA signature is pure arithmetic on public values, nothing here is
+/* mbedtls_ecdsa_sign_det_ext still takes an RNG, but not for the
+ * per-signature nonce k: that comes from RFC 6979's HMAC-DRBG, seeded
+ * deterministically from the private key and the message hash, so the
+ * same (key, message) pair always produces the same k and therefore the
+ * same signature. The RNG that remains is used only for blinding the
+ * scalar arithmetic against side-channel attacks -- it does not affect
+ * the output. Determinism is wanted here for two reasons: it is what
+ * makes a recorded session replayable (the same input must produce the
+ * same bytes on a second run), and it is safer -- a random k that repeats
+ * or is even slightly biased reveals the private signing key, which RFC
+ * 6979 avoids by construction. Seeded once and kept for the life of the
+ * process: reseeding an entropy-backed DRBG on every call buys nothing
+ * and this library is not multi-threaded anywhere else either.
+ * mbedtls_ecdsa_verify takes no RNG parameter at all -- verifying an
+ * ECDSA signature is pure arithmetic on public values, nothing here is
  * blinded -- so only rsp_sign uses this. */
 static mbedtls_entropy_context g_entropy;
 static mbedtls_ctr_drbg_context g_drbg;
@@ -94,8 +101,9 @@ int rsp_sign(const rsp_credential_t *c, const uint8_t *tbs, size_t tbs_len,
 
     if (mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1) == 0 &&
         mbedtls_mpi_read_binary(&d, c->sk, sizeof c->sk) == 0 &&
-        mbedtls_ecdsa_sign(&grp, &r, &s, &d, hash, sizeof hash,
-                            mbedtls_ctr_drbg_random, &g_drbg) == 0 &&
+        mbedtls_ecdsa_sign_det_ext(&grp, &r, &s, &d, hash, sizeof hash,
+                                    MBEDTLS_MD_SHA256,
+                                    mbedtls_ctr_drbg_random, &g_drbg) == 0 &&
         mbedtls_mpi_write_binary(&r, sig, 32) == 0 &&
         mbedtls_mpi_write_binary(&s, sig + 32, 32) == 0) {
         ret = 0;

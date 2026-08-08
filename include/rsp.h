@@ -90,8 +90,14 @@ void rsp_credential_free(rsp_credential_t *c);
 /* Sign tbs (already the exact bytes to be hashed -- assembling the signed
  * data object's concatenation, per whichever *Signed* structure applies,
  * is the caller's job, not this function's) with c's private key.
- * Returns 0, or -1 on failure. Every call produces a different sig for
- * the same tbs: mbedtls_ecdsa_sign draws a fresh nonce each time. */
+ * Returns 0, or -1 on failure. Signing is deterministic (RFC 6979): the
+ * same key and the same tbs always produce the same sig, because the
+ * nonce is derived from them rather than drawn from an RNG. This is
+ * wanted for two reasons: it is what makes a recorded session replayable
+ * (the same input must produce the same bytes on a second run), and it
+ * is safer -- a random nonce that repeats or is even slightly biased
+ * reveals the private signing key, which RFC 6979 avoids by
+ * construction. */
 int rsp_sign(const rsp_credential_t *c, const uint8_t *tbs, size_t tbs_len,
              uint8_t sig[64]);
 

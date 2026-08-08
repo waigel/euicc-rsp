@@ -126,6 +126,41 @@ static int unwrap_der_sig(const uint8_t *der, size_t der_n, uint8_t sig[64]) {
     return (p == der_n) ? 0 : -1;
 }
 
+/* RFC 6979 makes a signature a pure function of (key, message). Until it
+   did, no recording of a session that signs anything could replay: the
+   bytes differed every run. This is also the safer primitive -- with a
+   random k, a single repeated or biased nonce reveals the private key.
+
+   Both halves matter. Determinism without validity would be satisfied by
+   returning a constant; validity without determinism is what we had. */
+static void test_signing_is_deterministic(void) {
+    rsp_credential_t dp;
+    ok("DPpb loads", rsp_pki_dp(1, &dp) == 0);
+
+    static const uint8_t tbs[] = {
+        0xBF, 0x37, 0x04, 'h', 'e', 'r', 'e'
+    };
+    uint8_t a[64], b[64];
+    ok("first signature succeeds", rsp_sign(&dp, tbs, sizeof tbs, a) == 0);
+    ok("second signature succeeds", rsp_sign(&dp, tbs, sizeof tbs, b) == 0);
+    ok("the same key and message sign identically",
+       memcmp(a, b, sizeof a) == 0);
+    ok("and the signature still verifies",
+       rsp_sign_verify(dp.der, dp.der_len, tbs, sizeof tbs, a) == 0);
+
+    /* A different message must not produce the same bytes -- otherwise
+       "deterministic" would be satisfied by ignoring the input. */
+    static const uint8_t other[] = {
+        0xBF, 0x37, 0x04, 'h', 'e', 'r', 'f'
+    };
+    uint8_t c[64];
+    ok("a different message signs differently",
+       rsp_sign(&dp, other, sizeof other, c) == 0
+       && memcmp(a, c, sizeof a) != 0);
+
+    rsp_credential_free(&dp);
+}
+
 int main(void) {
     rsp_credential_t dp, card;
     memset(&dp, 0, sizeof dp);
@@ -163,14 +198,15 @@ int main(void) {
     ok("a tampered signature does not verify (-1: a real no)",
        rsp_sign_verify(dp.der, dp.der_len, msg, sizeof msg - 1, sig) == -1);
 
-    /* ECDSA is randomised: two signatures over the same message differ, and
-       both must verify. An implementation that returns a constant passes
-       every check above. */
+    /* Signing is deterministic (RFC 6979): two signatures over the same
+       message under the same key match, and both verify. This changed
+       from "differ" -- see test_signing_is_deterministic below for why
+       determinism, not randomisation, is what this library wants. */
     uint8_t sig2[64], sig3[64];
     rsp_sign(&dp, msg, sizeof msg - 1, sig2);
     rsp_sign(&dp, msg, sizeof msg - 1, sig3);
-    ok("two signatures over the same message differ",
-       memcmp(sig2, sig3, 64) != 0);
+    ok("two signatures over the same message match",
+       memcmp(sig2, sig3, 64) == 0);
     ok("both of them verify",
        rsp_sign_verify(dp.der, dp.der_len, msg, sizeof msg - 1, sig2) == 0
        && rsp_sign_verify(dp.der, dp.der_len, msg, sizeof msg - 1, sig3) == 0);
@@ -195,5 +231,6 @@ int main(void) {
 
     rsp_credential_free(&dp);
     rsp_credential_free(&card);
+    test_signing_is_deterministic();
     return fails ? 1 : 0;
 }
