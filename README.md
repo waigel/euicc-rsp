@@ -27,46 +27,15 @@ make
 make check
 ```
 
-`make check` needs no card reader. Every test it runs is provable on a
-machine with no hardware attached, `make check-card` (below) is the one
-exception, and it is not part of `check` for exactly that reason.
+`make check` needs no card reader. Every test in this repository is
+provable on a machine with no hardware attached -- the transport, the ES10
+command layer and the read-only card commands, the parts that would need
+one, live in [euicc-lpa](https://github.com/waigel/euicc-lpa) now, not here.
 
 `make check` also generates the RSP codec with `asn1c` (see below) the first
 time it runs. Install it with `brew install asn1c`, or point `ASN1C=` at a
 binary you already built; `SKELDIR=` overrides the skeleton directory the
 same way, if it is not next to `asn1c` on `PATH`.
-
-**PC/SC.** [`src/rsp_pcsc.c`](src/rsp_pcsc.c) is part of every build --
-`SRCS` globs `src/*.c` -- even on a machine with no reader attached, since
-the transport it implements still has to compile and link. macOS ships
-PC/SC as a system framework (`-framework PCSC`, already on every Mac, no
-install needed); Linux has no PC/SC of its own, so `libpcsclite-dev`
-(Debian/Ubuntu) or the equivalent `pcsc-lite-devel` package for your
-distribution needs to be installed first, or the build fails at
-`src/rsp_pcsc.c:38: fatal error: winscard.h: No such file or directory`.
-See [`.github/workflows/ci.yml`](.github/workflows/ci.yml) for exactly
-what CI installs.
-
-## `make check-card`
-
-The one target in this repository that is not provable without hardware:
-it needs a real card reader with a test eUICC in it, over PC/SC, and reads
-what the card actually says (see [`tests/test_card.c`](tests/test_card.c)
-and [`testdata/cards/README.md`](testdata/cards/README.md) for what it
-found against this project's own test card). It is not part of `make
-check` and CI never runs it, for the same reason: there is no reader
-attached to a CI runner, and a target that fails whenever hardware is
-absent would make every ordinary contribution look broken.
-
-```sh
-make check-card
-```
-
-`rsp_pcsc_open`'s own reader-selection and protocol-negotiation logic
-(`src/rsp_pcsc.c`) is what this target actually exercises; a recorded
-session (`testdata/cards/omnikey-info.log`) stands in for the reader
-everywhere else in the suite, which is what lets the rest of `make check`
-run with no hardware at all.
 
 **This needs asn1c 0.9.29 or later.** The codec rule passes `-D` (the
 destination directory for generated files), which

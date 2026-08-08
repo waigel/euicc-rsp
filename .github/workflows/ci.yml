@@ -42,17 +42,6 @@ jobs:
           ./configure
           make -j"$(nproc)"
 
-      # src/rsp_pcsc.c is part of every build (SRCS globs src/*.c), even
-      # though check-card -- the only thing that actually opens a reader --
-      # never runs here: this runner has none. libpcsclite-dev is still
-      # needed just to compile that file and link the PC/SC symbols into
-      # librsp.a. Unlike the asn1c step above, this one is not gated by a
-      # cache hit: it must run every time, cache or no cache.
-      - name: install pcsc-lite headers
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq libpcsclite-dev
-
       - name: build and test
         run: |
           make       ASN1C="$RUNNER_TEMP/asn1c-src/asn1c/asn1c" SKELDIR="$RUNNER_TEMP/asn1c-src/skeletons"

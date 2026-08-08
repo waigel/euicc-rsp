@@ -30,17 +30,7 @@ ifeq ($(shell uname -s),Darwin)
 EXTRA   += -D_DARWIN_C_SOURCE
 endif
 
-# PC/SC is the system smartcard library. macOS ships it as a framework;
-# Linux needs the pcsc-lite headers, the one dependency this project asks a
-# Linux user to install.
-ifeq ($(shell uname -s),Darwin)
-PCSC_LIBS := -framework PCSC
-else
-PCSC_CFLAGS := $(shell pkg-config --cflags libpcsclite 2>/dev/null)
-PCSC_LIBS   := $(shell pkg-config --libs libpcsclite 2>/dev/null || echo -lpcsclite)
-endif
-
-ALL_CFLAGS = $(STD) $(WARN) $(CFLAGS) $(EXTRA) $(INC) $(DEF) $(PCSC_CFLAGS)
+ALL_CFLAGS = $(STD) $(WARN) $(CFLAGS) $(EXTRA) $(INC) $(DEF)
 
 # build/sgp26_material.c embeds the published SGP.26 test material (see
 # testdata/sgp26/) as byte arrays, generated with tools/bin2c so the
@@ -157,13 +147,9 @@ GEN_INC := -idirafter $(DIST)
 # passed without ever running the new test -- a green suite that quietly
 # checked less than it claimed to. Derived from the test sources themselves
 # instead: adding tests/test_whatever.c is now sufficient on its own.
-#
-# tests/run-card is the one exception, filtered back out: it needs a real
-# reader, CI has none, and a hardware test that passes when the hardware is
-# absent proves nothing. It gets its own target, check-card, below.
-TESTS   := $(filter-out tests/run-card,$(patsubst tests/test_%.c,tests/run-%,$(wildcard tests/test_*.c)))
+TESTS   := $(patsubst tests/test_%.c,tests/run-%,$(wildcard tests/test_*.c))
 
-.PHONY: all check check-card record-card clean mbedtls codec
+.PHONY: all check clean mbedtls codec
 
 # build/sgp26_material.c is the first target textually in this file, so
 # without this, GNU Make's default goal (what bare "make" builds) would be
@@ -233,7 +219,7 @@ $(LIB): $(OBJS)
 # no other way to notice the line changed and would otherwise reuse an
 # already-built tests/run-% binary that no longer matches this recipe.
 tests/run-%: tests/test_%.c $(LIB) $(MBED_LIBS) $(DIST)/.stamp Makefile
-	$(CC) $(ALL_CFLAGS) $(GEN_INC) $< $(LIB) $(DIST)/*.o $(MBED_LIBS) $(PCSC_LIBS) -o $@
+	$(CC) $(ALL_CFLAGS) $(GEN_INC) $< $(LIB) $(DIST)/*.o $(MBED_LIBS) -o $@
 	@# On Darwin, a -g link auto-generates a companion run-%.dSYM directory.
 	@# tests/run-tests globs "run-*", so that bundle would be picked up and
 	@# "run" as if it were a test binary. Drop it: it is a build byproduct,
@@ -242,52 +228,6 @@ tests/run-%: tests/test_%.c $(LIB) $(MBED_LIBS) $(DIST)/.stamp Makefile
 
 check: $(TESTS)
 	./tests/run-tests
-
-# The real card. Excluded from `check` on purpose: CI has no reader, and a
-# hardware test that passes when the hardware is missing proves nothing.
-check-card: tests/run-card
-	./tests/run-card
-
-tests/run-card: tests/test_card.c $(LIB) $(MBED_LIBS) $(DIST)/.stamp
-	$(CC) $(ALL_CFLAGS) $(GEN_INC) $< $(LIB) $(DIST)/*.o $(MBED_LIBS) $(PCSC_LIBS) -o $@
-	@rm -rf $@.dSYM
-
-# Captures a session against the real reader TWICE and only writes OUT if
-# both agree, byte for byte. testdata/cards/README.md's own review found a
-# live capture desync once in fourteen attempts on this project's shared
-# rig -- SCardConnect in shared mode does not force a cold reset, so
-# leftover state from whatever last touched the card can bleed into a
-# capture. That is invisible by looking at the file afterward: a desynced
-# recording still parses, still replays, and reads exactly like a good
-# one, right up until it is trusted as ground truth for what the card
-# actually said. Two independent captures agreeing is the cheapest check
-# available that does not require a person to already know what the right
-# answer looks like.
-#
-# OUT defaults to a scratch path under /tmp rather than committing anything
-# by default -- this is a capture tool, not a promise that its result
-# belongs in testdata/cards/. Point OUT at a real destination to keep one:
-#   make record-card OUT=testdata/cards/card.log
-OUT ?= /tmp/rsp-record-card.log
-
-record-card: tests/run-card
-	@out="$(OUT)"; \
-	 tmp1=$$(mktemp) && tmp2=$$(mktemp) || exit 1; \
-	 trap 'rm -f "$$tmp1" "$$tmp2"' EXIT; \
-	 echo "record-card: capture 1/2..."; \
-	 ./tests/run-card "$$tmp1" || { echo "record-card: first capture failed" >&2; exit 1; }; \
-	 echo "record-card: capture 2/2..."; \
-	 ./tests/run-card "$$tmp2" || { echo "record-card: second capture failed" >&2; exit 1; }; \
-	 if ! cmp -s "$$tmp1" "$$tmp2"; then \
-	     echo "record-card: the two captures do not agree -- not writing $$out" >&2; \
-	     echo "record-card: (a shared reader can desync between passes;" >&2; \
-	     echo "record-card:  see testdata/cards/README.md); try again" >&2; \
-	     diff -u "$$tmp1" "$$tmp2" >&2 || true; \
-	     exit 1; \
-	 fi; \
-	 mkdir -p "$$(dirname "$$out")"; \
-	 cp "$$tmp1" "$$out"; \
-	 echo "record-card: wrote $$out, confirmed by two agreeing captures"
 
 # tools/bpp-dump builds a Bound Profile Package and prints its structure, so
 # a person can look at the artifact the suite only proves correct. It is a
@@ -302,7 +242,7 @@ record-card: tests/run-card
 # a file with no known flags -- #include "rsp.h" unresolvable in the editor --
 # for as long as it stayed out of "all".
 tools/bpp-dump: tools/bpp-dump.o $(LIB) $(MBED_LIBS) $(DIST)/.stamp
-	$(CC) $(ALL_CFLAGS) $(GEN_INC) $< $(LIB) $(DIST)/*.o $(MBED_LIBS) $(PCSC_LIBS) -o $@
+	$(CC) $(ALL_CFLAGS) $(GEN_INC) $< $(LIB) $(DIST)/*.o $(MBED_LIBS) -o $@
 	@rm -rf $@.dSYM
 
 clean:
