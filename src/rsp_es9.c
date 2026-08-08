@@ -1,8 +1,91 @@
 /*
- * rsp_es9.c -- ES9+ (LPA -- SM-DP+), SGP.22 v2.6 section 5.6: this file
- * currently implements only InitiateAuthentication (section 5.6.1), the
- * first of three ES9+ functions this library implements as the SM-DP+
- * role (AuthenticateClient and GetBoundProfilePackage are later tasks).
+ * rsp_es9.c -- ES9+ (LPA -- SM-DP+), SGP.22 v2.6 section 5.6: all three
+ * ES9+ functions this library implements as the SM-DP+ role --
+ * InitiateAuthentication (5.6.1), AuthenticateClient (5.6.3) and
+ * GetBoundProfilePackage (5.6.2), in that order because that is the order
+ * an RSP session actually calls them.
+ *
+ * AuthenticateClient (5.6.3) is the cryptographic core: on reception, the
+ * SM-DP+ SHALL
+ *
+ *   - Verify the validity of CERT.EUM.ECDSA, using PK.CI.ECDSA.
+ *   - Verify the validity of CERT.EUICC.ECDSA, using PK.EUM.ECDSA.
+ *   - Verify euiccSignature1 using PK.EUICC.ECDSA, as described in section
+ *     5.7.13 "ES10b.AuthenticateServer".
+ *   - Verify that the transactionId is known and relates to an ongoing RSP
+ *     session.
+ *   - Verify that the serverChallenge attached to the ongoing RSP session
+ *     matches the serverChallenge returned by the eUICC.
+ *
+ * -- in that order in the spec text, though this file checks transactionId
+ * and serverChallenge first: they are cheap memcmp's against *s, and
+ * failing on them before doing any certificate parsing or ECDSA
+ * verification means a caller who got the session wrong gets refused
+ * without this file spending an RNG seed and two chain verifications to
+ * tell them so. All five checks the spec text lists are what
+ * 5.6.3 actually requires -- nothing here reorders them away, only
+ * evaluates them in cheapest-first order, and every one of the five is
+ * still evaluated before anything below "otherwise" in 5.6.3's own text.
+ *
+ * Two further steps 5.6.3 itself defers to ES10b.AuthenticateServer's own
+ * definition (5.7.13, already read for Task 2 -- see rsp_dp_initiate_
+ * authentication's own top comment):
+ *
+ *   - "euiccSignature1 SHALL apply on euiccSigned1 data object" -- the
+ *     signed bytes are EuiccSigned1's own DER encoding, the same
+ *     "encode this struct alone, sign that" pattern InitiateAuthentication
+ *     already uses for ServerSigned1/serverSignature1.
+ *   - EuiccSigned1 itself (rsp-2.5.asn line 315) carries no EID field at
+ *     all: { transactionId, serverAddress, serverChallenge, euiccInfo2,
+ *     ctxParams1 }. The EID lives in CERT.EUICC.ECDSA's own Subject
+ *     'serialNumber' attribute instead (SGP.22 v2.6 section 4.5.1:
+ *     "'serialNumber' SHALL be the EID as a decimal PrintableString" --
+ *     that section's own worked example gives "o = ACME, serialNumber =
+ *     89049032123451234512345678901235", which is where this project's
+ *     EID fixture comes from, not the other way around). extract_eid()
+ *     below reads it from the parsed mbedtls_x509_crt's .subject list,
+ *     not from euiccSigned1.
+ *
+ * Everything 5.6.3 does "otherwise" -- Activation Code Retrieval,
+ * eligibility, MatchingID/pending-download-order lookup, Confirmation
+ * Code, retry limits -- is Profile-order state this stateless library has
+ * no database for, exactly the same scope cut InitiateAuthentication
+ * already made for CI selection and eligibility. ctxParams1 is decoded
+ * (it is part of EuiccSigned1, which must decode for euiccSignature1's own
+ * bytes to be reproduced) but never otherwise inspected.
+ *
+ * profileMetaData is the one output field this file cannot synthesize on
+ * its own: this stateless library has no profile-order database to learn
+ * a Profile's ICCID/name/service-provider from, so
+ * rsp_dp_authenticate_client's own `metadata` parameter is the caller's
+ * answer to that gap (see rsp.h) -- decoded, echoed into the response, and
+ * stashed in *s so rsp_dp_get_bound_profile_package can reuse the exact
+ * same values in its own StoreMetadataRequest (inside the BPP's '88'
+ * group) without a second, potentially-drifting copy.
+ *
+ * GetBoundProfilePackage (5.6.2) is comparatively small once
+ * AuthenticateClient has run: verify euiccSignature2 against the
+ * PK.EUICC.ECDSA already attached to *s, derive the SCP03t session keys
+ * (rsp_session_init) over Annex G's SharedInfo, and hand the result to
+ * rsp_bpp_build (already implemented, unmodified) together with the
+ * otPK.DP.ECKA this file derives from otsk_dp. *bpp and *bpp_len are exactly
+ * rsp_bpp_build's own raw BoundProfilePackage bytes -- not wrapped in a
+ * GetBoundProfilePackageOk/[58] envelope, for the same reason rsp_bpp_
+ * build's own output is not wrapped in one either (see include/rsp.h: the
+ * generated codec cannot round-trip BoundProfilePackage's SEQUENCE-OF-
+ * tagged-element fields, so nothing in this project ever hands one to
+ * der_encode).
+ *
+ * HostID and EID are two separate fields, not one encoded twice (Annex G:
+ * "keyType(1) || keyLen(1) || HostID-LV || EID-LV"). RSP_HOST_ID
+ * (src/rsp_internal.h) is a fixed, arbitrary, SM-DP+-chosen identifier --
+ * checked against a working reference implementation (osmo-smdpp, which
+ * hardcodes its own unrelated string for exactly this field) precisely
+ * because this project has a standing instruction not to trust a comment's
+ * say-so on a spec point without checking it, and an earlier comment in
+ * this exact codebase (src/rsp_bpp.c's build_isc) already got this one
+ * wrong. See RSP_HOST_ID's own comment for the full account. Task 4's own
+ * controlRefTemplate must read that same constant.
  *
  * Section 5.6.1 itself defers the exact content it hands back to section
  * 5.7.13 "ES10b.AuthenticateServer", which is what the eUICC actually
@@ -72,14 +155,22 @@
 #include <string.h>
 
 #include "mbedtls/ctr_drbg.h"
+#include "mbedtls/ecp.h"
 #include "mbedtls/entropy.h"
 #include "mbedtls/platform_util.h"
 #include "mbedtls/x509_crt.h"
 
+#include "AuthenticateClientResponseEs9.h"
+#include "AuthenticateServerResponse.h"
 #include "Certificate.h"
 #include "EUICCInfo1.h"
+#include "EUICCSigned2.h"
+#include "EuiccSigned1.h"
 #include "InitiateAuthenticationOkEs9.h"
+#include "PrepareDownloadResponse.h"
 #include "ServerSigned1.h"
+#include "SmdpSigned2.h"
+#include "StoreMetadataRequest.h"
 
 /* See this file's own top comment: no smdp_address input exists yet, so
  * this fixed, obviously-fake FQDN (RFC 2606 reserves ".invalid" for
@@ -89,14 +180,51 @@ static const char RSP_ES9_SMDP_ADDRESS_PLACEHOLDER[] =
     "smdp-address-placeholder.invalid";
 
 /* One RSP session's server-side state -- see the typedef's own doc
- * comment in rsp.h. Nothing in it is secret yet (transactionId and both
- * challenges cross the wire in the clear); rsp_dp_session_free wipes it
- * anyway, ahead of the session keys a later task lands here, rather than
- * waiting for that task to notice this one used plain free(). */
+ * comment in rsp.h. transactionId and both challenges cross the wire in
+ * the clear; the session keys rsp_dp_get_bound_profile_package lands in
+ * bpp_session are the first genuinely secret thing here, which is why
+ * rsp_dp_session_free's wipe -- present from Task 2 onward, ahead of any
+ * task actually needing it -- is now load-bearing rather than merely
+ * precautionary. */
 struct rsp_dp_session {
     uint8_t transaction_id[16];
     uint8_t euicc_challenge[16];
     uint8_t server_challenge[16];
+
+    /* Set once rsp_dp_authenticate_client succeeds; rsp_dp_get_bound_
+       profile_package refuses to run without it -- 5.6.2 assumes 5.6.3's
+       own "Attach the PK.EUICC.ECDSA to the ongoing RSP session" already
+       happened. euicc_cert_der is CERT.EUICC.ECDSA's DER, malloc'ed, kept
+       so euiccSignature2 (5.6.2) can be verified against the same
+       certificate 5.6.3 already chained to CERT.EUM -- not secret (it is
+       a certificate), so rsp_dp_session_free frees it but does not wipe
+       it, the same as rsp_credential_t.der elsewhere in this project.
+       eid is the decimal digit string extracted from that certificate's
+       Subject serialNumber -- see this file's own top comment for why it
+       does not come from euiccSigned1. */
+    int authenticated;
+    uint8_t *euicc_cert_der;
+    size_t euicc_cert_der_len;
+    char eid[32];
+    size_t eid_len;
+
+    /* Stashed from rsp_dp_authenticate_client's own metadata parameter
+       (an encoded StoreMetadataRequest), for rsp_dp_get_bound_profile_
+       package's own rsp_bpp_input_t -- one caller-supplied value, reused
+       here rather than asking the caller for iccid/profile_name/
+       service_provider_name a second time in a second call that could
+       drift from the first. profile_name/service_provider_name are
+       NUL-terminated (rsp_bpp_input_t's own fields are plain "const
+       char *"); StoreMetadataRequest's own SIZE constraints (0..64,
+       0..32) are checked before this is filled, so the +1 below always
+       fits. */
+    uint8_t iccid[10];
+    char profile_name[65];
+    char service_provider_name[33];
+
+    /* Set once rsp_dp_get_bound_profile_package succeeds. Secret. */
+    int have_bpp_session;
+    rsp_session_t bpp_session;
 };
 
 /* der_encode's callback interface, and a malloc'ed-buffer wrapper around
@@ -309,6 +437,591 @@ void rsp_dp_session_free(rsp_dp_session_t *s)
     if (!s) {
         return;
     }
+    free(s->euicc_cert_der);
+    rsp_session_wipe(&s->bpp_session);
     mbedtls_platform_zeroize(s, sizeof *s);
     free(s);
+}
+
+/* CERT.EUICC.ECDSA's Subject 'serialNumber' attribute IS the EID (SGP.22
+ * v2.6 section 4.5.1) -- see this file's own top comment for why that is
+ * where this function looks, not euiccSigned1. Returns 0 and the raw
+ * decimal digit bytes (never NUL-terminated) copied into out, or -1 if
+ * crt's subject carries no serialNumber attribute at all, or the one it
+ * carries does not fit cap. */
+static int extract_eid(const mbedtls_x509_crt *crt, char *out, size_t cap,
+                        size_t *out_len)
+{
+    const mbedtls_x509_name *n;
+
+    for (n = &crt->subject; n; n = n->next) {
+        if (MBEDTLS_OID_CMP(MBEDTLS_OID_AT_SERIAL_NUMBER, &n->oid) == 0) {
+            if (n->val.len == 0 || n->val.len > cap) {
+                return -1;
+            }
+            memcpy(out, n->val.p, n->val.len);
+            *out_len = n->val.len;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+int rsp_dp_authenticate_client(rsp_dp_session_t *s,
+        const uint8_t *auth_server_resp, size_t resp_len,
+        const uint8_t *metadata, size_t metadata_len,
+        uint8_t **out, size_t *out_len)
+{
+    /* Declared once, referenced from the extern-declaring TU that already
+       carries its definition (build/sgp26_material.c, generated from
+       testdata/sgp26/ci-2017.der) -- see rsp_pki.c's own identically-
+       shaped externs for rsp_sgp26_ci_der and friends. Not exposed via
+       rsp.h: this is a same-project-only quirk (two certificate objects
+       for one CI key -- see testdata/sgp26/README.md), not something a
+       caller of this library needs to know about. */
+    extern const unsigned char rsp_sgp26_ci2017_der[];
+    extern const unsigned int rsp_sgp26_ci2017_der_len;
+
+    AuthenticateServerResponse_t resp;
+    StoreMetadataRequest_t md_tmp;
+    AuthenticateClientResponseEs9_t ok_resp;
+    mbedtls_x509_crt ci, eum, euicc;
+    mbedtls_entropy_context ent;
+    mbedtls_ctr_drbg_context drbg;
+    const uint8_t *ci_der;
+    size_t ci_len;
+    uint8_t *es1_der = NULL;
+    size_t es1_der_len = 0;
+    uint8_t *eum_der_buf = NULL;
+    size_t eum_der_buf_len = 0;
+    uint8_t *euicc_der_buf = NULL;
+    size_t euicc_der_buf_len = 0;
+    uint8_t sig[64];
+    rsp_credential_t dppb;
+    char eid_buf[32];
+    size_t eid_len = 0;
+    int have_dppb = 0;
+    int have_rng = 0;
+    int ret = -2;
+
+    memset(&resp, 0, sizeof resp);
+    memset(&md_tmp, 0, sizeof md_tmp);
+    memset(&ok_resp, 0, sizeof ok_resp);
+    memset(&dppb, 0, sizeof dppb);
+    mbedtls_x509_crt_init(&ci);
+    mbedtls_x509_crt_init(&eum);
+    mbedtls_x509_crt_init(&euicc);
+
+    if (!s || !auth_server_resp || resp_len == 0 ||
+        !metadata || metadata_len == 0 || !out || !out_len) {
+        goto out;
+    }
+
+    /* metadata: an encoded StoreMetadataRequest -- see this file's own top
+       comment for why this function's own parameter is where that comes
+       from. Decoded, not merely accepted as opaque bytes, so garbage is
+       refused here rather than forwarded into the response unexamined,
+       and so iccid/profileName/serviceProviderName can be pulled out for
+       *s below. */
+    {
+        void *p = &md_tmp;
+        asn_dec_rval_t r = ber_decode(NULL, &asn_DEF_StoreMetadataRequest,
+                                       &p, metadata, metadata_len);
+        if (r.code != RC_OK) {
+            goto out;
+        }
+    }
+    if (md_tmp.iccid.size != 10 ||
+        md_tmp.profileName.size > 64 ||
+        md_tmp.serviceProviderName.size > 32) {
+        goto out;
+    }
+
+    /* The eUICC's own AuthenticateServerResponse (5.7.13's response,
+       relayed here as ES9+.AuthenticateClient's own authenticateServer-
+       Response input, Table 41). Only the authenticateResponseOk arm is
+       this function's business -- an authenticateResponseError arm is
+       something the LPA has already seen for itself and would have no
+       reason to relay into a call it expects to succeed. */
+    {
+        void *p = &resp;
+        asn_dec_rval_t r = ber_decode(NULL, &asn_DEF_AuthenticateServerResponse,
+                                       &p, auth_server_resp, resp_len);
+        if (r.code != RC_OK) {
+            goto out;
+        }
+    }
+    if (resp.present != AuthenticateServerResponse_PR_authenticateResponseOk) {
+        goto out;
+    }
+
+    {
+        AuthenticateResponseOk_t *rok = &resp.choice.authenticateResponseOk;
+
+        /* 5.6.3: "Verify that the transactionId is known and relates to
+           an ongoing RSP session." */
+        if (rok->euiccSigned1.transactionId.size != 16 ||
+            memcmp(rok->euiccSigned1.transactionId.buf,
+                   s->transaction_id, 16) != 0) {
+            ret = -1;
+            goto out;
+        }
+
+        /* 5.6.3: "Verify that the serverChallenge attached to the ongoing
+           RSP session matches the serverChallenge returned by the
+           eUICC." */
+        if (rok->euiccSigned1.serverChallenge.size != 16 ||
+            memcmp(rok->euiccSigned1.serverChallenge.buf,
+                   s->server_challenge, 16) != 0) {
+            ret = -1;
+            goto out;
+        }
+
+        have_rng = rsp_rng_init(&ent, &drbg, "euicc-rsp/rsp_es9") == 0;
+        if (!have_rng) {
+            goto out;
+        }
+
+        /* eumCertificate/euiccCertificate arrived as generic Certificate_t
+           (the PKIX1Explicit88 SEQUENCE -- unaffected by src/rsp_bpp.c's
+           SEQUENCE-OF-tagged-element defect, which only afflicts
+           BoundProfilePackage's own four fields), decoded as part of
+           `resp` above. Re-encoded here to get back plain DER bytes
+           mbedTLS's own X.509 parser can read -- the same technique
+           rsp_dp_initiate_authentication already uses in the opposite
+           direction for ok.serverCertificate. */
+        if (der_encode_alloc(&asn_DEF_Certificate, &rok->eumCertificate,
+                              &eum_der_buf, &eum_der_buf_len) != 0) {
+            goto out;
+        }
+        if (der_encode_alloc(&asn_DEF_Certificate, &rok->euiccCertificate,
+                              &euicc_der_buf, &euicc_der_buf_len) != 0) {
+            goto out;
+        }
+
+        if (rsp_pki_test_ci(&ci_der, &ci_len) != 0) {
+            goto out;
+        }
+        /* Both certificate objects for the one test CI key this project
+           compiles in, so CERT.EUM's chain check has a trust anchor whose
+           issuer/subject Name actually matches -- see testdata/sgp26/
+           README.md's "why a second CI certificate exists" for why two
+           are needed here and not anywhere else in this library. */
+        if (mbedtls_x509_crt_parse_der_with_ext_cb(
+                &ci, ci_der, ci_len, 1,
+                rsp_accept_certificate_policies_and_name_constraints,
+                NULL) != 0) {
+            goto out;
+        }
+        if (mbedtls_x509_crt_parse_der_with_ext_cb(
+                &ci, rsp_sgp26_ci2017_der, rsp_sgp26_ci2017_der_len, 1,
+                rsp_accept_certificate_policies_and_name_constraints,
+                NULL) != 0) {
+            goto out;
+        }
+
+        if (mbedtls_x509_crt_parse_der_with_ext_cb(
+                &eum, eum_der_buf, eum_der_buf_len, 1,
+                rsp_accept_certificate_policies_and_name_constraints,
+                NULL) != 0) {
+            goto out;
+        }
+        if (mbedtls_x509_crt_parse_der_with_ext_cb(
+                &euicc, euicc_der_buf, euicc_der_buf_len, 1,
+                rsp_accept_certificate_policies_and_name_constraints,
+                NULL) != 0) {
+            goto out;
+        }
+
+        /* 5.6.3: "Verify the validity of the CERT.EUM.ECDSA, using the
+           related public key PK.CI.ECDSA." */
+        {
+            uint32_t flags = 0;
+            if (mbedtls_x509_crt_verify(&eum, &ci, NULL, NULL, &flags,
+                                         NULL, NULL) != 0) {
+                ret = -1; /* the question was asked: CERT.EUM does not chain */
+                goto out;
+            }
+        }
+
+        /* 5.6.3: "Verify the validity of the CERT.EUICC.ECDSA, using the
+           public key PK.EUM.ECDSA." */
+        {
+            uint32_t flags = 0;
+            if (mbedtls_x509_crt_verify(&euicc, &eum, NULL, NULL, &flags,
+                                         NULL, NULL) != 0) {
+                ret = -1; /* the question was asked: CERT.EUICC does not chain */
+                goto out;
+            }
+        }
+
+        /* 5.6.3 / 5.7.13: "Verify the eUICC signature (euiccSignature1)
+           using the PK.EUICC.ECDSA" -- "euiccSignature1 SHALL apply on
+           euiccSigned1 data object." */
+        if (der_encode_alloc(&asn_DEF_EuiccSigned1, &rok->euiccSigned1,
+                              &es1_der, &es1_der_len) != 0) {
+            goto out;
+        }
+        if (rok->euiccSignature1.size != 64) {
+            goto out;
+        }
+        {
+            int vr = rsp_sign_verify(euicc_der_buf, euicc_der_buf_len,
+                                      es1_der, es1_der_len,
+                                      rok->euiccSignature1.buf);
+            if (vr != 0) {
+                ret = (vr == -1) ? -1 : -2;
+                goto out;
+            }
+        }
+
+        /* The EID, from CERT.EUICC.ECDSA's own Subject, not from
+           euiccSigned1 -- see this file's own top comment. */
+        if (extract_eid(&euicc, eid_buf, sizeof eid_buf, &eid_len) != 0) {
+            goto out;
+        }
+    }
+
+    /* Every verification above passed without touching *s or *out --
+       build the response now. */
+    if (OCTET_STRING_fromBuf(
+            &ok_resp.choice.authenticateClientOk.transactionId,
+            (const char *)s->transaction_id, 16) != 0) {
+        goto out;
+    }
+    /* profileMetaData: re-decode metadata straight into place -- the same
+       in-place-decode technique rsp_dp_initiate_authentication already
+       uses for ok.serverCertificate. md_tmp above is a separate,
+       already-populated copy this function keeps for its own stashing
+       into *s below; decoding the same bytes twice is simpler than
+       deep-copying asn1c's own generated struct. */
+    {
+        void *p = &ok_resp.choice.authenticateClientOk.profileMetaData;
+        asn_dec_rval_t r = ber_decode(NULL, &asn_DEF_StoreMetadataRequest,
+                                       &p, metadata, metadata_len);
+        if (r.code != RC_OK) {
+            goto out;
+        }
+    }
+
+    if (OCTET_STRING_fromBuf(
+            &ok_resp.choice.authenticateClientOk.smdpSigned2.transactionId,
+            (const char *)s->transaction_id, 16) != 0) {
+        goto out;
+    }
+    /* ccRequiredFlag: false -- this stateless library has no Confirmation
+       Code state to require one. bppEuiccOtpk: OPTIONAL, left absent --
+       this is not a re-bind of a previously-generated BPP (5.6.2's own
+       "if the Bound Profile Package has been previously generated for
+       this eUICC" case; rsp_bpp_input_t has nothing that models "already
+       generated" either). */
+    ok_resp.choice.authenticateClientOk.smdpSigned2.ccRequiredFlag = 0;
+
+    {
+        uint8_t *sd2_der = NULL;
+        size_t sd2_der_len = 0;
+        int enc_rc = der_encode_alloc(
+                &asn_DEF_SmdpSigned2,
+                &ok_resp.choice.authenticateClientOk.smdpSigned2,
+                &sd2_der, &sd2_der_len);
+        if (enc_rc == 0) {
+            /* DPpb, not DPauth: smdpSigned2/smdpSignature2 bind the
+               Profile Package (SGP.22 v2.6 section 2.6.4 -- "the SM-DP+
+               plays the role of the OCE" for Profile Protection),
+               CERT.DPpb.ECDSA's own purpose, not CERT.DPauth.ECDSA's
+               (which already signed InitiateAuthentication's
+               serverSigned1 -- see this file's top comment). Getting
+               these two backwards is the mistake this project's own
+               brief calls out as most worth catching. */
+            enc_rc = rsp_pki_dp(1, &dppb);
+        }
+        if (enc_rc == 0) {
+            have_dppb = 1;
+            enc_rc = rsp_sign(&dppb, sd2_der, sd2_der_len, sig);
+        }
+        free(sd2_der);
+        if (enc_rc != 0) {
+            goto out;
+        }
+    }
+    if (OCTET_STRING_fromBuf(
+            &ok_resp.choice.authenticateClientOk.smdpSignature2,
+            (const char *)sig, sizeof sig) != 0) {
+        goto out;
+    }
+    {
+        void *p = &ok_resp.choice.authenticateClientOk.smdpCertificate;
+        asn_dec_rval_t r = ber_decode(NULL, &asn_DEF_Certificate, &p,
+                                       dppb.der, dppb.der_len);
+        if (r.code != RC_OK) {
+            goto out;
+        }
+    }
+    ok_resp.present = AuthenticateClientResponseEs9_PR_authenticateClientOk;
+
+    if (der_encode_alloc(&asn_DEF_AuthenticateClientResponseEs9, &ok_resp,
+                          out, out_len) != 0) {
+        goto out;
+    }
+
+    /* *s changes only now, after everything above -- including the final
+       encoding -- has actually succeeded, so a failing call leaves *s
+       exactly as it was. */
+    {
+        uint8_t *cert_copy = malloc(euicc_der_buf_len);
+        if (!cert_copy) {
+            free(*out);
+            *out = NULL;
+            *out_len = 0;
+            goto out;
+        }
+        memcpy(cert_copy, euicc_der_buf, euicc_der_buf_len);
+        free(s->euicc_cert_der);
+        s->euicc_cert_der = cert_copy;
+        s->euicc_cert_der_len = euicc_der_buf_len;
+
+        memcpy(s->eid, eid_buf, eid_len);
+        s->eid_len = eid_len;
+
+        memcpy(s->iccid, md_tmp.iccid.buf, 10);
+        memcpy(s->profile_name, md_tmp.profileName.buf,
+               md_tmp.profileName.size);
+        s->profile_name[md_tmp.profileName.size] = '\0';
+        memcpy(s->service_provider_name, md_tmp.serviceProviderName.buf,
+               md_tmp.serviceProviderName.size);
+        s->service_provider_name[md_tmp.serviceProviderName.size] = '\0';
+
+        s->authenticated = 1;
+    }
+
+    ret = 0;
+
+out:
+    if (have_dppb) {
+        rsp_credential_free(&dppb);
+    }
+    if (have_rng) {
+        mbedtls_ctr_drbg_free(&drbg);
+        mbedtls_entropy_free(&ent);
+    }
+    mbedtls_x509_crt_free(&ci);
+    mbedtls_x509_crt_free(&eum);
+    mbedtls_x509_crt_free(&euicc);
+    free(eum_der_buf);
+    free(euicc_der_buf);
+    free(es1_der);
+    ASN_STRUCT_RESET(asn_DEF_AuthenticateServerResponse, &resp);
+    ASN_STRUCT_RESET(asn_DEF_StoreMetadataRequest, &md_tmp);
+    ASN_STRUCT_RESET(asn_DEF_AuthenticateClientResponseEs9, &ok_resp);
+    return ret;
+}
+
+int rsp_dp_session_eid(const rsp_dp_session_t *s,
+        uint8_t *eid, size_t eid_cap, size_t *eid_len)
+{
+    if (!s || !eid || !eid_len) {
+        return -2;
+    }
+    if (!s->authenticated || s->eid_len == 0 || s->eid_len > eid_cap) {
+        return -1; /* the question was asked: no EID this session actually has */
+    }
+    memcpy(eid, s->eid, s->eid_len);
+    *eid_len = s->eid_len;
+    return 0;
+}
+
+/* otPK.DP.ECKA, the public counterpart of otsk_dp: standard EC scalar
+ * multiplication by the curve's base point, the same primitive
+ * src/rsp_pki.c already uses (there, to confirm a loaded rsp_credential_t's
+ * sk matches its own certificate's public key) -- not a new kind of crypto
+ * this project has not already trusted, just a new caller of it. Needed
+ * because whoever the SM-DP+ tells its one-time secret key to must also
+ * be told the matching public one: InitialiseSecureChannelRequest.smdpOtpk
+ * is that public key, and rsp_bpp_input_t has no other source for it.
+ * Returns 0, or -1 on any mbedTLS failure (RNG seeding, an invalid scalar,
+ * point encoding). */
+static int derive_public_key(const uint8_t sk[32], uint8_t pk[65])
+{
+    mbedtls_ecp_group grp;
+    mbedtls_ecp_point q;
+    mbedtls_mpi d;
+    mbedtls_entropy_context ent;
+    mbedtls_ctr_drbg_context drbg;
+    size_t olen = 0;
+    int rng_ok;
+    int ret = -1;
+
+    mbedtls_ecp_group_init(&grp);
+    mbedtls_ecp_point_init(&q);
+    mbedtls_mpi_init(&d);
+    rng_ok = rsp_rng_init(&ent, &drbg, "euicc-rsp/rsp_es9") == 0;
+
+    if (rng_ok &&
+        mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1) == 0 &&
+        mbedtls_mpi_read_binary(&d, sk, 32) == 0 &&
+        mbedtls_ecp_mul(&grp, &q, &d, &grp.G, mbedtls_ctr_drbg_random,
+                         &drbg) == 0 &&
+        mbedtls_ecp_point_write_binary(&grp, &q, MBEDTLS_ECP_PF_UNCOMPRESSED,
+                                        &olen, pk, 65) == 0 &&
+        olen == 65) {
+        ret = 0;
+    }
+
+    mbedtls_mpi_free(&d);
+    mbedtls_ecp_point_free(&q);
+    mbedtls_ecp_group_free(&grp);
+    if (rng_ok) {
+        mbedtls_ctr_drbg_free(&drbg);
+        mbedtls_entropy_free(&ent);
+    }
+    return ret;
+}
+
+/* Annex G's SharedInfo: keyType(1) || keyLen(1) || HostID-LV || EID-LV --
+ * "LV" meaning a one-byte length followed by the value, which is all
+ * either field ever needs here (host_id_len is RSP_HOST_ID_LEN, a small
+ * compile-time constant; eid_len is at most 32, EUICCInfo1's own EID
+ * digit count). Returns 0, or -1 if either length does not fit one byte
+ * (never true for this file's own callers) or the assembled SharedInfo
+ * does not fit out_cap. */
+static int build_shared_info(const uint8_t *host_id, size_t host_id_len,
+                              const char *eid, size_t eid_len,
+                              uint8_t *out, size_t out_cap, size_t *out_len)
+{
+    size_t n = 2 + 1 + host_id_len + 1 + eid_len;
+
+    if (host_id_len > 0xFF || eid_len > 0xFF || n > out_cap) {
+        return -1;
+    }
+    out[0] = 0x88; /* AES key type, GlobalPlatform Card Specification Table 11-16 */
+    out[1] = 0x10; /* key length, 16 bytes -- rsp-2.5.asn's own fixed value */
+    out[2] = (uint8_t)host_id_len;
+    memcpy(out + 3, host_id, host_id_len);
+    out[3 + host_id_len] = (uint8_t)eid_len;
+    memcpy(out + 3 + host_id_len + 1, eid, eid_len);
+    *out_len = n;
+    return 0;
+}
+
+int rsp_dp_get_bound_profile_package(rsp_dp_session_t *s,
+        const uint8_t *prepare_download_resp, size_t resp_len,
+        const uint8_t *upp, size_t upp_len,
+        const uint8_t otsk_dp[32],
+        uint8_t **bpp, size_t *bpp_len)
+{
+    PrepareDownloadResponse_t resp;
+    rsp_session_t session;
+    rsp_bpp_input_t in;
+    uint8_t otpk_dp[65];
+    uint8_t shared_info[2 + 1 + RSP_HOST_ID_LEN + 1 + 32];
+    size_t shared_info_len = 0;
+    uint8_t *es2_der = NULL;
+    size_t es2_der_len = 0;
+    int ret = -2;
+
+    memset(&resp, 0, sizeof resp);
+    memset(&session, 0, sizeof session);
+
+    if (!s || !prepare_download_resp || resp_len == 0 ||
+        !upp || upp_len == 0 || !otsk_dp || !bpp || !bpp_len) {
+        goto out;
+    }
+    /* 5.6.2 presumes 5.6.3 already ran -- "the PK.EUICC.ECDSA attached to
+       the ongoing RSP session" has to have gotten there somehow. */
+    if (!s->authenticated) {
+        goto out;
+    }
+
+    {
+        void *p = &resp;
+        asn_dec_rval_t r = ber_decode(NULL, &asn_DEF_PrepareDownloadResponse,
+                                       &p, prepare_download_resp, resp_len);
+        if (r.code != RC_OK) {
+            goto out;
+        }
+    }
+    if (resp.present != PrepareDownloadResponse_PR_downloadResponseOk) {
+        goto out;
+    }
+
+    {
+        PrepareDownloadResponseOk_t *rok = &resp.choice.downloadResponseOk;
+
+        /* 5.6.2: "Verify that the received transactionId is known and
+           relates to an ongoing RSP session." */
+        if (rok->euiccSigned2.transactionId.size != 16 ||
+            memcmp(rok->euiccSigned2.transactionId.buf,
+                   s->transaction_id, 16) != 0) {
+            ret = -1;
+            goto out;
+        }
+
+        /* 5.6.2: "Verify the eUICC signature (euiccSignature2) using the
+           PK.EUICC.ECDSA attached to the ongoing RSP session" --
+           attached by rsp_dp_authenticate_client, above. */
+        if (der_encode_alloc(&asn_DEF_EUICCSigned2, &rok->euiccSigned2,
+                              &es2_der, &es2_der_len) != 0) {
+            goto out;
+        }
+        if (rok->euiccSignature2.size != 64) {
+            goto out;
+        }
+        {
+            int vr = rsp_sign_verify(s->euicc_cert_der, s->euicc_cert_der_len,
+                                      es2_der, es2_der_len,
+                                      rok->euiccSignature2.buf);
+            if (vr != 0) {
+                ret = (vr == -1) ? -1 : -2;
+                goto out;
+            }
+        }
+
+        /* otPK.EUICC.ECKA: an uncompressed P-256 point, 65 bytes. */
+        if (rok->euiccSigned2.euiccOtpk.size != 65) {
+            goto out;
+        }
+
+        if (build_shared_info(RSP_HOST_ID, RSP_HOST_ID_LEN,
+                               s->eid, s->eid_len,
+                               shared_info, sizeof shared_info,
+                               &shared_info_len) != 0) {
+            goto out;
+        }
+        if (rsp_session_init(otsk_dp, rok->euiccSigned2.euiccOtpk.buf,
+                              shared_info, shared_info_len, &session) != 0) {
+            goto out;
+        }
+        if (derive_public_key(otsk_dp, otpk_dp) != 0) {
+            goto out;
+        }
+    }
+
+    memset(&in, 0, sizeof in);
+    in.upp = upp;
+    in.upp_len = upp_len;
+    in.otpk_dp = otpk_dp;
+    in.iccid = s->iccid;
+    in.profile_name = s->profile_name;
+    in.service_provider_name = s->service_provider_name;
+
+    if (rsp_bpp_build(&session, &in, bpp, bpp_len) != 0) {
+        goto out;
+    }
+
+    rsp_session_wipe(&s->bpp_session); /* whatever was there before (a rebind, or nothing) */
+    s->bpp_session = session;
+    s->have_bpp_session = 1;
+    ret = 0;
+
+out:
+    /* session is either still all-zero (never reached rsp_session_init),
+       or a real key schedule that either failed later or was already
+       copied into s->bpp_session above -- either way, this stack copy is
+       done being read and gets wiped unconditionally, the same
+       "wipe rather than reason about whether it is needed" rule
+       rsp_growbuf_free already states for itself. */
+    mbedtls_platform_zeroize(&session, sizeof session);
+    free(es2_der);
+    ASN_STRUCT_RESET(asn_DEF_PrepareDownloadResponse, &resp);
+    return ret;
 }

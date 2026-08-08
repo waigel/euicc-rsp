@@ -342,4 +342,96 @@ int rsp_dp_initiate_authentication(
  * comment on *upp for why) before freeing. Safe to call with NULL. */
 void rsp_dp_session_free(rsp_dp_session_t *s);
 
+/* SGP.22 v2.6 section 5.6.3, "AuthenticateClient": the mutual-authentication
+ * step -- the SM-DP+ verifies the eUICC's identity (CERT.EUM chains to the
+ * test CI, CERT.EUICC chains to CERT.EUM, euiccSignature1 verifies, the
+ * session's own transactionId and serverChallenge are echoed back
+ * correctly), then signs smdpSigned2 with DPpb (never DPauth -- DPauth
+ * already signed InitiateAuthentication's serverSigned1; a different key
+ * for a different purpose, see src/rsp_es9.c). auth_server_resp is an
+ * encoded AuthenticateServerResponse (Table 41; rejected if it is not the
+ * authenticateResponseOk arm). metadata is an encoded StoreMetadataRequest
+ * (section 5.5.3) -- this stateless library has no profile-order database
+ * of its own to learn a Profile's ICCID/name/provider from, so the caller
+ * supplies it; on success it is both echoed into the returned
+ * AuthenticateClientOk.profileMetaData and stashed in *s for
+ * rsp_dp_get_bound_profile_package's own StoreMetadataRequest later --
+ * one caller-supplied value, reused, not two that could drift apart.
+ *
+ * On success (0), *out / *out_len receive the DER encoding of an
+ * AuthenticateClientResponseEs9 (the authenticateClientOk arm: transactionId,
+ * profileMetaData, smdpSigned2, smdpSignature2, smdpCertificate --
+ * CERT.DPpb.ECDSA), malloc'ed, owned by the caller, and *s learns the
+ * eUICC's EID and public key for later steps (read the EID back with
+ * rsp_dp_session_eid). On failure, *out / *out_len are untouched and *s is
+ * unchanged.
+ *
+ * -1 means the question was actually asked and the answer is no:
+ * euiccSigned1.transactionId does not match the session's, the
+ * serverChallenge does not match, CERT.EUM does not chain to the test CI,
+ * CERT.EUICC does not chain to CERT.EUM, or euiccSignature1 does not
+ * verify against CERT.EUICC.ECDSA. -2 means the question was never
+ * reached: a null/malformed argument, auth_server_resp not decoding as
+ * AuthenticateServerResponse at all (or decoding as the
+ * authenticateResponseError arm -- a shape the LPA handles itself, not
+ * this function), metadata not decoding as StoreMetadataRequest, or an
+ * internal failure (allocation, RNG seeding, DPpb credential loading,
+ * signing). */
+int rsp_dp_authenticate_client(rsp_dp_session_t *s,
+        const uint8_t *auth_server_resp, size_t resp_len,
+        const uint8_t *metadata, size_t metadata_len,
+        uint8_t **out, size_t *out_len);
+
+/* The EID rsp_dp_authenticate_client learned from CERT.EUICC.ECDSA's own
+ * Subject 'serialNumber' attribute (SGP.22 v2.6 section 4.5.1: "'serialNumber'
+ * SHALL be the EID as a decimal PrintableString") -- not a field of
+ * euiccSigned1 itself, which carries no EID at all (see src/rsp_es9.c).
+ * Copies up to eid_cap bytes of the decimal digit string (never
+ * NUL-terminated by this function) into eid and sets *eid_len to how many.
+ * Returns 0, or -1 if rsp_dp_authenticate_client has not yet succeeded on
+ * this session, or eid_cap is too small for the EID this session actually
+ * learned (the question "does this session have an EID to give back" was
+ * asked and the answer is no, either way) -- or -2 for a null
+ * s/eid/eid_len. */
+int rsp_dp_session_eid(const rsp_dp_session_t *s,
+        uint8_t *eid, size_t eid_cap, size_t *eid_len);
+
+/* SGP.22 v2.6 section 5.6.2, "GetBoundProfilePackage": extracts
+ * otPK.EUICC.ECKA from euiccSigned2, verifies euiccSignature2 against the
+ * PK.EUICC.ECDSA rsp_dp_authenticate_client attached to *s, derives the
+ * SCP03t session keys (rsp_session_init) over the Annex G SharedInfo --
+ * keyType(1) || keyLen(1) || HostID-LV || EID-LV, HostID and EID being two
+ * separate values, not one encoded twice; see RSP_HOST_ID in
+ * src/rsp_internal.h for where the SM-DP+'s own Host ID constant lives and
+ * why it is not the EID -- and binds upp into a Bound Profile Package with
+ * it (rsp_bpp_build), reusing the profileName/serviceProviderName/iccid
+ * rsp_dp_authenticate_client already stashed in *s from its own metadata
+ * argument. otsk_dp is caller-supplied for the same reason transaction_id
+ * is (see rsp_dp_initiate_authentication above): production passes fresh
+ * random, a test passes a fixed value, and that is what makes a session
+ * replayable.
+ *
+ * prepare_download_resp is an encoded PrepareDownloadResponse (Table 38;
+ * rejected if it is not the downloadResponseOk arm). On success (0), *bpp /
+ * *bpp_len receive the same raw BoundProfilePackage bytes rsp_bpp_build
+ * itself produces (not wrapped in a GetBoundProfilePackageOk envelope --
+ * see this header's own note on rsp_bpp_build for why that envelope's
+ * generated codec cannot be trusted here either), malloc'ed, owned by the
+ * caller.
+ *
+ * -1 means the question was actually asked and the answer is no:
+ * euiccSigned2.transactionId does not match the session's, or
+ * euiccSignature2 does not verify against the eUICC's public key. -2 means
+ * the question was never reached: a null/malformed argument,
+ * rsp_dp_authenticate_client not having already succeeded on *s,
+ * prepare_download_resp not decoding as PrepareDownloadResponse (or
+ * decoding as its downloadResponseError arm), or an internal failure
+ * (allocation, RNG seeding, the EC point derivation for otPK.DP.ECKA, or
+ * rsp_bpp_build itself). */
+int rsp_dp_get_bound_profile_package(rsp_dp_session_t *s,
+        const uint8_t *prepare_download_resp, size_t resp_len,
+        const uint8_t *upp, size_t upp_len,
+        const uint8_t otsk_dp[32],
+        uint8_t **bpp, size_t *bpp_len);
+
 #endif /* RSP_H */

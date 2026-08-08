@@ -101,6 +101,73 @@ static inline int rsp_accept_certificate_policies(
     return MBEDTLS_OID_CMP(MBEDTLS_OID_CERTIFICATE_POLICIES, oid) == 0 ? 0 : -1;
 }
 
+/* Like rsp_accept_certificate_policies above, but also accepts a critical
+ * id-ce-nameConstraints extension (2.5.29.30). Needed for exactly one
+ * certificate this project loads: testdata/sgp26/eum.der (GSMA's own
+ * published SGP.26 v1.0 test EUM certificate) carries a critical Name
+ * Constraints extension restricting the EIDs it may issue for ("Permitted:
+ * DirName:O = RSP Test EUM, serialNumber = 89049032") -- a real GSMA
+ * convention for scoping an EUM to its assigned IIN range, encoded as a
+ * directoryName constraint even though the "serialNumber = 89049032" value
+ * is a prefix, not a literal RDN a compliant subtree match would ever
+ * accept (confirmed independently: `openssl verify` rejects this exact
+ * chain with "permitted subtree violation", error 47, for precisely this
+ * reason). mbedTLS has no Name Constraints support at all (verified by
+ * reading vendor/mbedtls/library/x509_crt.c: no "name_constraint" match
+ * anywhere in it), so accepting the OID here only lets the certificate
+ * parse; it does not make this project enforce -- or even read -- the
+ * constraint's content. That is not a gap this project introduces: the
+ * IIN-range eligibility check the constraint is standing in for belongs
+ * with Profile-order/eligibility logic (SGP.22 5.6.3, Annex F), which this
+ * stateless library does not implement at all (see src/rsp_es9.c). */
+static inline int rsp_accept_certificate_policies_and_name_constraints(
+    void *p_ctx, mbedtls_x509_crt const *crt, mbedtls_x509_buf const *oid,
+    int is_critical, const unsigned char *p, const unsigned char *end)
+{
+    (void)p_ctx;
+    (void)crt;
+    (void)p;
+    (void)end;
+    if (!is_critical) {
+        return 0;
+    }
+    if (MBEDTLS_OID_CMP(MBEDTLS_OID_CERTIFICATE_POLICIES, oid) == 0) {
+        return 0;
+    }
+    return MBEDTLS_OID_CMP(MBEDTLS_OID_NAME_CONSTRAINTS, oid) == 0 ? 0 : -1;
+}
+
+/* The SM-DP+'s own Host ID, for the Control Reference Template (ControlRef-
+ * Template.hostId, rsp-2.5.asn line 474) and for the matching HostID-LV
+ * component of Annex G's KDF SharedInfo (SGP.22 v2.6 Annex G:
+ * "keyType(1) || keyLen(1) || HostID-LV || EID-LV" -- HostID and EID are
+ * two separate LV fields, not the same value encoded twice).
+ *
+ * This is NOT the eUICC's EID. That is a real, previously-shipped mistake
+ * in this project worth recording precisely: src/rsp_bpp.c's build_isc
+ * currently comments that "the real hostId is the eUICC's EID, absent from
+ * this input struct". Checked against a working reference implementation
+ * rather than trusted on that comment's say-so: osmo-smdpp (Osmocom's
+ * pySim-based SM-DP+, github.com/osmocom/pysim, osmo-smdpp.py) hardcodes
+ * `ss.host_id = b'mahlzeit'` -- an arbitrary, unrelated ASCII string --
+ * completely independent of `ss.eid` (which it reads from the eUICC
+ * certificate's subject serialNumber a few lines away, and which is passed
+ * as the *separate* eid_lv argument to its own KDF call,
+ * BspInstance.from_kdf(shared_secret, key_type, key_length, host_id, eid)
+ * in pySim/esim/bsp.py). GlobalPlatform Amendment F's SCP11a, which SGP.22
+ * section 2.6.4 says this protocol is based on, calls the off-card entity
+ * (here, the SM-DP+) the "Host" -- hostId identifies that Host, not the
+ * Card (eUICC) on the other end of the exchange. Task 4's own
+ * controlRefTemplate must read this same constant, not re-derive a hostId
+ * from the EID: if the two sides of a key derivation start from different
+ * hostId bytes, they derive different session keys with no useful
+ * diagnostic (see include/rsp.h's own note on rsp_session_init).
+ *
+ * 9 bytes, well inside ControlRefTemplate.hostId's OctetTo16 SIZE(1..16)
+ * ceiling. */
+#define RSP_HOST_ID     ((const uint8_t *)"euicc-rsp")
+#define RSP_HOST_ID_LEN 9
+
 /* BER/DER length octets for len, minimal encoding (no leading zero byte
  * beyond what the long form needs) -- ITU-T X.690 8.1.3. Writes at most
  * RSP_DER_LEN_OCTETS_MAX bytes to out and sets *n to how many. Handles

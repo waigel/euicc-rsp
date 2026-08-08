@@ -79,7 +79,10 @@ SGP26_DIR := testdata/sgp26
 SGP26_SRCS := \
 	$(SGP26_DIR)/ci.der \
 	$(SGP26_DIR)/dpauth.der $(SGP26_DIR)/dpauth-key.pem \
-	$(SGP26_DIR)/dppb.der $(SGP26_DIR)/dppb-key.pem
+	$(SGP26_DIR)/dppb.der $(SGP26_DIR)/dppb-key.pem \
+	$(SGP26_DIR)/ci-2017.der \
+	$(SGP26_DIR)/eum.der \
+	$(SGP26_DIR)/euicc.der $(SGP26_DIR)/euicc-key.pem
 
 # The DP secret keys are SEC1 PEM text, and mbedtls_pk_parse_key requires a
 # null-terminated buffer for PEM input with keylen == strlen(pem) + 1;
@@ -97,7 +100,11 @@ build/sgp26_material.c: $(SGP26_SRCS) $(BIN2C)
 	   $(BIN2C) rsp_sgp26_dpauth_der      < $(SGP26_DIR)/dpauth.der && \
 	   $(BIN2C) -z rsp_sgp26_dpauth_key_pem < $(SGP26_DIR)/dpauth-key.pem && \
 	   $(BIN2C) rsp_sgp26_dppb_der        < $(SGP26_DIR)/dppb.der && \
-	   $(BIN2C) -z rsp_sgp26_dppb_key_pem < $(SGP26_DIR)/dppb-key.pem; \
+	   $(BIN2C) -z rsp_sgp26_dppb_key_pem < $(SGP26_DIR)/dppb-key.pem && \
+	   $(BIN2C) rsp_sgp26_ci2017_der      < $(SGP26_DIR)/ci-2017.der && \
+	   $(BIN2C) rsp_sgp26_eum_der         < $(SGP26_DIR)/eum.der && \
+	   $(BIN2C) rsp_sgp26_euicc_der       < $(SGP26_DIR)/euicc.der && \
+	   $(BIN2C) -z rsp_sgp26_euicc_key_pem < $(SGP26_DIR)/euicc-key.pem; \
 	 } > $@
 
 # The codec, generated from the RSP module. asn1c is a path, not a submodule:
