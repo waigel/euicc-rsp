@@ -14,15 +14,21 @@
  *      Always absent here.
  *   5. sequenceOf86: the Protected Profile Package, as tag-'86' segments
  *
- * Groups 2 and 3 are placed UNPROTECTED -- their ConfigureISDPRequest and
- * StoreMetadataRequest are DER-encoded and placed straight into the '87'/
- * '88' TLV's value. This is a deliberate, documented scope cut for this
- * half of the project: rsp.h says plainly that rsp_protect and
- * rsp_unprotect hard-code tag '86' and that '87'/'88' protection (a
- * different construction -- '87' is encrypted and MAC'd like '86', '88'
- * is MAC-only, no encryption) is out of scope here. A real card will
- * refuse a BPP built this way; the first task that talks to a card is
- * where '87'/'88' protection belongs.
+ * Groups 2 and 3 are now protected exactly as SGP.22 v2.6 Table 4
+ * requires: '87' (ConfigureISDP) is encrypted and MAC'd with the same
+ * SCP03t construction as '86' (S-ENC, S-CMAC) -- rsp_protect below takes
+ * the segment's tag as a parameter for exactly this reason, so the same
+ * function serves both '86' and '87'. '88' (StoreMetadata) is MAC'd only,
+ * never encrypted -- rsp_protect_mac_only (src/rsp_crypto.c) is the
+ * separate, narrower construction Table 4 describes for it. Both '87' and
+ * '88' advance the same s->chain the '86' segments do, in wire order
+ * (firstSequenceOf87, then sequenceOf88, then sequenceOf86): section
+ * 2.5.4's own text, "The encryption counter for ICV calculation is
+ * incremented each time a TLV with tag '86', '87' or '88' is received,"
+ * describes one shared chaining value across all three tags, not three
+ * independent ones -- see src/rsp_crypto.c's own comment for the full
+ * account, including what that means for '88', which has no ICV or
+ * encryption step of its own to increment a counter for.
  *
  * SGP.22 v2.6 section 2.5.3, "Protected Profile Package", is where the
  * segment size limit comes from: "That block of data is split into
@@ -158,6 +164,29 @@
 #define TAG_88_ELEMENT   TAG_BYTE(2, 0, 8)  /* '88' TLV, primitive */
 #define TAG_86_ELEMENT   TAG_BYTE(2, 0, 6)  /* '86' TLV, primitive */
 
+/* smdpSign's own concatenation (SGP.22 v2.6 section 5.5.1, build_isc_tbs
+   below): the exact IMPLICIT tag InitialiseSecureChannelRequest's own
+   generated member table (dist/InitialiseSecureChannelRequest.c) assigns
+   each field -- not values re-typed independently of that table. remoteOpId
+   carries no override in that table (tag_mode 0: RemoteOpId's own natural
+   [2] IMPLICIT INTEGER tag, unchanged); transactionId, controlRefTemplate
+   are each re-tagged IMPLICIT at [0] and [6]; ControlRefTemplate's own three
+   members (dist/ControlRefTemplate.c) are IMPLICIT at [0], [1], [4].
+   smdpOtpk/euiccOtpk share one tag, APPLICATION 73 (otPK.*.ECKA is the same
+   OCTET STRING type for both DP and eUICC's one-time public key) -- its
+   high-tag-number form needs two octets, so it is not a TAG_BYTE constant
+   like the others. Checked against a working reference implementation, not
+   assumed: pySim's ES8+ helper (pySim/esim/es8p.py,
+   gen_init_sec_chan_signed_part) builds this exact concatenation, tag by
+   tag, the same way. */
+#define TAG_REMOTEOPID    TAG_BYTE(2, 0, 2)  /* remoteOpId: RemoteOpId's own [2] INTEGER tag */
+#define TAG_TRANSACTIONID TAG_BYTE(2, 0, 0)  /* transactionId [0] IMPLICIT */
+#define TAG_CRT           TAG_BYTE(2, 1, 6)  /* controlRefTemplate [6] IMPLICIT, constructed (SEQUENCE) */
+#define TAG_CRT_KEYTYPE   TAG_BYTE(2, 0, 0)  /* ControlRefTemplate.keyType [0] IMPLICIT */
+#define TAG_CRT_KEYLEN    TAG_BYTE(2, 0, 1)  /* ControlRefTemplate.keyLen  [1] IMPLICIT */
+#define TAG_CRT_HOSTID    TAG_BYTE(2, 0, 4)  /* ControlRefTemplate.hostId  [4] IMPLICIT */
+static const uint8_t TAG_OTPK[2] = { 0x5F, 0x49 }; /* smdpOtpk / euiccOtpk: APPLICATION 73 IMPLICIT */
+
 /* The packed (class | tag_number << 2) form ber_fetch_tag hands back --
    see ber_tlv_tag.h. Used only to check the wrapper tags on decode. */
 #define PACKED_TAG(class2, num) (ber_tlv_tag_t)((class2) | ((num) << 2))
@@ -214,9 +243,14 @@ static int der_encode_alloc(asn_TYPE_descriptor_t *td, const void *sptr,
    own; a UPP that size is refused here (see the checks in rsp_bpp_build
    below), not silently truncated. */
 
-/* Append one TLV with a single-byte tag: tag, minimal DER length, content. */
-static int put_tlv(rsp_growbuf_t *g, uint8_t tag, const uint8_t *content,
-                    size_t len)
+/* Append one TLV: tag (tag_len octets, written as given -- the caller is
+   responsible for it being a well-formed BER tag), minimal DER length,
+   content. Generalizes put_tlv below to tags wider than one octet: every
+   tag this file otherwise writes is a single low-tag-number octet, but
+   smdpSign's own concatenation (build_isc_tbs) also needs APPLICATION 73's
+   two-octet high-tag-number form (TAG_OTPK, above). */
+static int put_tlv_tag(rsp_growbuf_t *g, const uint8_t *tag, size_t tag_len,
+                        const uint8_t *content, size_t len)
 {
     uint8_t lo[RSP_DER_LEN_OCTETS_MAX];
     size_t n;
@@ -224,7 +258,7 @@ static int put_tlv(rsp_growbuf_t *g, uint8_t tag, const uint8_t *content,
     if (rsp_der_length_octets(len, lo, &n) != 0) {
         return -1;
     }
-    if (rsp_growbuf_append(g, &tag, 1) != 0) {
+    if (rsp_growbuf_append(g, tag, tag_len) != 0) {
         return -1;
     }
     if (rsp_growbuf_append(g, lo, n) != 0) {
@@ -234,6 +268,13 @@ static int put_tlv(rsp_growbuf_t *g, uint8_t tag, const uint8_t *content,
         return -1;
     }
     return 0;
+}
+
+/* Append one TLV with a single-byte tag: tag, minimal DER length, content. */
+static int put_tlv(rsp_growbuf_t *g, uint8_t tag, const uint8_t *content,
+                    size_t len)
+{
+    return put_tlv_tag(g, &tag, 1, content, len);
 }
 
 /* Read one BER/DER TLV header at p (n bytes available). *tag receives the
@@ -272,60 +313,129 @@ static ssize_t read_tlv(const uint8_t *p, size_t n, ber_tlv_tag_t *tag,
     return (ssize_t)((size_t)tag_len + (size_t)len_len + (size_t)len);
 }
 
+/* smdpSign's own to-be-signed bytes (SGP.22 v2.6 section 5.5.1): "the
+   SM-DP+ private key SK.DPbp.ECDSA across the following concatenated data
+   objects: remoteOpId; transactionId; controlRefTemplate; smdpOtpk;
+   euiccOtpk." Section 2.6.7.2's general rule for ASN.1-data-object signing
+   ("the signature SHALL be computed for the data object after encoding,
+   i.e. in its DER representation") applies to each one individually, so
+   this is each field's own encoded TLV, concatenated -- not their bare
+   values, and not InitialiseSecureChannelRequest's own encoding either
+   (which cannot be what is meant: it would have to include smdpSign
+   itself, and it does not include euiccOtpk at all, which comes from
+   PrepareDownloadResponse, an earlier exchange). See TAG_REMOTEOPID and
+   its neighbors, above, for exactly which tag each field carries and how
+   that was checked, not assumed. key_type/key_len/host_id/host_id_len are
+   the same three values build_isc below fills controlRefTemplate's own
+   three members with -- passed in rather than re-read from isc, so this
+   function has no ordering dependency on when isc's own fields are
+   populated. */
+static int build_isc_tbs(rsp_growbuf_t *g,
+                          const uint8_t transaction_id[16],
+                          uint8_t key_type, uint8_t key_len,
+                          const uint8_t *host_id, size_t host_id_len,
+                          const uint8_t smdp_otpk[65],
+                          const uint8_t euicc_otpk[65])
+{
+    /* This library only ever requests one remote operation type -- see
+       build_isc's own use of RemoteOpId_installBoundProfilePackage --
+       so this is the one value this concatenation ever needs, not a
+       second, independent copy of that choice. */
+    static const uint8_t remote_op_id = RemoteOpId_installBoundProfilePackage;
+    rsp_growbuf_t crt;
+    int ret = -1;
+
+    memset(&crt, 0, sizeof crt);
+
+    if (put_tlv(&crt, TAG_CRT_KEYTYPE, &key_type, 1) != 0 ||
+        put_tlv(&crt, TAG_CRT_KEYLEN, &key_len, 1) != 0 ||
+        put_tlv(&crt, TAG_CRT_HOSTID, host_id, host_id_len) != 0) {
+        goto out;
+    }
+
+    if (put_tlv(g, TAG_REMOTEOPID, &remote_op_id, 1) != 0 ||
+        put_tlv(g, TAG_TRANSACTIONID, transaction_id, 16) != 0 ||
+        put_tlv(g, TAG_CRT, crt.buf, crt.len) != 0 ||
+        put_tlv_tag(g, TAG_OTPK, sizeof TAG_OTPK, smdp_otpk, 65) != 0 ||
+        put_tlv_tag(g, TAG_OTPK, sizeof TAG_OTPK, euicc_otpk, 65) != 0) {
+        goto out;
+    }
+    ret = 0;
+
+out:
+    rsp_growbuf_free(&crt);
+    return ret;
+}
+
 /* InitialiseSecureChannelRequest, SGP.22 v2.6 section 5.5.1 / the ASN.1 at
-   rsp-2.5.asn line 463. Only smdpOtpk and the iccid-derived hostId
-   placeholder come from the caller; transactionId, the real hostId (the
-   eUICC's EID) and smdpSign belong to the ES9+/ES8+ exchange this half of
-   the project does not implement (no AuthenticateClient round trip
-   supplies a transaction id or an EID, and no ECDSA signing primitive is
-   exposed by rsp.h at this stage -- Task 3 only verifies certificates, it
-   does not sign). They are filled with clearly-marked placeholders so the
-   message still encodes to a structurally valid TLV; the task that wires
-   the full ES9+/ES8+ flow supplies the real values. */
+   rsp-2.5.asn line 463. transactionId is in->transaction_id, the same
+   value the caller's RSP session generated (not a placeholder).
+   controlRefTemplate.hostId is RSP_HOST_ID (src/rsp_internal.h) -- an
+   arbitrary, fixed, SM-DP+-chosen identifier for the Host side of the key
+   agreement, NOT the eUICC's EID and NOT in->iccid: both were tried in
+   this exact function at different points in this project's history and
+   are documented, in RSP_HOST_ID's own comment, as wrong for this field.
+   smdpSign is now a real signature -- see build_isc_tbs above for the
+   concatenation and rsp_sign (rsp.h) for the deterministic-ECDSA primitive
+   it is computed with, using the DPpb credential the caller supplies via
+   in->dppb (never DPauth: DPauth signs InitiateAuthentication's own
+   serverSigned1, a different key for a different purpose -- see
+   src/rsp_es9.c's own top comment). */
 static int build_isc(InitialiseSecureChannelRequest_t *isc,
                       const rsp_bpp_input_t *in)
 {
-    static const uint8_t placeholder_txn[1] = { 0x01 };
     /* GlobalPlatform Card Specification v2.3.1 Table 11-16: AES key type
        is '88'; keyLen is fixed to 0x10 (16 bytes) by rsp-2.5.asn's own
        comment on ControlRefTemplate.keyLen. */
     static const uint8_t key_type_aes = 0x88;
     static const uint8_t key_len_16 = 0x10;
+    rsp_growbuf_t tbs;
+    uint8_t sig[64];
+    int ret = -1;
 
     memset(isc, 0, sizeof *isc);
+    memset(&tbs, 0, sizeof tbs);
+
     isc->remoteOpId = RemoteOpId_installBoundProfilePackage;
 
     if (OCTET_STRING_fromBuf(&isc->transactionId,
-                              (const char *)placeholder_txn, 1) != 0) {
-        return -1;
+                              (const char *)in->transaction_id, 16) != 0) {
+        goto out;
     }
     if (OCTET_STRING_fromBuf(&isc->controlRefTemplate.keyType,
                               (const char *)&key_type_aes, 1) != 0) {
-        return -1;
+        goto out;
     }
     if (OCTET_STRING_fromBuf(&isc->controlRefTemplate.keyLen,
                               (const char *)&key_len_16, 1) != 0) {
-        return -1;
+        goto out;
     }
-    /* Placeholder hostId: reuses the ICCID only because it is a 10-byte
-       value already at hand, not because it is the correct field -- the
-       real hostId is the eUICC's EID, which rsp_bpp_input_t does not
-       carry. */
     if (OCTET_STRING_fromBuf(&isc->controlRefTemplate.hostId,
-                              (const char *)in->iccid, 10) != 0) {
-        return -1;
+                              (const char *)RSP_HOST_ID, RSP_HOST_ID_LEN) != 0) {
+        goto out;
     }
     if (OCTET_STRING_fromBuf(&isc->smdpOtpk,
                               (const char *)in->otpk_dp, 65) != 0) {
-        return -1;
+        goto out;
     }
-    /* Left empty, not filled with filler bytes: an empty signature cannot
-       be mistaken for a real one the way a fixed-length placeholder
-       could. */
-    if (OCTET_STRING_fromBuf(&isc->smdpSign, "", 0) != 0) {
-        return -1;
+
+    if (build_isc_tbs(&tbs, in->transaction_id, key_type_aes, key_len_16,
+                       RSP_HOST_ID, RSP_HOST_ID_LEN,
+                       in->otpk_dp, in->euicc_otpk) != 0) {
+        goto out;
     }
-    return 0;
+    if (rsp_sign(in->dppb, tbs.buf, tbs.len, sig) != 0) {
+        goto out;
+    }
+    if (OCTET_STRING_fromBuf(&isc->smdpSign, (const char *)sig,
+                              sizeof sig) != 0) {
+        goto out;
+    }
+    ret = 0;
+
+out:
+    rsp_growbuf_free(&tbs);
+    return ret;
 }
 
 /* ConfigureISDPRequest, rsp-2.5.asn line 478. dpProprietaryData is
@@ -397,7 +507,8 @@ int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
         return -1;
     }
     if (!in->otpk_dp || !in->iccid || !in->profile_name ||
-        !in->service_provider_name) {
+        !in->service_provider_name || !in->transaction_id ||
+        !in->euicc_otpk || !in->dppb) {
         return -1;
     }
     if (!in->upp && in->upp_len) {
@@ -458,10 +569,28 @@ int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
             goto out;
         }
     }
+    /* '87': ConfigureISDP, encrypted-and-MAC'd with rsp_protect -- the same
+       construction as '86', a different tag (SGP.22 v2.6 Table 4; see this
+       file's own top comment and rsp_protect's in include/rsp.h). Table 4
+       describes no remainder form for '87' the way it does for '88', so a
+       ConfigureISDPRequest that does not fit one segment is refused rather
+       than guessed at -- ConfigureISDPRequest's only field
+       (dpProprietaryData) is capped well under this by its own SIZE
+       constraint in practice, so this is not expected to ever trigger, but
+       refusing beats silently truncating if it somehow did. */
+    if (configure_len > RSP_BPP_MAX_SEGMENT_PLAINTEXT) {
+        goto out;
+    }
     {
+        uint8_t prot87[RSP_BPP_SEGMENT_BUF];
+        long n = rsp_protect(s, configure_der, configure_len,
+                              TAG_87_ELEMENT, prot87, sizeof prot87);
         rsp_growbuf_t wrapped;
+        if (n < 0) {
+            goto out;
+        }
         memset(&wrapped, 0, sizeof wrapped);
-        if (put_tlv(&wrapped, TAG_87_ELEMENT, configure_der, configure_len) != 0 ||
+        if (put_tlv(&wrapped, TAG_87_ELEMENT, prot87, (size_t)n) != 0 ||
             put_tlv(&content, TAG_F87_WRAPPER, wrapped.buf, wrapped.len) != 0) {
             rsp_growbuf_free(&wrapped);
             goto out;
@@ -482,10 +611,26 @@ int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
             goto out;
         }
     }
+    /* '88': StoreMetadata, MAC'd only with rsp_protect_mac_only -- Table 4's
+       own words, "MAC protected ... (i.e. not encrypted)". Table 4 does
+       allow a second, remainder '88' TLV if the first cannot hold the
+       whole StoreMetadataRequest; that is not implemented (see
+       include/rsp.h's own note on rsp_bpp_input_t), so a
+       StoreMetadataRequest too large for one segment is refused here
+       rather than silently truncated or wrongly split. */
+    if (metadata_len > RSP_BPP_MAX_SEGMENT_PLAINTEXT) {
+        goto out;
+    }
     {
+        uint8_t prot88[RSP_BPP_SEGMENT_BUF];
+        long n = rsp_protect_mac_only(s, metadata_der, metadata_len,
+                                       TAG_88_ELEMENT, prot88, sizeof prot88);
         rsp_growbuf_t wrapped;
+        if (n < 0) {
+            goto out;
+        }
         memset(&wrapped, 0, sizeof wrapped);
-        if (put_tlv(&wrapped, TAG_88_ELEMENT, metadata_der, metadata_len) != 0 ||
+        if (put_tlv(&wrapped, TAG_88_ELEMENT, prot88, (size_t)n) != 0 ||
             put_tlv(&content, TAG_88_WRAPPER, wrapped.buf, wrapped.len) != 0) {
             rsp_growbuf_free(&wrapped);
             goto out;
@@ -515,7 +660,7 @@ int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
         }
         p = (chunk && in->upp) ? in->upp + off : NULL;
 
-        n = rsp_protect(s, p, chunk, seg_buf, sizeof seg_buf);
+        n = rsp_protect(s, p, chunk, TAG_86_ELEMENT, seg_buf, sizeof seg_buf);
         if (n < 0) {
             goto out;
         }
@@ -567,6 +712,73 @@ out:
     return ret;
 }
 
+/* Verifies every element inside a firstSequenceOf87/sequenceOf88 wrapper's
+   own content (wrapper_val, wrapper_len), advancing s->chain through each
+   one in wire order -- without keeping any of the recovered plaintext,
+   which is not part of the UPP. This replays, on the recovering side,
+   exactly the chain advancement rsp_bpp_build performed on the building
+   side via rsp_protect ('87') / rsp_protect_mac_only ('88'); see this
+   file's own top comment and src/rsp_crypto.c's SCP03t comment for why
+   skipping either -- as this function did before both were genuinely
+   protected -- would desynchronize the chain the first '86' segment is
+   then checked against, with a failure that looks like it is about '86'.
+
+   elem_tag is the packed tag read_tlv compares each element against
+   (PACKED_TAG(2, 7) or PACKED_TAG(2, 8)); wire_tag is that same tag's raw
+   wire byte, threaded through to rsp_unprotect/rsp_unprotect_mac_only
+   (TAG_87_ELEMENT or TAG_88_ELEMENT) -- both are needed because read_tlv
+   and rsp_unprotect* use two different tag representations (see PACKED_TAG
+   and TAG_BYTE's own comments, above). mac_only selects which of the two
+   inverse functions applies: '87' is encrypted-and-MAC'd like '86', '88'
+   is MAC-only (Table 4).
+
+   Zero or more elements are accepted, not "at least one": firstSequenceOf87
+   and sequenceOf88 are each exactly one TLV as far as rsp_bpp_build is
+   concerned, but an empty wrapper is not the same kind of ambiguity
+   sequenceOf86 has (see rsp_bpp_recover's own comment on why *that* one
+   does require at least one) -- a hand-built BPP is free to leave either
+   group empty without that meaning anything went missing. Returns 0 on
+   success. -1 if some element's MAC did not match (a real no, propagated
+   from rsp_unprotect/rsp_unprotect_mac_only unchanged). -2 if malformed
+   (a bad element tag, a truncated TLV) or an allocation failure. */
+static int verify_and_advance(rsp_session_t *s, const uint8_t *wrapper_val,
+                               size_t wrapper_len, ber_tlv_tag_t elem_tag,
+                               uint8_t wire_tag, int mac_only)
+{
+    size_t p = 0;
+
+    while (p < wrapper_len) {
+        ber_tlv_tag_t et;
+        const uint8_t *ev;
+        size_t evlen;
+        uint8_t *plain;
+        long un;
+        ssize_t en = read_tlv(wrapper_val + p, wrapper_len - p, &et, &ev, &evlen);
+
+        if (en < 0 || et != elem_tag) {
+            return -2;
+        }
+        p += (size_t)en;
+
+        /* Sized the same way the sequenceOf86 loop below sizes its own
+           scratch buffer: the recovered plaintext is never longer than
+           the element's own value bytes, encrypted or not. */
+        plain = malloc(evlen ? evlen : 1);
+        if (!plain) {
+            return -2;
+        }
+        un = mac_only
+            ? rsp_unprotect_mac_only(s, ev, evlen, wire_tag, plain, evlen)
+            : rsp_unprotect(s, ev, evlen, wire_tag, plain, evlen);
+        mbedtls_platform_zeroize(plain, evlen);
+        free(plain);
+        if (un < 0) {
+            return (un == -1) ? -1 : -2;
+        }
+    }
+    return 0;
+}
+
 int rsp_bpp_recover(rsp_session_t *s, const uint8_t *bpp, size_t bpp_len,
                      uint8_t **upp, size_t *upp_len)
 {
@@ -614,29 +826,48 @@ int rsp_bpp_recover(rsp_session_t *s, const uint8_t *bpp, size_t bpp_len,
         pos += (size_t)n;
     }
 
-    /* firstSequenceOf87: also skipped -- ConfigureISDP is not part of the
-       UPP. */
+    /* firstSequenceOf87: ConfigureISDP is not part of the UPP, and its
+       recovered plaintext is discarded -- but it is now genuinely
+       protected (see this file's own top comment), so it must be verified
+       and its chain advancement replayed, not merely skipped as a raw
+       TLV. verify_and_advance, above, does both. */
     {
         ber_tlv_tag_t t;
         const uint8_t *v;
         size_t vlen;
         ssize_t n = read_tlv(content + pos, content_len - pos, &t, &v, &vlen);
+        int vrc;
         if (n < 0 || t != PACKED_TAG(2, 0)) {
             goto out;
         }
         pos += (size_t)n;
+        vrc = verify_and_advance(s, v, vlen, PACKED_TAG(2, 7),
+                                  TAG_87_ELEMENT, 0);
+        if (vrc != 0) {
+            ret = vrc;
+            goto out;
+        }
     }
 
-    /* sequenceOf88: skipped -- StoreMetadata is not part of the UPP. */
+    /* sequenceOf88: same treatment -- StoreMetadata is not part of the
+       UPP, but its MAC-only protection must still be verified and its
+       chain advancement replayed. */
     {
         ber_tlv_tag_t t;
         const uint8_t *v;
         size_t vlen;
         ssize_t n = read_tlv(content + pos, content_len - pos, &t, &v, &vlen);
+        int vrc;
         if (n < 0 || t != PACKED_TAG(2, 1)) {
             goto out;
         }
         pos += (size_t)n;
+        vrc = verify_and_advance(s, v, vlen, PACKED_TAG(2, 8),
+                                  TAG_88_ELEMENT, 1);
+        if (vrc != 0) {
+            ret = vrc;
+            goto out;
+        }
     }
 
     /* secondSequenceOf87: OPTIONAL. rsp_bpp_build never emits it, but a
@@ -703,7 +934,7 @@ int rsp_bpp_recover(rsp_session_t *s, const uint8_t *bpp, size_t bpp_len,
             if (!plain) {
                 goto out;
             }
-            un = rsp_unprotect(s, ev, evlen, plain, evlen);
+            un = rsp_unprotect(s, ev, evlen, TAG_86_ELEMENT, plain, evlen);
             if (un < 0) {
                 /* Propagate rsp_unprotect's own answer rather than
                  * collapsing it: un == -1 means this segment's MAC did

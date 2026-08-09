@@ -280,26 +280,77 @@ void rsp_session_wipe(rsp_session_t *s)
  *    becomes the 'MAC chaining value' for the subsequent C-MAC
  *    verification").
  *
- * rsp_protect and rsp_unprotect hard-code the tag as '86': that is the only
- * tag this library's caller (the Bound Profile Package assembly) uses
- * rsp_protect for -- SGP.22 Table 4 also defines tag '87' (ConfigureISDP,
- * ReplaceSessionKeys) and '88' (StoreMetadata, MAC-only, no encryption),
- * which are a different, narrower construction this function does not
- * cover. *out* holds only the segment's value bytes (ciphertext, then the
- * 8-byte MAC) -- not the tag or its length octets, since those are exactly
- * what a BER/DER encoder reproduces from a plain byte count when the
- * segment is placed into the generated codec's OCTET STRING (see
- * include/rsp.h for why that is safe to leave to the caller). The tag and
- * length octets are still computed here, internally, because per rule 3
- * above they are part of what the MAC covers, even though they are never
- * written to *out*.
+ * rsp_protect and rsp_protect_mac_only both take the segment's TLV tag as a
+ * parameter now, not a hard-coded constant: SGP.22 Table 4 uses the exact
+ * same encrypt-and-MAC construction for tag '87' (ConfigureISDP) as it does
+ * for '86' (the PPP itself) -- "protected with session keys resulting from
+ * the key agreement (S-ENC, S-CMAC)" is Table 4's own wording for both --
+ * so rsp_protect below is the one function for both, distinguished only by
+ * which tag its caller passes. '88' (StoreMetadata) is different: Table 4
+ * says it is "MAC protected ... (i.e. not encrypted)", which is why it gets
+ * its own function, rsp_protect_mac_only, rather than a flag on rsp_protect
+ * that skips encryption -- the two constructions genuinely differ (no ICV,
+ * no padding, no ciphertext), not just in which bytes get MACed.
+ *
+ * Both functions share the same MAC computation, scp03t_mac below, now
+ * parametrized by tag for the same reason: rule 3 folds the tag byte into
+ * what gets MACed, so a MAC computed with the wrong tag baked in verifies
+ * against nothing a real eUICC (which authenticates using the tag it
+ * actually parsed the segment under) would ever compute to match.
+ *
+ * SGP.22 v2.6 section 2.5.4's own text: "The encryption counter for ICV
+ * calculation is incremented each time a TLV with tag '86', '87' or '88' is
+ * received." Read against rule 2's own citation (GlobalPlatform Amendment D
+ * section 6.2.6, the counter SCP03t's chaining value replaces) and rule 3's
+ * (the full 16-byte CMAC output becomes the chaining value for what
+ * follows): this is one shared counter -- realized here as the single
+ * s->chain field -- advanced by every one of '86', '87' and '88', in
+ * whatever order they are actually sent, not three independent per-tag
+ * counters. Concretely: firstSequenceOf87's '87' TLV advances the chain
+ * that sequenceOf88's '88' TLV then reads as its own MAC input, which in
+ * turn advances the chain that sequenceOf86's first '86' segment reads. A
+ * card computing its own MACs to compare against therefore expects
+ * *exactly this* interleaved advancement -- an implementation that keeps a
+ * separate chain per tag, or that skips advancing it for '88' because '88'
+ * has no encryption step to reset a counter for, silently disagrees with
+ * every '86' segment's MAC from that point on, with no diagnostic pointing
+ * at '88' as the cause. rsp_protect_mac_only advances s->chain from its own
+ * MAC's full CMAC output for exactly this reason, even though it never
+ * computes an ICV (there being nothing to encrypt) -- see its own comment
+ * below.
+ *
+ * *out* holds only the segment's value bytes (ciphertext-or-plaintext,
+ * then the 8-byte MAC) -- not the tag or its length octets, since those are
+ * exactly what a BER/DER encoder reproduces from a plain byte count when
+ * the segment is placed into a TLV (see include/rsp.h for why that is safe
+ * to leave to the caller). The tag and length octets are still computed
+ * here, internally, because per rule 3 above they are part of what the MAC
+ * covers, even though they are never written to *out*.
+ *
+ * rsp_unprotect and rsp_unprotect_mac_only are the inverse pair, tag-generic
+ * for the identical reason: src/rsp_bpp.c's rsp_bpp_recover must now
+ * actually verify the single '87' element and every '88' element it finds
+ * (not merely skip their TLVs, the way it did before this construction was
+ * implemented), purely to replay the same chain advancement rsp_protect and
+ * rsp_protect_mac_only performed while building -- without that replay, the
+ * chain rsp_unprotect reads for the first '86' segment would still be the
+ * pre-'87'/'88' initial value, while the chain rsp_protect actually used to
+ * MAC that same '86' segment during build had already moved twice; every
+ * '86' segment's MAC would then fail to verify, for a reason with no
+ * connection to the '86' segment itself.
  */
-#define RSP_SCP03T_TAG      0x86
 #define RSP_SCP03T_MAC_LEN  8
 
-/* CMAC(S-MAC, chain || '86' || Lcc || ciphertext) -- rule 3 above. Always
- * produces the full 16-byte CMAC; the caller decides how much of it is
- * appended to the wire and how much becomes the next chaining value.
+/* CMAC(S-MAC, chain || tag || Lcc || data) -- rule 3 above, generalized to
+ * take the tag it MACs as a parameter (see this file's SCP03t comment for
+ * why: '86' and '87' share this exact construction, differing only in
+ * their tag byte). "data" is the segment's ciphertext for the encrypt-and-
+ * MAC callers (rsp_protect, rsp_unprotect) or its plaintext for the MAC-
+ * only caller (rsp_protect_mac_only) -- rule 3 itself does not care which,
+ * only that it is exactly the bytes that end up on the wire as the
+ * segment's value. Always produces the full 16-byte CMAC; the caller
+ * decides how much of it is appended to the wire and how much becomes the
+ * next chaining value.
  *
  * Lcc -- the length octets the MAC covers -- comes from
  * rsp_der_length_octets (src/rsp_internal.h), the same implementation
@@ -310,6 +361,7 @@ void rsp_session_wipe(rsp_session_t *s)
  * length the MAC authenticates, and it must be computed exactly the way
  * the wire bytes it is authenticating were computed. */
 static int scp03t_mac(const uint8_t s_mac[16], const uint8_t chain[16],
+                       uint8_t tag,
                        const uint8_t *ciphertext, size_t ciphertext_len,
                        uint8_t mac16[16])
 {
@@ -330,7 +382,7 @@ static int scp03t_mac(const uint8_t s_mac[16], const uint8_t chain[16],
         return -1;
     }
     memcpy(buf, chain, 16);
-    buf[16] = RSP_SCP03T_TAG;
+    buf[16] = tag;
     memcpy(buf + 17, len_octets, len_octets_n);
     if (ciphertext_len) {
         memcpy(buf + 17 + len_octets_n, ciphertext, ciphertext_len);
@@ -387,7 +439,7 @@ int rsp_cmac(const uint8_t key[16], const uint8_t *msg, size_t len,
 }
 
 long rsp_protect(rsp_session_t *s, const uint8_t *plain, size_t plain_len,
-                  uint8_t *out, size_t out_cap)
+                  uint8_t tag, uint8_t *out, size_t out_cap)
 {
     size_t pad_len, padded_len;
     uint8_t *padded = NULL;
@@ -458,7 +510,7 @@ long rsp_protect(rsp_session_t *s, const uint8_t *plain, size_t plain_len,
         }
     }
 
-    if (scp03t_mac(s->s_mac, s->chain, out, padded_len, mac16) != 0) {
+    if (scp03t_mac(s->s_mac, s->chain, tag, out, padded_len, mac16) != 0) {
         goto out;
     }
     memcpy(out + padded_len, mac16, RSP_SCP03T_MAC_LEN);
@@ -478,8 +530,61 @@ out:
     return ret;
 }
 
+/* Table 4's '88' construction: "MAC protected ... (i.e. not encrypted)".
+ * Same rule 3 MAC as rsp_protect (scp03t_mac, above, with this call's own
+ * tag folded in), computed directly over plain -- there is no ciphertext
+ * to MAC instead, and therefore no rule-1 padding and no rule-2 ICV either:
+ * both of those exist only to support the encryption step this
+ * construction does not have. *out* is plain_len bytes of plaintext,
+ * unchanged, followed by the 8-byte MAC -- recoverable by a caller (or a
+ * test) with nothing more than "read plain_len bytes, then check the MAC",
+ * no decryption step of any kind.
+ *
+ * s->chain still advances from the full 16-byte CMAC output, exactly the
+ * way rsp_protect's does: see this file's own SCP03t comment for why an
+ * implementation that only advances the chain for encrypted tags ('86',
+ * '87') and leaves it alone for '88' silently disagrees with a real
+ * eUICC's own chaining from that point on. */
+long rsp_protect_mac_only(rsp_session_t *s, const uint8_t *plain,
+                           size_t plain_len, uint8_t tag,
+                           uint8_t *out, size_t out_cap)
+{
+    uint8_t mac16[16];
+    long ret = -1;
+
+    if (!s || (!plain && plain_len != 0) || !out) {
+        return -1;
+    }
+    /* Same overflow guard rsp_protect uses, narrowed to the one addition
+     * this function actually performs (no padding to also account for). */
+    if (plain_len > SIZE_MAX - RSP_SCP03T_MAC_LEN) {
+        return -1;
+    }
+    if (plain_len + RSP_SCP03T_MAC_LEN > out_cap) {
+        return -1;
+    }
+
+    if (scp03t_mac(s->s_mac, s->chain, tag, plain, plain_len, mac16) != 0) {
+        goto out;
+    }
+    if (plain_len) {
+        memcpy(out, plain, plain_len);
+    }
+    memcpy(out + plain_len, mac16, RSP_SCP03T_MAC_LEN);
+
+    /* The full 16-byte MAC becomes the chaining value for the next
+     * segment (rule 3), only once everything above has succeeded --
+     * mirroring rsp_protect's own placement of this line. */
+    memcpy(s->chain, mac16, 16);
+    ret = (long)(plain_len + RSP_SCP03T_MAC_LEN);
+
+out:
+    mbedtls_platform_zeroize(mac16, sizeof mac16);
+    return ret;
+}
+
 long rsp_unprotect(rsp_session_t *s, const uint8_t *seg, size_t seg_len,
-                    uint8_t *out, size_t out_cap)
+                    uint8_t tag, uint8_t *out, size_t out_cap)
 {
     const uint8_t *ciphertext;
     size_t ciphertext_len;
@@ -508,7 +613,8 @@ long rsp_unprotect(rsp_session_t *s, const uint8_t *seg, size_t seg_len,
     ciphertext = seg;
     ciphertext_len = seg_len - RSP_SCP03T_MAC_LEN;
 
-    if (scp03t_mac(s->s_mac, s->chain, ciphertext, ciphertext_len, mac16) != 0) {
+    if (scp03t_mac(s->s_mac, s->chain, tag, ciphertext,
+                    ciphertext_len, mac16) != 0) {
         goto out;
     }
 
@@ -590,6 +696,64 @@ out:
         free(padded);
     }
     mbedtls_platform_zeroize(icv, sizeof icv);
+    mbedtls_platform_zeroize(mac16, sizeof mac16);
+    return ret;
+}
+
+/* The inverse of rsp_protect_mac_only: verify the MAC over chain || tag ||
+ * Lcc || plain (rule 3, no ICV/decryption step, mirroring rsp_protect_
+ * mac_only's own construction), and if it matches, copy plain_len bytes of
+ * plaintext to *out and advance s->chain from the full CMAC output.
+ *
+ * This exists for the same reason rsp_unprotect does: a caller needs to
+ * verify a '88' segment it did not produce itself, and rsp_bpp_recover
+ * needs to replay '88's own chain advancement to stay in step with
+ * whatever '86' segments follow it (see this file's SCP03t comment) --
+ * without decrypting anything, since there is nothing to decrypt. Returns
+ * plain_len on success. -1 means the question was actually asked and the
+ * answer is no: the MAC does not match. -2 means the question was never
+ * reached: a null argument, a seg_len too short to even hold a MAC,
+ * out_cap too small for plain_len, or an allocation/crypto-primitive
+ * failure. */
+long rsp_unprotect_mac_only(rsp_session_t *s, const uint8_t *seg,
+                             size_t seg_len, uint8_t tag,
+                             uint8_t *out, size_t out_cap)
+{
+    size_t plain_len;
+    uint8_t mac16[16];
+    long ret = -2;
+
+    if (!s || !seg || !out) {
+        return -2;
+    }
+    if (seg_len < RSP_SCP03T_MAC_LEN) {
+        return -2;
+    }
+    plain_len = seg_len - RSP_SCP03T_MAC_LEN;
+
+    if (scp03t_mac(s->s_mac, s->chain, tag, seg, plain_len, mac16) != 0) {
+        goto out;
+    }
+
+    /* Constant-time, for the same reason rsp_unprotect's own comparison
+     * is: this is an exported entry point, not only fed by this
+     * repository's own locally generated segments. */
+    if (mbedtls_ct_memcmp(mac16, seg + plain_len, RSP_SCP03T_MAC_LEN) != 0) {
+        ret = -1; /* the question was asked: this segment's MAC does not match */
+        goto out;
+    }
+
+    if (plain_len > out_cap) {
+        goto out; /* -2: the segment itself is fine, out_cap is just too small */
+    }
+    if (plain_len) {
+        memcpy(out, seg, plain_len);
+    }
+
+    memcpy(s->chain, mac16, 16);
+    ret = (long)plain_len;
+
+out:
     mbedtls_platform_zeroize(mac16, sizeof mac16);
     return ret;
 }

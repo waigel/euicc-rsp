@@ -4,10 +4,15 @@
  * The card side -- the transport abstraction, the ES10 command layer, and
  * the read-only card commands -- now lives in euicc-lpa (lpa.h), not here.
  *
- * No card accepts the BPP rsp_bpp_build produces yet: '87'/'88' groups are
- * placed unprotected, transactionId is a fixed placeholder, hostId is the
- * ICCID rather than the eUICC's EID, and smdpSign is empty. See the comment
- * on rsp_bpp_input_t below for the full account of each gap.
+ * The BPP rsp_bpp_build produces now carries everything SGP.22 v2.6
+ * section 2.5.4's Table 4 requires for a card to accept it: '87'
+ * (ConfigureISDP) is encrypted-and-MAC'd, '88' (StoreMetadata) is MAC'd,
+ * transactionId/hostId/smdpSign in InitialiseSecureChannelRequest are real
+ * values rather than placeholders. See the comment on rsp_bpp_input_t
+ * below for what genuinely remains unimplemented (Profile Protection Keys/
+ * random-key mode, multi-segment '88', a handful of OPTIONAL profile
+ * metadata fields) -- each still spec-conformant on its own, none of them
+ * blocking a card from accepting a BPP that does not need them.
  */
 #ifndef RSP_H
 #define RSP_H
@@ -160,35 +165,78 @@ void rsp_session_wipe(rsp_session_t *s);
  * "Otherwise the MAC chaining method SHALL be applied (i.e. the MAC
  * chaining value of the previous command TLV SHALL be used)").
  *
- * A "segment" here is exactly one SCP03t tag-'86' data segment, as SGP.22
- * section 2.5.3 names it ("Each data segment of the PPP is identified by
- * the tag '86' as defined in SGP.02"). rsp_protect returns the segment's
- * value bytes only (ciphertext, then the 8-byte C-MAC) -- the tag and its
- * BER length octets are not written to *out*, because whoever assembles
- * the BoundProfilePackage's [6] IMPLICIT OCTET STRING (Task 2's generated
- * codec) reproduces them from the DER encoding rules; but per GlobalPlatform
+ * A "segment" here is one SCP03t data segment: a tag-'86' segment of the
+ * PPP itself (SGP.22 section 2.5.3: "Each data segment of the PPP is
+ * identified by the tag '86' as defined in SGP.02"), or a tag-'87' segment
+ * carrying ConfigureISDP or the (unimplemented, see rsp_bpp_input_t below)
+ * Profile Protection Keys -- section 2.5.4's Table 4 protects both with the
+ * identical construction ("protected with session keys ... (S-ENC,
+ * S-CMAC)"), differing only in which tag is folded into the MAC, which is
+ * why tag is now a parameter here instead of a constant this function
+ * hard-codes. Tag '88' (StoreMetadata) is a different, narrower
+ * construction -- MAC only, never encrypted -- and has its own function,
+ * rsp_protect_mac_only, below.
+ *
+ * rsp_protect returns the segment's value bytes only (ciphertext, then the
+ * 8-byte C-MAC) -- the tag and its BER length octets are not written to
+ * *out*, because whoever assembles the enclosing TLV (src/rsp_bpp.c)
+ * reproduces them from the DER encoding rules; but per GlobalPlatform
  * Amendment D section 6.2.4 / SGP.02 Figure 46, those bytes ARE part of what
  * gets MACed, so rsp_protect and rsp_unprotect compute them internally
- * (tag 0x86, DER-minimal-length of the ciphertext-plus-MAC) purely to feed
- * the MAC input -- see src/rsp_crypto.c for the exact construction and its
- * citations. */
+ * (the given tag, DER-minimal-length of the ciphertext-plus-MAC) purely to
+ * feed the MAC input -- see src/rsp_crypto.c for the exact construction and
+ * its citations, including what section 2.5.4's own "the encryption
+ * counter for ICV calculation is incremented each time a TLV with tag '86',
+ * '87' or '88' is received" means for s->chain across all three tags. */
 
-/* Protect one ES8+ command into one SCP03t segment. Advances s->chain.
-   Returns the number of bytes written to out, or -1. */
+/* Protect one ES8+ command into one SCP03t segment, encrypted and MAC'd
+   (tag '86' or '87' -- see the comment above). Advances s->chain. Returns
+   the number of bytes written to out, or -1. */
 long rsp_protect(rsp_session_t *s, const uint8_t *plain, size_t plain_len,
-                 uint8_t *out, size_t out_cap);
+                 uint8_t tag, uint8_t *out, size_t out_cap);
 
-/* The inverse, for the round trip and for the self-check before sending.
-   Advances s->chain the same way. Returns bytes written on success. -1
-   means the question was actually asked and the answer is no: the MAC
-   does not match, or the decrypted padding is not valid SCP03t padding
-   (which only happens once the MAC has already matched, so this is still
-   a real answer about the segment's content, not an operational failure).
-   -2 means the question was never reached: a null argument, a seg_len
-   that cannot hold a valid segment, out_cap too small for the recovered
-   plaintext, or an allocation/crypto-primitive failure. */
+/* The '88' construction (StoreMetadata): MAC'd only, never encrypted --
+   *out* is plain_len bytes of plain, unchanged, followed by the 8-byte
+   MAC, recoverable by a caller with no decryption step at all. Advances
+   s->chain from the same rule rsp_protect's own C-MAC output does (see
+   src/rsp_crypto.c's own comment on why '88' must still advance it, even
+   though it has no ICV/encryption step of its own). Returns the number of
+   bytes written to out, or -1. */
+long rsp_protect_mac_only(rsp_session_t *s, const uint8_t *plain,
+                          size_t plain_len, uint8_t tag,
+                          uint8_t *out, size_t out_cap);
+
+/* The inverse of rsp_protect (tag '86' or '87'), for the round trip and for
+   the self-check before sending. rsp_bpp_recover uses this on the single
+   '87' element it must now verify and un-advance-in-step-with (TAG_87_
+   ELEMENT), as well as on every '86' segment (TAG_86_ELEMENT) -- see this
+   file's own rsp_bpp_input_t comment and src/rsp_crypto.c's SCP03t comment
+   for why '87' must be verified, not merely skipped, once it is genuinely
+   protected. Advances s->chain the same way. Returns bytes written on
+   success. -1 means the question was actually asked and the answer is no:
+   the MAC does not match, or the decrypted padding is not valid SCP03t
+   padding (which only happens once the MAC has already matched, so this is
+   still a real answer about the segment's content, not an operational
+   failure). -2 means the question was never reached: a null argument, a
+   seg_len that cannot hold a valid segment, out_cap too small for the
+   recovered plaintext, or an allocation/crypto-primitive failure. */
 long rsp_unprotect(rsp_session_t *s, const uint8_t *seg, size_t seg_len,
-                   uint8_t *out, size_t out_cap);
+                   uint8_t tag, uint8_t *out, size_t out_cap);
+
+/* The inverse of rsp_protect_mac_only ('88'): verifies the MAC (no
+   decryption step -- there is nothing encrypted) and, if it matches,
+   copies plain_len bytes of plaintext to *out and advances s->chain from
+   the full CMAC output, exactly the way rsp_unprotect's own does for '86'/
+   '87'. rsp_bpp_recover uses this on every '88' element for the same
+   chain-synchronization reason it now verifies '87' instead of skipping
+   it. Returns plain_len on success. -1 means the question was actually
+   asked and the answer is no: the MAC does not match. -2 means the
+   question was never reached: a null argument, a seg_len too short to even
+   hold a MAC, out_cap too small for plain_len, or an allocation/crypto-
+   primitive failure. */
+long rsp_unprotect_mac_only(rsp_session_t *s, const uint8_t *seg,
+                            size_t seg_len, uint8_t tag,
+                            uint8_t *out, size_t out_cap);
 
 /* AES-CMAC over one block chain, exposed because it has published vectors
  * and therefore deserves its own test. Returns 0 or -1. */
@@ -217,27 +265,52 @@ int rsp_cmac(const uint8_t key[16], const uint8_t *msg, size_t len,
  * and StoreMetadataRequest ARE plain SEQUENCEs and unaffected, so those
  * three are still built with Task 2's generated types.
  *
- * Two more scope cuts, beyond the hand-rolled envelope:
+ * ConfigureISDP ('87') and StoreMetadata ('88') are now protected exactly
+ * as SGP.22 v2.6 Table 4 requires -- '87' encrypted-and-MAC'd with
+ * rsp_protect (the same construction as '86', a different tag), '88'
+ * MAC'd only with rsp_protect_mac_only -- both advancing s->chain in wire
+ * order before the sequenceOf86 loop runs, so a card's own chaining stays
+ * in step with this library's (see src/rsp_crypto.c's SCP03t comment for
+ * why skipping that for '88', or keeping a separate chain per tag, would
+ * silently desynchronize every '86' segment's MAC from that point on).
+ * InitialiseSecureChannelRequest's own fields are now real: transactionId
+ * is in->transaction_id (16 bytes, the same value the caller's RSP session
+ * generated); controlRefTemplate.hostId is RSP_HOST_ID (src/rsp_internal.h)
+ * -- NOT the eUICC's EID, and NOT in->iccid either; both were tried and
+ * are documented, in RSP_HOST_ID's own comment, as wrong for this field --
+ * and smdpSign is a real ECDSA signature (section 5.5.1: SK.DPbp.ECDSA
+ * over remoteOpId || transactionId || controlRefTemplate || smdpOtpk ||
+ * euiccOtpk, each as its own encoded TLV, concatenated -- see
+ * src/rsp_bpp.c's build_isc for the construction and the working
+ * reference implementation it was checked against), computed with the
+ * DPpb credential the caller supplies via in->dppb.
  *
- *   - ConfigureISDP ('87') and StoreMetadata ('88') are placed in the
- *     BPP UNPROTECTED -- their own DER-encoded TLV, with no SCP03t
- *     encryption or MAC at all. rsp_protect/rsp_unprotect above only
- *     implement the '86' construction (see their own comment); a real
- *     card requires '87' encrypted-and-MAC'd and '88' MAC'd, and will
- *     refuse a BPP built by rsp_bpp_build. That protection is a
- *     different, narrower construction than '86' and is left to
- *     whichever task first talks to a card.
- *   - Several InitialiseSecureChannelRequest fields have no source in
- *     rsp_bpp_input_t and are filled with fixed placeholders, not real
- *     values: transactionId is the single byte 0x01; controlRefTemplate.
- *     hostId reuses the 10-byte ICCID, which is NOT the correct field --
- *     the real hostId is the eUICC's EID, absent from this input struct;
- *     smdpSign is a zero-length OCTET STRING (wire bytes '5F 37 00'),
- *     left empty rather than filled with same-length filler so it cannot
- *     be mistaken for a real signature -- no ECDSA signing primitive
- *     over arbitrary data exists in this header. A BPP built this way is
- *     not ready for a real ES9+/ES8+ exchange until whichever task wires
- *     that flow supplies transactionId, the EID and a real signature.
+ * What is still not implemented, and why each is a real gap rather than
+ * an oversight:
+ *
+ *   - secondSequenceOf87 (the OPTIONAL Profile Protection Keys /
+ *     ReplaceSessionKeys group, "random key" mode) is never emitted --
+ *     unchanged from before this task, and explicitly out of scope for
+ *     it (see the task brief): this library only supports session-key
+ *     mode. DER omits an absent OPTIONAL field, so this is spec-
+ *     conformant, not a placeholder.
+ *   - '88' (StoreMetadata) is only ever written as a single TLV.
+ *     Table 4 allows a second '88' "if one '88' TLV is not able to
+ *     contain the whole data structure"; rsp_bpp_build instead refuses
+ *     (-1) a StoreMetadataRequest encoding that would not fit in one
+ *     segment (RSP_BPP_MAX_SEGMENT_PLAINTEXT, src/rsp_bpp.c), rather than
+ *     splitting it -- a real caller with a large enough icon or profile
+ *     name would hit this. The same is true of ConfigureISDP's single
+ *     '87' TLV, though Table 4 does not describe a remainder form for it
+ *     at all, so refusing an oversized one is the only conformant choice
+ *     there.
+ *   - ConfigureISDPRequest.dpProprietaryData and several
+ *     StoreMetadataRequest fields (iconType, icon,
+ *     notificationConfigurationInfo, profileOwner, profilePolicyRules)
+ *     are OPTIONAL and rsp_bpp_input_t has no source for any of them, so
+ *     they are always left absent -- unrelated to this task, unchanged
+ *     from before it, and each still spec-conformant since every one of
+ *     them is OPTIONAL.
  *
  * rsp_bpp_build's own length encoder refuses a UPP whose encoded
  * sequenceOf86 or outer content would need a DER length field longer
@@ -248,10 +321,20 @@ int rsp_cmac(const uint8_t key[16], const uint8_t *msg, size_t len,
 typedef struct {
     const uint8_t *upp;        /* the profile package, DER */
     size_t         upp_len;
-    const uint8_t *otpk_dp;    /* our one-time public key, 65 bytes */
+    const uint8_t *otpk_dp;    /* our one-time public key, otPK.DP.ECKA, 65 bytes */
     const uint8_t *iccid;      /* 10 bytes */
     const char    *profile_name;
     const char    *service_provider_name;
+    const uint8_t *transaction_id; /* 16 bytes; InitialiseSecureChannelRequest.transactionId */
+    const uint8_t *euicc_otpk; /* otPK.EUICC.ECKA, 65 bytes; part of what
+                                   smdpSign covers (section 5.5.1) -- the
+                                   same value already used to derive the
+                                   session this call protects segments
+                                   with, so the caller already has it. */
+    const rsp_credential_t *dppb; /* CERT.DPpb.ECDSA + SK.DPbp.ECDSA; smdpSign
+                                      is signed with this, never DPauth (see
+                                      src/rsp_es9.c's own top comment on why
+                                      the two must never be confused). */
 } rsp_bpp_input_t;
 
 /* Build the BPP. *out is malloc'ed and belongs to the caller. The session is

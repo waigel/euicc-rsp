@@ -67,8 +67,13 @@
  * AuthenticateClient has run: verify euiccSignature2 against the
  * PK.EUICC.ECDSA already attached to *s, derive the SCP03t session keys
  * (rsp_session_init) over Annex G's SharedInfo, and hand the result to
- * rsp_bpp_build (already implemented, unmodified) together with the
- * otPK.DP.ECKA this file derives from otsk_dp. *bpp and *bpp_len are exactly
+ * rsp_bpp_build together with the otPK.DP.ECKA this file derives from
+ * otsk_dp, its own otPK.EUICC.ECKA (rok->euiccSigned2.euiccOtpk -- the same
+ * value just used to derive the session, now also part of what
+ * rsp_bpp_build's own smdpSign covers, section 5.5.1), s->transaction_id,
+ * and a freshly-loaded DPpb credential (rsp_pki_dp(1, ...), loaded and
+ * freed in this function, not DPauth -- see this file's own top comment on
+ * why the two must never be confused). *bpp and *bpp_len are exactly
  * rsp_bpp_build's own raw BoundProfilePackage bytes -- not wrapped in a
  * GetBoundProfilePackageOk/[58] envelope, for the same reason rsp_bpp_
  * build's own output is not wrapped in one either (see include/rsp.h: the
@@ -917,10 +922,16 @@ int rsp_dp_get_bound_profile_package(rsp_dp_session_t *s,
     size_t shared_info_len = 0;
     uint8_t *es2_der = NULL;
     size_t es2_der_len = 0;
+    rsp_credential_t dppb; /* smdpSign (section 5.5.1), inside rsp_bpp_build's
+                               own build_isc -- DPpb, never DPauth, the same
+                               distinction rsp_dp_authenticate_client's own
+                               top comment already makes for smdpSignature2. */
+    int have_dppb = 0;
     int ret = -2;
 
     memset(&resp, 0, sizeof resp);
     memset(&session, 0, sizeof session);
+    memset(&dppb, 0, sizeof dppb);
 
     if (!s || !prepare_download_resp || resp_len == 0 ||
         !upp || upp_len == 0 || !otsk_dp || !bpp || !bpp_len) {
@@ -996,6 +1007,11 @@ int rsp_dp_get_bound_profile_package(rsp_dp_session_t *s,
         }
     }
 
+    if (rsp_pki_dp(1, &dppb) != 0) { /* DPpb, not DPauth -- see this file's top comment */
+        goto out;
+    }
+    have_dppb = 1;
+
     memset(&in, 0, sizeof in);
     in.upp = upp;
     in.upp_len = upp_len;
@@ -1003,6 +1019,9 @@ int rsp_dp_get_bound_profile_package(rsp_dp_session_t *s,
     in.iccid = s->iccid;
     in.profile_name = s->profile_name;
     in.service_provider_name = s->service_provider_name;
+    in.transaction_id = s->transaction_id;
+    in.euicc_otpk = resp.choice.downloadResponseOk.euiccSigned2.euiccOtpk.buf;
+    in.dppb = &dppb;
 
     if (rsp_bpp_build(&session, &in, bpp, bpp_len) != 0) {
         goto out;
@@ -1021,6 +1040,9 @@ out:
        "wipe rather than reason about whether it is needed" rule
        rsp_growbuf_free already states for itself. */
     mbedtls_platform_zeroize(&session, sizeof session);
+    if (have_dppb) {
+        rsp_credential_free(&dppb);
+    }
     free(es2_der);
     ASN_STRUCT_RESET(asn_DEF_PrepareDownloadResponse, &resp);
     return ret;

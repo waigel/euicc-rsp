@@ -43,8 +43,8 @@ int main(void) {
         rsp_session_t s1, s2;
         session(&s1); session(&s2);
 
-        long enc = rsp_protect(&s1, plain, n, seg, sizeof seg);
-        long dec = enc > 0 ? rsp_unprotect(&s2, seg, (size_t)enc, back, sizeof back) : -1;
+        long enc = rsp_protect(&s1, plain, n, 0x86, seg, sizeof seg);
+        long dec = enc > 0 ? rsp_unprotect(&s2, seg, (size_t)enc, 0x86, back, sizeof back) : -1;
 
         char what[64];
         snprintf(what, sizeof what, "%zu bytes survive protect and unprotect", n);
@@ -73,7 +73,7 @@ int main(void) {
         memset(plain, 0xA5, sizeof plain);
         rsp_session_t s1, s2;
         session(&s1); session(&s2);
-        long enc = rsp_protect(&s1, plain, sizeof plain, seg, sizeof seg);
+        long enc = rsp_protect(&s1, plain, sizeof plain, 0x86, seg, sizeof seg);
         ok("a segment was produced", enc > 0);
         seg[enc / 2] ^= 0x01;
         /* -1, not just negative, either way: the MAC covers this
@@ -86,7 +86,7 @@ int main(void) {
            real "no" about this segment's content: -1, not -2. */
         ok("a segment tampered inside the padding block is refused"
            " (padding validation, not the MAC) with -1, a real no",
-           rsp_unprotect(&s2, seg, (size_t)enc, back, sizeof back) == -1);
+           rsp_unprotect(&s2, seg, (size_t)enc, 0x86, back, sizeof back) == -1);
     }
 
     /* The MAC-only case. This plaintext is four AES blocks of real data,
@@ -107,13 +107,13 @@ int main(void) {
         for (size_t k = 0; k < sizeof plain; k++) plain[k] = (uint8_t)(k * 3 + 5);
         rsp_session_t s1, s2;
         session(&s1); session(&s2);
-        long enc = rsp_protect(&s1, plain, sizeof plain, seg, sizeof seg);
+        long enc = rsp_protect(&s1, plain, sizeof plain, 0x86, seg, sizeof seg);
         ok("a segment was produced for the MAC-only tamper case", enc > 0);
         seg[0] ^= 0x01; /* first ciphertext byte: block 0, four blocks
                             clear of the trailing padding block (block 4) */
         ok("a segment tampered outside the padding block is refused"
            " (the MAC, not padding) with -1, a real no",
-           rsp_unprotect(&s2, seg, (size_t)enc, back, sizeof back) == -1);
+           rsp_unprotect(&s2, seg, (size_t)enc, 0x86, back, sizeof back) == -1);
     }
 
     /* fix round 2, finding 2: an absurd plain_len must be rejected before
@@ -130,7 +130,7 @@ int main(void) {
         uint8_t one_byte[1] = { 0 };
         uint8_t out[16];
         ok("a plain_len near SIZE_MAX is rejected, not overflowed",
-           rsp_protect(&s, one_byte, SIZE_MAX - 1, out, sizeof out) < 0);
+           rsp_protect(&s, one_byte, SIZE_MAX - 1, 0x86, out, sizeof out) < 0);
     }
 
     /* Absolute pin on the wire bytes. Every other check in this file is an
@@ -170,8 +170,8 @@ int main(void) {
         rsp_session_t s;
         session(&s);
 
-        long n1 = rsp_protect(&s, plain, sizeof plain, seg1, sizeof seg1);
-        long n2 = rsp_protect(&s, plain, sizeof plain, seg2, sizeof seg2);
+        long n1 = rsp_protect(&s, plain, sizeof plain, 0x86, seg1, sizeof seg1);
+        long n2 = rsp_protect(&s, plain, sizeof plain, 0x86, seg2, sizeof seg2);
         ok("two segments were produced for the absolute wire pin",
            n1 == (long)sizeof want_seg1 && n2 == (long)sizeof want_seg2);
         ok("the first segment's wire bytes match this implementation's own"
@@ -199,12 +199,12 @@ int main(void) {
         memset(plain, 0x5A, sizeof plain);
         rsp_session_t s1, s2;
         session(&s1); session(&s2);
-        long enc = rsp_protect(&s1, plain, sizeof plain, seg, sizeof seg);
+        long enc = rsp_protect(&s1, plain, sizeof plain, 0x86, seg, sizeof seg);
         ok("a segment was produced for the MAC-last-byte case", enc > 0);
         seg[enc - 1] ^= 0x01; /* only the MAC's last byte */
         ok("a segment with only the MAC's last byte corrupted is refused"
            " with -1, a real no",
-           rsp_unprotect(&s2, seg, (size_t)enc, back, sizeof back) == -1);
+           rsp_unprotect(&s2, seg, (size_t)enc, 0x86, back, sizeof back) == -1);
     }
 
     /* -2, not -1: seg_len too small to even hold a MAC is a malformed
@@ -218,7 +218,104 @@ int main(void) {
         uint8_t back[16];
         ok("a segment too short to hold a MAC answers -2, not -1"
            " (include/rsp.h's failure convention)",
-           rsp_unprotect(&s, seg, sizeof seg, back, sizeof back) == -2);
+           rsp_unprotect(&s, seg, sizeof seg, 0x86, back, sizeof back) == -2);
+    }
+
+    /* rsp_protect_mac_only: Table 4's '88' construction, MAC only, never
+       encrypted. Two things to prove: the plaintext is recoverable with
+       nothing more than "read plain_len bytes, then check the MAC" -- no
+       decryption step of any kind -- and the MAC itself covers the tag
+       and length octets, not just the plaintext bytes (rule 3:
+       CMAC(S-MAC, chain || tag || Lcc || data), src/rsp_crypto.c's own
+       comment). The second half is checked by independently recomputing
+       that same CMAC by hand, at this test's own level, from the session's
+       known initial chain, the '88' tag, and the DER-minimal length octet
+       for (plain_len + 8) -- not by re-deriving what
+       rsp_protect_mac_only's own internals would compute (which would
+       prove nothing), but by building the MAC input from the rule as
+       stated, independently. */
+    {
+        uint8_t plain[20];
+        uint8_t out[32];
+        uint8_t manual_mac_input[16 + 1 + 1 + 20];
+        uint8_t manual_mac[16];
+        rsp_session_t s;
+        long n;
+
+        for (size_t k = 0; k < sizeof plain; k++) {
+            plain[k] = (uint8_t)(k * 5 + 3);
+        }
+        session(&s);
+
+        /* chain || '88' || Lcc || plain. Lcc is the single DER length
+           octet for sizeof(plain)+8 = 28, which is < 0x80 -- the short
+           form, one byte, 0x1C -- so this hand-built input does not need
+           rsp_der_length_octets to reproduce it. */
+        memcpy(manual_mac_input, s.chain, 16);
+        manual_mac_input[16] = 0x88;
+        manual_mac_input[17] = (uint8_t)(sizeof plain + 8);
+        memcpy(manual_mac_input + 18, plain, sizeof plain);
+
+        ok("the reference CMAC over the hand-built MAC input computes",
+           rsp_cmac(s.s_mac, manual_mac_input, sizeof manual_mac_input,
+                    manual_mac) == 0);
+
+        n = rsp_protect_mac_only(&s, plain, sizeof plain, 0x88, out, sizeof out);
+        ok("rsp_protect_mac_only produced a segment of plain_len + 8 bytes",
+           n == (long)(sizeof plain + 8));
+
+        ok("the plaintext is recoverable with no decryption step at all --"
+           " just the first plain_len bytes of the output, unchanged",
+           n > 0 && memcmp(out, plain, sizeof plain) == 0);
+
+        ok("the appended MAC is the top 8 bytes of a CMAC that covers the"
+           " tag and length octets, not just the plaintext",
+           n > 0 && memcmp(out + sizeof plain, manual_mac, 8) == 0);
+    }
+
+    /* The chaining assertion the brief calls the one that matters: showing
+       the chain merely changed after some operation is weak, since it
+       changes on every call regardless. This is stronger: it shows the
+       chain a '86' segment ends up with depends on whatever '87' and '88'
+       segments came before it, not on '86' alone. Two sessions start from
+       the identical initial chain (session(), below); one protects a '87'
+       segment, then a '88' segment, then a '86' segment; the other
+       protects only that same '86' segment, with nothing before it. If
+       either '87' or '88' ever stopped advancing s->chain, the two
+       sessions would still agree by the time the '86' call runs, and this
+       assertion would pass when it should fail -- exactly the failure
+       Step 6 of the brief asks this test to be able to catch. */
+    {
+        rsp_session_t with_8788, alone;
+        uint8_t p87[10], p88[12], p86[14];
+        uint8_t out87[64], out88[64], out86[64];
+        uint8_t chain_with[16], chain_alone[16];
+
+        session(&with_8788);
+        session(&alone);
+        memset(p87, 0x11, sizeof p87);
+        memset(p88, 0x22, sizeof p88);
+        memset(p86, 0x33, sizeof p86);
+
+        ok("a '87' segment was protected ahead of the chaining comparison",
+           rsp_protect(&with_8788, p87, sizeof p87, 0x87, out87,
+                       sizeof out87) > 0);
+        ok("a '88' segment was protected ahead of the chaining comparison",
+           rsp_protect_mac_only(&with_8788, p88, sizeof p88, 0x88, out88,
+                                 sizeof out88) > 0);
+        ok("the '86' segment following '87' and '88' was protected",
+           rsp_protect(&with_8788, p86, sizeof p86, 0x86, out86,
+                       sizeof out86) > 0);
+        memcpy(chain_with, with_8788.chain, 16);
+
+        ok("the same '86' segment, protected alone from the same starting"
+           " chain, was protected",
+           rsp_protect(&alone, p86, sizeof p86, 0x86, out86, sizeof out86) > 0);
+        memcpy(chain_alone, alone.chain, 16);
+
+        ok("the chain after '87' then '88' then '86' differs from the chain"
+           " after '86' alone -- proving '87' and '88' both advanced it",
+           memcmp(chain_with, chain_alone, 16) != 0);
     }
     return fails ? 1 : 0;
 }
