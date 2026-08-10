@@ -297,9 +297,20 @@ static int build_store_metadata(const uint8_t iccid[10],
    arm: euiccSigned2 carries transaction_id and euicc_otpk (otPK.EUICC.ECKA),
    signed with the same EUICC_TEST_SK -- 5.6.2's "euiccSignature2 ...
    using the PK.EUICC.ECDSA attached to the ongoing RSP session" is the
-   same key AuthenticateClient already verified against. */
+   same key AuthenticateClient already verified against.
+
+   What is signed is euiccSigned2 AND smdpSignature2, concatenated:
+   "Compute the euiccSignature2 over euiccSigned2 and smdpSignature2"
+   (SGP.22 v2.6 section 3.1.3.2, step 3). smdp_signature2 is the one the
+   AuthenticateClient step actually produced, copied out of that response
+   by the caller -- a real eUICC signs over the bytes it was handed in
+   PrepareDownload, and a fixture that signed over anything else would be
+   testing a card that does not exist. It goes in as its own TLV, tag
+   '5F37' ([APPLICATION 55]), written as literals here for the same
+   reason the assertion above does. */
 static int build_prepare_download_response(
         const uint8_t transaction_id[16], const uint8_t euicc_otpk[65],
+        const uint8_t smdp_signature2[64],
         unsigned char *out, size_t cap, size_t *out_len) {
     PrepareDownloadResponse_t resp;
     PrepareDownloadResponseOk_t *rok;
@@ -326,6 +337,15 @@ static int build_prepare_download_response(
     if (r.encoded < 0) {
         goto done;
     }
+
+    if (es2_sink.len + 3 + 64 > es2_sink.cap) {
+        goto done;
+    }
+    es2_sink.p[es2_sink.len + 0] = 0x5F;
+    es2_sink.p[es2_sink.len + 1] = 0x37;
+    es2_sink.p[es2_sink.len + 2] = 64;
+    memcpy(es2_sink.p + es2_sink.len + 3, smdp_signature2, 64);
+    es2_sink.len += 3 + 64;
 
     memset(&euicc_cred, 0, sizeof euicc_cred);
     memcpy(euicc_cred.sk, EUICC_TEST_SK, sizeof euicc_cred.sk);
@@ -499,6 +519,13 @@ int main(void) {
         size_t asr_len = 0;
         uint8_t *ac_out = NULL;
         size_t ac_out_len = 0;
+        /* smdpSignature2, copied out of the AuthenticateClient response
+           while it still exists: ac_out is freed further down, and the
+           PrepareDownloadResponse fixture built after that has to sign
+           over these exact bytes (SGP.22 v2.6 section 3.1.3.2 step 3,
+           "over euiccSigned2 and smdpSignature2"). */
+        uint8_t smdp_sig2[64];
+        int have_smdp_sig2 = 0;
 
         ok("a fixture StoreMetadataRequest encodes",
            build_store_metadata(iccid, "euicc-rsp test profile",
@@ -548,12 +575,33 @@ int main(void) {
                     ok("smdpSignature2 is 64 bytes (plain r||s, not DER)",
                        aco->smdpSignature2.size == 64);
 
-                    /* smdpSignature2 applies over smdpSigned2's own DER
-                       encoding, and MUST verify against CERT.DPpb --
-                       never CERT.DPauth, the mistake the brief calls out
-                       as most worth catching (DPauth already signed
+                    if (aco->smdpSignature2.size == 64) {
+                        memcpy(smdp_sig2, aco->smdpSignature2.buf, 64);
+                        have_smdp_sig2 = 1;
+                    }
+
+                    /* smdpSignature2 applies over smdpSigned2 AND the
+                       eUICC's own euiccSignature1, concatenated (SGP.22
+                       v2.6 section 3.1.3, step 5) -- not over smdpSigned2
+                       alone, which is what this assertion used to pin and
+                       what a real eUICC answered PrepareDownload's
+                       invalidSignature(2) to.
+                       euiccSignature1 goes in as its own TLV, tag '5F37'
+                       ([APPLICATION 55]); the two literal tag bytes are
+                       written out here rather than taken from the
+                       implementation, so a test borrowing the same
+                       constant cannot agree with it by construction.
+
+                       And it MUST verify against CERT.DPpb -- never
+                       CERT.DPauth, the mistake the brief calls out as
+                       most worth catching (DPauth already signed
                        InitiateAuthentication's serverSigned1; a
-                       different key for a different purpose). */
+                       different key for a different purpose).
+
+                       euiccSignature1 is read back out of the very
+                       fixture this call consumed (asr_buf), not
+                       recomputed here: the point is that the SM-DP+
+                       signed over what the eUICC actually sent. */
                     {
                         unsigned char sd2_buf[512];
                         struct sink s = { sd2_buf, 0, sizeof sd2_buf };
@@ -562,6 +610,34 @@ int main(void) {
                                 collect, &s);
                         ok("the decoded smdpSigned2 re-encodes",
                            r.encoded >= 0);
+
+                        AuthenticateServerResponse_t *asr_back = NULL;
+                        asn_dec_rval_t ar = ber_decode(
+                                NULL, &asn_DEF_AuthenticateServerResponse,
+                                (void **)&asr_back, asr_buf, asr_len);
+                        int have_es1 =
+                            ar.code == RC_OK && asr_back &&
+                            asr_back->present ==
+                                AuthenticateServerResponse_PR_authenticateResponseOk &&
+                            asr_back->choice.authenticateResponseOk
+                                .euiccSignature1.size == 64;
+                        ok("the fixture's own euiccSignature1 is recoverable",
+                           have_es1);
+
+                        if (have_es1 && r.encoded >= 0 &&
+                            s.len + 3 + 64 <= s.cap) {
+                            s.p[s.len + 0] = 0x5F;
+                            s.p[s.len + 1] = 0x37;
+                            s.p[s.len + 2] = 64;
+                            memcpy(s.p + s.len + 3,
+                                   asr_back->choice.authenticateResponseOk
+                                       .euiccSignature1.buf, 64);
+                            s.len += 3 + 64;
+                        }
+                        if (asr_back) {
+                            ASN_STRUCT_FREE(asn_DEF_AuthenticateServerResponse,
+                                            asr_back);
+                        }
 
                         rsp_credential_t dppb, dpauth;
                         memset(&dppb, 0, sizeof dppb);
@@ -796,9 +872,12 @@ int main(void) {
             size_t bpp_len = 0;
             int bpp_rc;
 
+            ok("the AuthenticateClient step yielded an smdpSignature2 to "
+               "chain euiccSignature2 onto", have_smdp_sig2);
             ok("a fixture PrepareDownloadResponse encodes",
+               have_smdp_sig2 &&
                build_prepare_download_response(
-                       transaction_id, euicc_otpk,
+                       transaction_id, euicc_otpk, smdp_sig2,
                        pdr_buf, sizeof pdr_buf, &pdr_len) == 0);
 
             bpp_rc = rsp_dp_get_bound_profile_package(

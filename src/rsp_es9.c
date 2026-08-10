@@ -227,6 +227,17 @@ struct rsp_dp_session {
     char profile_name[65];
     char service_provider_name[33];
 
+    /* smdpSignature2 exactly as this session's own AuthenticateClient
+       produced it. The eUICC computes euiccSignature2 "over euiccSigned2
+       and smdpSignature2" (SGP.22 v2.6 section 3.1.3.2's own procedure
+       text, step 3), so verifying it in rsp_dp_get_bound_profile_package
+       needs these 64 bytes back -- and they cannot be recomputed there:
+       rsp_sign is deterministic, but smdpSigned2's own encoding is not
+       kept, and re-deriving it would be a second construction that could
+       drift from the one actually sent. Valid only while `authenticated`
+       is set. Not secret -- it crossed the wire in the clear. */
+    uint8_t smdp_signature2[64];
+
     /* Set once rsp_dp_get_bound_profile_package succeeds. Secret. */
     int have_bpp_session;
     rsp_session_t bpp_session;
@@ -725,10 +736,46 @@ int rsp_dp_authenticate_client(rsp_dp_session_t *s,
     {
         uint8_t *sd2_der = NULL;
         size_t sd2_der_len = 0;
+        uint8_t *tbs = NULL;
+        size_t tbs_len = 0;
         int enc_rc = der_encode_alloc(
                 &asn_DEF_SmdpSigned2,
                 &ok_resp.choice.authenticateClientOk.smdpSigned2,
                 &sd2_der, &sd2_der_len);
+        /* smdpSignature2 covers smdpSigned2 AND the eUICC's own
+           euiccSignature1 from the AuthenticateServer response just
+           verified above -- "Compute the smdpSignature2 over smdpSigned2
+           and euiccSignature1 using the SK.DPpb.ECDSA" (SGP.22 v2.6
+           section 3.1.3, step 5; 5.6.3's own function description does
+           not restate it, which is how signing smdpSigned2 alone survived
+           here for as long as it did). A real eUICC answers PrepareDownload
+           with downloadErrorCode invalidSignature(2) to the shorter
+           version, and the concatenation is not a formality: it is the
+           signature chaining that stops one party's message or signature
+           being lifted out and replayed under the other's.
+
+           euiccSignature1 goes in as its own encoded TLV, tag '5F37'
+           ([APPLICATION 55], rsp-2.5.asn's own annotation on the field) --
+           the same "each as its own encoded TLV" convention section 5.5.1
+           uses for smdpSign, see src/rsp_bpp.c's build_isc_tbs. Its length
+           is 64 and its short-form length octet is therefore a constant:
+           the euiccSignature1.size != 64 check further up has already
+           refused anything else before this point is reached. */
+        if (enc_rc == 0) {
+            const OCTET_STRING_t *es1 =
+                &resp.choice.authenticateResponseOk.euiccSignature1;
+            tbs_len = sd2_der_len + 3 + 64;
+            tbs = malloc(tbs_len);
+            if (!tbs) {
+                enc_rc = -1;
+            } else {
+                memcpy(tbs, sd2_der, sd2_der_len);
+                tbs[sd2_der_len + 0] = 0x5F;
+                tbs[sd2_der_len + 1] = 0x37;
+                tbs[sd2_der_len + 2] = 64;
+                memcpy(tbs + sd2_der_len + 3, es1->buf, 64);
+            }
+        }
         if (enc_rc == 0) {
             /* DPpb, not DPauth: smdpSigned2/smdpSignature2 bind the
                Profile Package (SGP.22 v2.6 section 2.6.4 -- "the SM-DP+
@@ -742,9 +789,10 @@ int rsp_dp_authenticate_client(rsp_dp_session_t *s,
         }
         if (enc_rc == 0) {
             have_dppb = 1;
-            enc_rc = rsp_sign(&dppb, sd2_der, sd2_der_len, sig);
+            enc_rc = rsp_sign(&dppb, tbs, tbs_len, sig);
         }
         free(sd2_der);
+        free(tbs);
         if (enc_rc != 0) {
             goto out;
         }
@@ -795,6 +843,14 @@ int rsp_dp_authenticate_client(rsp_dp_session_t *s,
         memcpy(s->service_provider_name, md_tmp.serviceProviderName.buf,
                md_tmp.serviceProviderName.size);
         s->service_provider_name[md_tmp.serviceProviderName.size] = '\0';
+
+        /* sig still holds smdpSignature2 from the signing block above --
+           what the eUICC will fold into euiccSignature2, and what
+           rsp_dp_get_bound_profile_package therefore has to verify over.
+           Stashed here, with the rest of this function's success state,
+           so a failure leaves *s untouched as this function's contract
+           in rsp.h promises. */
+        memcpy(s->smdp_signature2, sig, sizeof s->smdp_signature2);
 
         s->authenticated = 1;
     }
@@ -968,8 +1024,23 @@ int rsp_dp_get_bound_profile_package(rsp_dp_session_t *s,
         }
 
         /* 5.6.2: "Verify the eUICC signature (euiccSignature2) using the
-           PK.EUICC.ECDSA attached to the ongoing RSP session" --
-           attached by rsp_dp_authenticate_client, above. */
+           PK.EUICC.ECDSA attached to the ongoing RSP session" -- attached
+           by rsp_dp_authenticate_client, above.
+
+           That bullet says which key; the procedure text says over what,
+           and it is not euiccSigned2 alone: "the SM-DP+ SHALL verify the
+           euiccSignature2 performed over euiccSigned2 and
+           smdpSignature2" (3.1.3.2, step 6; the eUICC's own side of it is
+           step 3, "Compute the euiccSignature2 over euiccSigned2 and
+           smdpSignature2"). Verifying over euiccSigned2 alone rejects
+           every signature a conformant eUICC produces -- the mirror image
+           of the smdpSignature2 construction in rsp_dp_authenticate_
+           client, and the same signature chaining: each side signs the
+           other's last signature, so neither message can be lifted out
+           and replayed against a different one.
+
+           smdpSignature2 goes in as its own TLV, tag '5F37'
+           ([APPLICATION 55]), the same convention used there. */
         if (der_encode_alloc(&asn_DEF_EUICCSigned2, &rok->euiccSigned2,
                               &es2_der, &es2_der_len) != 0) {
             goto out;
@@ -978,9 +1049,22 @@ int rsp_dp_get_bound_profile_package(rsp_dp_session_t *s,
             goto out;
         }
         {
-            int vr = rsp_sign_verify(s->euicc_cert_der, s->euicc_cert_der_len,
-                                      es2_der, es2_der_len,
-                                      rok->euiccSignature2.buf);
+            size_t tbs_len = es2_der_len + 3 + 64;
+            uint8_t *tbs = malloc(tbs_len);
+            int vr;
+            if (!tbs) {
+                goto out;
+            }
+            memcpy(tbs, es2_der, es2_der_len);
+            tbs[es2_der_len + 0] = 0x5F;
+            tbs[es2_der_len + 1] = 0x37;
+            tbs[es2_der_len + 2] = 64;
+            memcpy(tbs + es2_der_len + 3, s->smdp_signature2, 64);
+
+            vr = rsp_sign_verify(s->euicc_cert_der, s->euicc_cert_der_len,
+                                  tbs, tbs_len,
+                                  rok->euiccSignature2.buf);
+            free(tbs);
             if (vr != 0) {
                 ret = (vr == -1) ? -1 : -2;
                 goto out;
