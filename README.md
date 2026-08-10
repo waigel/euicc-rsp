@@ -1,15 +1,36 @@
 # euicc-rsp
 
-The SM-DP+ role of SGP.22, as a C library. It builds a Bound Profile Package
-for one eUICC. It is not a server: no HTTPS, no ES2+, no SM-DS, no activation
-code. [euicc-tools](https://github.com/waigel/euicc-tools) is the command
-that uses it.
+The SM-DP+ role of SGP.22, as a C library. It runs an RSP session's server
+side -- `InitiateAuthentication`, `AuthenticateClient`,
+`GetBoundProfilePackage` -- and builds the Bound Profile Package the last of
+those hands back. It is not a server: no HTTPS, no ES2+, no SM-DS, no
+activation code, and no Profile order database, so the caller supplies the
+Profile metadata this library has nowhere to look it up from.
+[euicc-tools](https://github.com/waigel/euicc-tools) is the command that
+uses it.
 
-**No card accepts the BPP this library builds today.** `'87'`/`'88'` groups
-go in unprotected, `transactionId` is a fixed placeholder byte, `hostId` is
-the ICCID instead of the eUICC's EID, and `smdpSign` is empty -- see
-[`include/rsp.h`](include/rsp.h)'s comment on `rsp_bpp_input_t` for the full
-list and why each one is still open.
+The BPP now carries everything SGP.22 v2.6 section 2.5.4's Table 4 requires
+for a card to accept it: `'87'` encrypted and MAC'd, `'88'` MAC'd, and real
+`transactionId`, `hostId` and `smdpSign` where placeholders used to be. That
+is a conformance claim, checked against Table 4 and against this library's
+own recovery of what it built -- not a card's answer. No eUICC in this
+repository accepts anything, because the card side is not in this
+repository.
+
+What is still open is narrower, and each piece is spec-conformant on its
+own: the Profile Protection Keys ("random key") mode, a `'88'` too large for
+one segment, and a handful of OPTIONAL metadata fields --
+[`include/rsp.h`](include/rsp.h)'s comment on `rsp_bpp_input_t` has the full
+list and why each one is still open. One more sits a level up, in ES9+
+rather than in the BPP: `serverAddress` has no parameter that could carry a
+real value yet, so an `.invalid` placeholder is genuinely signed in its
+place (see [`src/rsp_es9.c`](src/rsp_es9.c)).
+
+The session also stops where the download does. Of ES9+'s five functions,
+the three above are implemented; `HandleNotification` and `CancelSession`
+are not, so nothing here verifies a `ProfileInstallationResult`. This
+library can bind a Profile to an eUICC, and cannot yet learn whether the
+eUICC installed it.
 
 | Repository | Role |
 | --- | --- |
