@@ -125,9 +125,18 @@ PKIX_SOURCES := \
 	$(PKIX_DIR)/rfc3280-PKIX1Explicit88.asn1 \
 	$(PKIX_DIR)/rfc3280-PKIX1Implicit88.asn1
 
+# -fwide-types is load-bearing, not a preference. asn1c's default C type for
+# an unconstrained INTEGER is "long", which holds eight octets; RFC 5280
+# section 4.1.2.2 lets a certificate serial number run to twenty, and real
+# eUICC certificates use more than eight. Without this flag ber_decode fails
+# outright on such a certificate, and so on every structure that carries one
+# -- AuthenticateResponseOk's euiccCertificate and eumCertificate, which is
+# to say every ES9+ session with a real card. The flag turns those into
+# INTEGER_t (arbitrary precision) instead. tests/test_codec.c pins it with
+# this project's own test CI, whose serial needs nine octets.
 $(DIST)/BoundProfilePackage.h: $(RSP_ASN) $(PKIX_SOURCES)
 	mkdir -p $(DIST)
-	$(ASN1C) -S $(SKELDIR) -pdu=auto -fcompound-names -D $(DIST) $(RSP_ASN) $(PKIX_SOURCES)
+	$(ASN1C) -S $(SKELDIR) -pdu=auto -fcompound-names -fwide-types -D $(DIST) $(RSP_ASN) $(PKIX_SOURCES)
 
 # Generated code is compiled with warnings off. It is not ours to correct.
 # -idirafter, never -I: the PKIX types generate a Time.h that would hide the

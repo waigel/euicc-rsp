@@ -205,7 +205,16 @@ int main(void) {
                agrees with it by construction and would not have caught
                these two being swapped, which is exactly what happened on
                the first attempt at this assertion. */
-            uint8_t remote_op = (uint8_t)r->remoteOpId;
+            /* A cast until the codec started being generated with
+               -fwide-types (see the Makefile's codec rule): RemoteOpId is
+               an INTEGER_t now, so the value comes back out through
+               asn_INTEGER2long. Still the decoded field rather than the
+               implementation's constant, which is the whole point of the
+               note above. */
+            long remote_op_v = -1;
+            ok("remoteOpId reads back as an integer",
+               asn_INTEGER2long(&r->remoteOpId, &remote_op_v) == 0);
+            uint8_t remote_op = (uint8_t)remote_op_v;
             n += put_short_tlv(tbs + n, 0x82, &remote_op, 1);
             n += put_short_tlv(tbs + n, 0x80, r->transactionId.buf,
                                (size_t)r->transactionId.size);

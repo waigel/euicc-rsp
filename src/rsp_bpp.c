@@ -396,7 +396,16 @@ static int build_isc(InitialiseSecureChannelRequest_t *isc,
     memset(isc, 0, sizeof *isc);
     memset(&tbs, 0, sizeof tbs);
 
-    isc->remoteOpId = RemoteOpId_installBoundProfilePackage;
+    /* An assignment until the codec started being generated with
+       -fwide-types (see the Makefile's codec rule for why it has to be):
+       RemoteOpId is an unconstrained INTEGER, so it is an INTEGER_t now,
+       not a long, and it allocates. The unconditional ASN_STRUCT_RESET
+       in this function's caller already covers it, for the same reason
+       it covers the OCTET STRINGs below. */
+    if (asn_long2INTEGER(&isc->remoteOpId,
+                          RemoteOpId_installBoundProfilePackage) != 0) {
+        goto out;
+    }
 
     if (OCTET_STRING_fromBuf(&isc->transactionId,
                               (const char *)in->transaction_id, 16) != 0) {
