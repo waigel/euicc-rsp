@@ -39,6 +39,9 @@
 #include "rsp.h"
 #include "rsp_internal.h"
 
+#include "ber_tlv_length.h"
+#include "ber_tlv_tag.h"
+
 #include "AuthenticateClientOk.h"
 #include "AuthenticateClientResponseEs9.h"
 #include "AuthenticateServerResponse.h"
@@ -1109,6 +1112,95 @@ int main(void) {
             ok("...and is refused with -1, though its signature is genuine",
                rsp_dp_verify_installation_result(sess, other, other_len,
                                                   &inst, NULL, NULL) == -1);
+        }
+
+        /* The fidelity case, and the reason this function slices the
+           signed bytes out of what arrived instead of re-encoding them.
+
+           SGP.22 v2.6 section 2.5.6 puts the signature "across the data
+           object ProfileInstallationResultData (tag 'BF 27')" -- those
+           bytes. BER permits a non-minimal length octet where a shorter
+           one would do, ber_decode accepts it, and der_encode normalizes
+           it away. So a report encoded that way, with a signature
+           genuinely computed over it, is one a re-encoding verifier
+           rejects and a slicing one accepts. A real card sends DER and
+           would never produce it, which is exactly why it has to be
+           constructed here: the earlier, re-encoding version of this
+           function passed every other assertion in this file.
+
+           The TLVs are located rather than counted: the outer BF37 is
+           already past 128 bytes, so its own length is in long form, and
+           an earlier draft of this block that assumed short form got the
+           offsets wrong -- caught by asserting the layout instead of
+           trusting it. */
+        {
+            unsigned char ber[900];
+            size_t ber_len = 0;
+            int inst = -1;
+            ber_tlv_tag_t tg;
+            ber_tlv_len_t clen;
+            ssize_t tl, ll;
+            size_t outer_hdr = 0, dhdr = 0, dlen = 0, tail_off = 0, tail = 0;
+            int laid_out = 0;
+
+            tl = ber_fetch_tag(pir, pir_len, &tg);
+            if (tl > 0) {
+                ll = ber_fetch_length(1, pir + tl, pir_len - (size_t)tl, &clen);
+                if (ll > 0) {
+                    outer_hdr = (size_t)tl + (size_t)ll;
+                    tl = ber_fetch_tag(pir + outer_hdr, pir_len - outer_hdr, &tg);
+                    if (tl > 0) {
+                        ll = ber_fetch_length(1, pir + outer_hdr + (size_t)tl,
+                                               pir_len - outer_hdr - (size_t)tl,
+                                               &clen);
+                        if (ll > 0) {
+                            dhdr = (size_t)tl + (size_t)ll;
+                            dlen = (size_t)clen;
+                            tail_off = outer_hdr + dhdr + dlen;
+                            tail = pir_len - tail_off;
+                            laid_out = 1;
+                        }
+                    }
+                }
+            }
+            ok("the fixture's two headers parse", laid_out);
+            ok("...and the data object is BF27",
+               laid_out && pir[outer_hdr] == 0xBF && pir[outer_hdr + 1] == 0x27);
+            /* euiccSignPIR is 5F37 40 <64 bytes>. */
+            ok("...and the tail is the 67-byte euiccSignPIR TLV",
+               laid_out && tail == 67 && pir[tail_off] == 0x5F &&
+               pir[tail_off + 1] == 0x37 && pir[tail_off + 2] == 64);
+
+            if (laid_out && tail == 67 && dlen < 128) {
+                /* The same content under a two-octet long-form length:
+                   valid BER, not DER. */
+                unsigned char data_obj[600];
+                uint8_t sig2[64];
+                rsp_credential_t cred;
+                size_t obj_len = 4 + dlen;
+
+                data_obj[0] = 0xBF; data_obj[1] = 0x27;
+                data_obj[2] = 0x81; data_obj[3] = (unsigned char)dlen;
+                memcpy(data_obj + 4, pir + outer_hdr + dhdr, dlen);
+
+                memset(&cred, 0, sizeof cred);
+                memcpy(cred.sk, EUICC_TEST_SK, sizeof cred.sk);
+                ok("the non-minimal data object signs",
+                   rsp_sign(&cred, data_obj, obj_len, sig2) == 0);
+
+                ber[0] = 0xBF; ber[1] = 0x37;
+                ber[2] = 0x81;
+                ber[3] = (unsigned char)(obj_len + tail);
+                memcpy(ber + 4, data_obj, obj_len);
+                memcpy(ber + 4 + obj_len, pir + tail_off, tail);
+                memcpy(ber + 4 + obj_len + 3, sig2, 64);
+                ber_len = 4 + obj_len + tail;
+
+                ok("a genuine signature over a non-minimal encoding verifies",
+                   rsp_dp_verify_installation_result(sess, ber, ber_len,
+                                                      &inst, NULL, NULL) == 0);
+                ok("...and still reports the profile as installed", inst == 1);
+            }
         }
 
         /* A signed refusal is a complete answer, not an error: the card

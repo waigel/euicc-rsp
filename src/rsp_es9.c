@@ -178,6 +178,8 @@
 #include "PrepareDownloadResponse.h"
 #include "ServerSigned1.h"
 #include "SmdpSigned2.h"
+#include "ber_tlv_length.h"
+#include "ber_tlv_tag.h"
 #include "ProfileInstallationResult.h"
 #include "StoreMetadataRequest.h"
 
@@ -1193,16 +1195,49 @@ out:
     return ret;
 }
 
+/* Locate one TLV's full extent -- tag, length octets and content -- at
+ * `off` inside buf, checking it carries the tag `want`. Returns 0 and
+ * describes the whole TLV through start and len, or -1.
+ *
+ * Needed because a signature is over bytes, and the only bytes that can
+ * be verified are the ones that arrived. */
+static int find_tlv(const uint8_t *buf, size_t buf_len, size_t off,
+                     const uint8_t *want, size_t want_len,
+                     size_t *start, size_t *len)
+{
+    ber_tlv_tag_t tag;
+    ber_tlv_len_t content;
+    ssize_t tl, ll;
+
+    if (off > buf_len) return -1;
+    tl = ber_fetch_tag(buf + off, buf_len - off, &tag);
+    if (tl <= 0) return -1;
+    if ((size_t)tl != want_len || memcmp(buf + off, want, want_len) != 0) {
+        return -1;
+    }
+    ll = ber_fetch_length(BER_TLV_CONSTRUCTED(buf + off), buf + off + tl,
+                           buf_len - off - (size_t)tl, &content);
+    if (ll <= 0 || content < 0) return -1;
+    if ((size_t)content > buf_len - off - (size_t)tl - (size_t)ll) return -1;
+    *start = off;
+    *len = (size_t)tl + (size_t)ll + (size_t)content;
+    return 0;
+}
+
 /* See rsp.h for what this answers and why the two questions are kept
- * apart. The signed bytes are profileInstallationResultData's own DER --
- * the whole [39] TLV, 'BF 27' and its length included -- which is what
- * "across the data object ProfileInstallationResultData (tag 'BF 27')"
- * (SGP.22 v2.6 section 2.5.6) names. Re-encoded from the decoded struct
- * rather than sliced out of the caller's buffer: this project has no
- * "find the sub-TLV and hope the bounds are right" helper, and a
- * re-encode of a DER structure this library just decoded reproduces the
- * same bytes, the same way rsp_dp_authenticate_client already
- * reconstructs euiccSigned1's own bytes to check euiccSignature1. */
+ * apart.
+ *
+ * The signed bytes are taken out of the caller's buffer, not re-encoded
+ * from the decoded struct. SGP.22 v2.6 section 2.5.6 puts the signature
+ * "across the data object ProfileInstallationResultData (tag 'BF 27')" --
+ * that data object, as it arrived. An earlier version of this function
+ * re-encoded it instead, which for DER produces the same bytes and so
+ * appeared to work; but it verifies a reconstruction rather than the
+ * thing that was signed, and the two part company the moment a card
+ * sends anything the decoder normalizes -- a non-minimal length, say,
+ * which BER permits and ber_decode accepts. A conformant card would then
+ * have a genuine signature rejected. Slicing cannot drift that way: what
+ * is verified is what came in. */
 int rsp_dp_verify_installation_result(const rsp_dp_session_t *s,
         const uint8_t *pir, size_t pir_len,
         int *installed, long *bpp_command_id, long *error_reason)
@@ -1243,9 +1278,41 @@ int rsp_dp_verify_installation_result(const rsp_dp_session_t *s,
     if (r->euiccSignPIR.size != 64) {
         goto out;
     }
-    if (der_encode_alloc(&asn_DEF_ProfileInstallationResultData, d,
-                          &data_der, &data_der_len) != 0) {
-        goto out;
+    /* profileInstallationResultData is ProfileInstallationResult's first
+       member, so it begins immediately after the outer [55] header. Both
+       tags are two octets ('BF 37', 'BF 27'): high-tag-number form, since
+       55 and 39 do not fit the five bits of a single-octet tag. */
+    {
+        static const uint8_t tag_pir[2]  = { 0xBF, 0x37 };
+        static const uint8_t tag_data[2] = { 0xBF, 0x27 };
+        size_t outer_start = 0, outer_len = 0, hdr = 0;
+        size_t data_off = 0;
+
+        if (find_tlv(pir, pir_len, 0, tag_pir, sizeof tag_pir,
+                      &outer_start, &outer_len) != 0) {
+            goto out;
+        }
+        {
+            ber_tlv_tag_t t;
+            ber_tlv_len_t cl;
+            ssize_t tl = ber_fetch_tag(pir, pir_len, &t);
+            ssize_t ll;
+            if (tl <= 0) goto out;
+            ll = ber_fetch_length(BER_TLV_CONSTRUCTED(pir), pir + tl,
+                                   pir_len - (size_t)tl, &cl);
+            if (ll <= 0) goto out;
+            hdr = (size_t)tl + (size_t)ll;
+        }
+        data_off = hdr;
+        if (find_tlv(pir, pir_len, data_off, tag_data, sizeof tag_data,
+                      &outer_start, &data_der_len) != 0) {
+            goto out;
+        }
+        data_der = malloc(data_der_len);
+        if (!data_der) {
+            goto out;
+        }
+        memcpy(data_der, pir + outer_start, data_der_len);
     }
     {
         int vr = rsp_sign_verify(s->euicc_cert_der, s->euicc_cert_der_len,
