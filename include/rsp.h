@@ -549,4 +549,47 @@ int rsp_dp_get_bound_profile_package(rsp_dp_session_t *s,
         const uint8_t otsk_dp[32],
         uint8_t **bpp, size_t *bpp_len);
 
+/* Is this Profile Installation Result genuinely this eUICC's, for this
+ * session -- and what does it say?
+ *
+ * The eUICC answers a loaded Bound Profile Package with a
+ * ProfileInstallationResult, and until this function existed nothing
+ * checked it: a report of success was believed because it arrived. It
+ * carries a signature for exactly that reason. SGP.22 v2.6 section 2.5.6:
+ * the result "SHALL include an eUICC signature data object computed as
+ * defined in section 2.6.7.2, using the eUICC private key SK.EUICC.ECDSA
+ * across the data object ProfileInstallationResultData (tag 'BF 27')" --
+ * one data object, whole, tag and length included, not a concatenation
+ * like smdpSignature2's.
+ *
+ * pir is an encoded ProfileInstallationResult. The key it is checked
+ * against is the PK.EUICC.ECDSA rsp_dp_authenticate_client attached to
+ * *s, so that call must have succeeded on this session first.
+ *
+ * Two questions, kept apart because they have different answers and
+ * different consequences. This function's return value answers only the
+ * first: is the report genuine? *installed answers the second -- 1 when
+ * the report is finalResult.successResult, 0 when it is errorResult --
+ * and is only meaningful on a 0 return, because an unverified report's
+ * contents are not evidence of anything. bpp_command_id and error_reason,
+ * when not NULL, receive ErrorResult's own two fields on an errorResult
+ * (BppCommandId and ErrorReason, rsp-2.5.asn), and are left untouched
+ * otherwise.
+ *
+ * A failed installation is therefore a 0 return with *installed 0, not an
+ * error: the eUICC said truthfully that it could not install the profile,
+ * and this function's job was to establish that it was the eUICC saying
+ * it.
+ *
+ * -1 means the question was asked and the answer is no: euiccSignPIR does
+ * not verify against this session's eUICC, or the result's transactionId
+ * is not this session's. Either one means the bytes are not this card's
+ * report of this download, whatever they claim. -2 means the question was
+ * never reached: a null argument, rsp_dp_authenticate_client not having
+ * succeeded on *s, pir not decoding as a ProfileInstallationResult, a
+ * signature that is not 64 bytes, or an internal failure. */
+int rsp_dp_verify_installation_result(const rsp_dp_session_t *s,
+        const uint8_t *pir, size_t pir_len,
+        int *installed, long *bpp_command_id, long *error_reason);
+
 #endif /* RSP_H */

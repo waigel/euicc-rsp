@@ -178,6 +178,7 @@
 #include "PrepareDownloadResponse.h"
 #include "ServerSigned1.h"
 #include "SmdpSigned2.h"
+#include "ProfileInstallationResult.h"
 #include "StoreMetadataRequest.h"
 
 /* See this file's own top comment: no smdp_address input exists yet, so
@@ -1189,5 +1190,101 @@ out:
     }
     free(es2_der);
     ASN_STRUCT_RESET(asn_DEF_PrepareDownloadResponse, &resp);
+    return ret;
+}
+
+/* See rsp.h for what this answers and why the two questions are kept
+ * apart. The signed bytes are profileInstallationResultData's own DER --
+ * the whole [39] TLV, 'BF 27' and its length included -- which is what
+ * "across the data object ProfileInstallationResultData (tag 'BF 27')"
+ * (SGP.22 v2.6 section 2.5.6) names. Re-encoded from the decoded struct
+ * rather than sliced out of the caller's buffer: this project has no
+ * "find the sub-TLV and hope the bounds are right" helper, and a
+ * re-encode of a DER structure this library just decoded reproduces the
+ * same bytes, the same way rsp_dp_authenticate_client already
+ * reconstructs euiccSigned1's own bytes to check euiccSignature1. */
+int rsp_dp_verify_installation_result(const rsp_dp_session_t *s,
+        const uint8_t *pir, size_t pir_len,
+        int *installed, long *bpp_command_id, long *error_reason)
+{
+    ProfileInstallationResult_t *r = NULL;
+    uint8_t *data_der = NULL;
+    size_t data_der_len = 0;
+    int ret = -2;
+
+    if (!s || !pir || pir_len == 0 || !installed) {
+        return -2;
+    }
+    if (!s->authenticated || !s->euicc_cert_der) {
+        return -2;
+    }
+
+    {
+        asn_dec_rval_t dr = ber_decode(NULL, &asn_DEF_ProfileInstallationResult,
+                                       (void **)&r, pir, pir_len);
+        if (dr.code != RC_OK || !r) {
+            goto out;
+        }
+    }
+
+    ProfileInstallationResultData_t *d = &r->profileInstallationResultData;
+
+    /* This session's download, or someone else's report. Checked before
+       the signature for the same reason rsp_dp_authenticate_client checks
+       its own transactionId first: it is a memcmp, and a caller who got
+       the session wrong should not cost an RNG seed and an ECDSA
+       verification to be told so. */
+    if (d->transactionId.size != 16 ||
+        memcmp(d->transactionId.buf, s->transaction_id, 16) != 0) {
+        ret = -1;
+        goto out;
+    }
+
+    if (r->euiccSignPIR.size != 64) {
+        goto out;
+    }
+    if (der_encode_alloc(&asn_DEF_ProfileInstallationResultData, d,
+                          &data_der, &data_der_len) != 0) {
+        goto out;
+    }
+    {
+        int vr = rsp_sign_verify(s->euicc_cert_der, s->euicc_cert_der_len,
+                                  data_der, data_der_len,
+                                  r->euiccSignPIR.buf);
+        if (vr != 0) {
+            ret = (vr == -1) ? -1 : -2;
+            goto out;
+        }
+    }
+
+    /* Genuine. Only now is what it says worth reading. */
+    if (d->finalResult.present ==
+        ProfileInstallationResultData__finalResult_PR_successResult) {
+        *installed = 1;
+    } else if (d->finalResult.present ==
+               ProfileInstallationResultData__finalResult_PR_errorResult) {
+        *installed = 0;
+        if (bpp_command_id) {
+            (void)asn_INTEGER2long(
+                &d->finalResult.choice.errorResult.bppCommandId,
+                bpp_command_id);
+        }
+        if (error_reason) {
+            (void)asn_INTEGER2long(
+                &d->finalResult.choice.errorResult.errorReason,
+                error_reason);
+        }
+    } else {
+        /* Neither arm: a signed report this function cannot read. The
+           signature held, so the bytes are the card's -- but there is
+           nothing here to report as installed or not, and guessing either
+           way would be inventing an answer. */
+        goto out;
+    }
+    ret = 0;
+
+out:
+    free(data_der);
+    if (r) ASN_STRUCT_FREE(asn_DEF_ProfileInstallationResult, r);
     return ret;
 }

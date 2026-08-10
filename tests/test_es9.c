@@ -51,6 +51,7 @@
 #include "EuiccSigned1.h"
 #include "InitiateAuthenticationOkEs9.h"
 #include "PrepareDownloadResponse.h"
+#include "ProfileInstallationResult.h"
 #include "ServerSigned1.h"
 #include "SmdpSigned2.h"
 #include "StoreMetadataRequest.h"
@@ -291,6 +292,101 @@ static int build_store_metadata(const uint8_t iccid[10],
     }
     *out_len = s.len;
     return 0;
+}
+
+
+/* A ProfileInstallationResult the way a real eUICC builds one: the
+   profileInstallationResultData object, then euiccSignPIR over that
+   object's own DER -- "across the data object
+   ProfileInstallationResultData (tag 'BF 27')", SGP.22 v2.6 section
+   2.5.6 -- signed with the same EUICC_TEST_SK the other fixtures here
+   use, so it verifies against the same CERT.EUICC the session holds. */
+static int build_installation_result(
+        const uint8_t transaction_id[16], int success,
+        unsigned char *out, size_t cap, size_t *out_len) {
+    ProfileInstallationResult_t pir;
+    ProfileInstallationResultData_t *d;
+    unsigned char data_buf[512];
+    struct sink data_sink = { data_buf, 0, sizeof data_buf };
+    struct sink out_sink = { out, 0, cap };
+    asn_enc_rval_t r;
+    rsp_credential_t euicc_cred;
+    uint8_t sig[64];
+    int ret = -1;
+
+    memset(&pir, 0, sizeof pir);
+    d = &pir.profileInstallationResultData;
+
+    static const uint8_t aid[16] = {
+        0xA0,0x00,0x00,0x05,0x59,0x10,0x10,0xFF,
+        0xFF,0xFF,0xFF,0x89,0x00,0x00,0x11,0x00
+    };
+    if (OCTET_STRING_fromBuf(&d->transactionId,
+                              (const char *)transaction_id, 16) != 0 ||
+        asn_long2INTEGER(&d->notificationMetadata.seqNumber, 1) != 0 ||
+        OCTET_STRING_fromBuf(
+            (OCTET_STRING_t *)&d->notificationMetadata.profileManagementOperation,
+            "\x80", 1) != 0 ||
+        OCTET_STRING_fromBuf(&d->notificationMetadata.notificationAddress,
+                              "smdp-address-placeholder.invalid", 32) != 0) {
+        goto done;
+    }
+    /* smdpOid: any well-formed OID -- this function is about the
+       signature, and nothing in rsp_dp_verify_installation_result reads
+       this field. 2.999 is the ITU-T "example" arc. */
+    {
+        static const asn_oid_arc_t arcs[2] = { 2, 999 };
+        if (OBJECT_IDENTIFIER_set_arcs(&d->smdpOid, arcs, 2) != 0) {
+            goto done;
+        }
+    }
+    if (success) {
+        d->finalResult.present =
+            ProfileInstallationResultData__finalResult_PR_successResult;
+        if (OCTET_STRING_fromBuf(&d->finalResult.choice.successResult.aid,
+                                  (const char *)aid, sizeof aid) != 0 ||
+            OCTET_STRING_fromBuf(
+                &d->finalResult.choice.successResult.simaResponse,
+                "\x30\x00", 2) != 0) {
+            goto done;
+        }
+    } else {
+        d->finalResult.present =
+            ProfileInstallationResultData__finalResult_PR_errorResult;
+        if (asn_long2INTEGER(
+                &d->finalResult.choice.errorResult.bppCommandId, 5) != 0 ||
+            asn_long2INTEGER(
+                &d->finalResult.choice.errorResult.errorReason, 12) != 0) {
+            goto done;
+        }
+    }
+
+    r = der_encode(&asn_DEF_ProfileInstallationResultData, d, collect,
+                   &data_sink);
+    if (r.encoded < 0) {
+        goto done;
+    }
+
+    memset(&euicc_cred, 0, sizeof euicc_cred);
+    memcpy(euicc_cred.sk, EUICC_TEST_SK, sizeof euicc_cred.sk);
+    if (rsp_sign(&euicc_cred, data_sink.p, data_sink.len, sig) != 0) {
+        goto done;
+    }
+    if (OCTET_STRING_fromBuf(&pir.euiccSignPIR, (const char *)sig, 64) != 0) {
+        goto done;
+    }
+
+    r = der_encode(&asn_DEF_ProfileInstallationResult, &pir, collect,
+                   &out_sink);
+    if (r.encoded < 0) {
+        goto done;
+    }
+    *out_len = out_sink.len;
+    ret = 0;
+
+done:
+    ASN_STRUCT_RESET(asn_DEF_ProfileInstallationResult, &pir);
+    return ret;
 }
 
 /* PrepareDownloadResponse (rsp-2.5.asn line 255), the downloadResponseOk
@@ -950,6 +1046,88 @@ int main(void) {
                 rsp_session_wipe(&expected);
             }
             free(bpp);
+        }
+    }
+
+    /* The eUICC's own report, and whether this library can tell a genuine
+       one from bytes that merely claim to be one. Before
+       rsp_dp_verify_installation_result existed, a ProfileInstallationResult
+       was believed because it arrived -- so the assertions that matter here
+       are the two mutations, not the happy path: a check that only ever
+       answers "genuine" is worse than no check, because it reads like one.
+
+       The fixture is signed with EUICC_TEST_SK over
+       profileInstallationResultData's own DER, which is what SGP.22 v2.6
+       section 2.5.6 requires ("across the data object
+       ProfileInstallationResultData (tag 'BF 27')"), and verifies against
+       the CERT.EUICC this session attached in AuthenticateClient above. */
+    {
+        unsigned char pir[768];
+        size_t pir_len = 0;
+        int installed = -1;
+
+        ok("a fixture ProfileInstallationResult encodes",
+           build_installation_result(transaction_id, 1, pir, sizeof pir,
+                                      &pir_len) == 0);
+
+        ok("a genuine result verifies",
+           rsp_dp_verify_installation_result(sess, pir, pir_len, &installed,
+                                              NULL, NULL) == 0);
+        ok("...and reports the profile as installed", installed == 1);
+
+        /* Mutation 1: one byte of the signature. The signed bytes are
+           untouched, so this is exactly the case a check that never looks
+           at euiccSignPIR would pass. -1, not -2: the question was asked
+           of a cryptographic primitive and the answer is no. */
+        {
+            unsigned char bad[768];
+            memcpy(bad, pir, pir_len);
+            /* The last byte of the encoding is inside euiccSignPIR: it is
+               the final field, and its 64 content octets end the outer
+               SEQUENCE. */
+            bad[pir_len - 1] ^= 0xFF;
+            int inst = -1;
+            ok("a tampered signature is refused with -1",
+               rsp_dp_verify_installation_result(sess, bad, pir_len, &inst,
+                                                  NULL, NULL) == -1);
+        }
+
+        /* Mutation 2: a report for a different session. The signature is
+           genuine for what it covers -- it is simply not this download's
+           report, which a check that only verified the signature would
+           accept. */
+        {
+            unsigned char other[768];
+            size_t other_len = 0;
+            uint8_t other_tid[16];
+            memcpy(other_tid, transaction_id, 16);
+            other_tid[0] ^= 0xFF;
+            int inst = -1;
+            ok("a result for another transactionId encodes",
+               build_installation_result(other_tid, 1, other, sizeof other,
+                                          &other_len) == 0);
+            ok("...and is refused with -1, though its signature is genuine",
+               rsp_dp_verify_installation_result(sess, other, other_len,
+                                                  &inst, NULL, NULL) == -1);
+        }
+
+        /* A signed refusal is a complete answer, not an error: the card
+           said truthfully that it could not install, and establishing that
+           the card said it is this function's whole job. */
+        {
+            unsigned char err[768];
+            size_t err_len = 0;
+            int inst = -1;
+            long cmd = -1, reason = -1;
+            ok("a fixture errorResult encodes",
+               build_installation_result(transaction_id, 0, err, sizeof err,
+                                          &err_len) == 0);
+            ok("a genuine refusal verifies, and is not an error",
+               rsp_dp_verify_installation_result(sess, err, err_len, &inst,
+                                                  &cmd, &reason) == 0);
+            ok("...reporting the profile as not installed", inst == 0);
+            ok("...and naming loadProfileElements(5)", cmd == 5);
+            ok("...and installFailedDueToPEProcessingError(12)", reason == 12);
         }
     }
 
