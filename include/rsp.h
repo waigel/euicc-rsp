@@ -129,6 +129,18 @@ typedef struct {
     uint8_t s_enc[16];
     uint8_t s_mac[16];
     uint8_t chain[16];   /* the MAC chaining value; rsp_protect advances it */
+    /* The encryption counter for ICV calculation -- a second, independent
+     * value, not a view of chain above. SGP.22 v2.6 keeps the two apart
+     * in one sentence (section 2.5.3, on random key mode: "the initial
+     * MAC chaining value ... is provided together with the random key AND
+     * the encryption counter for ICV calculation is reset to its initial
+     * state (i.e. the value on 16 bytes is '00...01')"), and gives this
+     * one its own advancement rule (section 2.5.4: "The encryption
+     * counter for ICV calculation is incremented each time a TLV with tag
+     * '86', '87' or '88' is received"). rsp_session_init starts it at
+     * '00...01'; rsp_protect and rsp_protect_mac_only each advance it by
+     * one, '88' included -- it counts TLVs, not encryptions. */
+    uint8_t enc_counter[16];
 } rsp_session_t;
 
 /* ECDH on P-256. pk is an uncompressed point, 65 bytes starting with 0x04.

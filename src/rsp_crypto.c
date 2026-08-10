@@ -187,6 +187,12 @@ int rsp_session_init(const uint8_t otsk_dp[32], const uint8_t otpk_euicc[65],
     memcpy(out->chain, key_data + 0, 16);
     memcpy(out->s_enc, key_data + 16, 16);
     memcpy(out->s_mac, key_data + 32, 16);
+    /* The encryption counter's initial state, SGP.22 v2.6 section 2.5.3:
+       "the value on 16 bytes is '00...01'". Annex G derives the chaining
+       value, S-ENC and S-MAC and nothing else -- this one is a constant,
+       not part of KeyData. */
+    memset(out->enc_counter, 0, sizeof out->enc_counter);
+    out->enc_counter[sizeof out->enc_counter - 1] = 0x01;
     ret = 0;
 
 out:
@@ -258,14 +264,23 @@ void rsp_session_wipe(rsp_session_t *s)
  * 2. The ICV (Amendment D section 6.2.6, "APDU Command C-MAC and
  *    C-DECRYPTION Generation and Verification"): "the off-card entity
  *    shall increment an encryption counter ... This block shall be
- *    encrypted with S-ENC to produce the ICV for command encryption."
- *    SCP03t replaces that counter: SGP.02 v4.1 section 4.1.3.3, "Otherwise
- *    the MAC chaining method SHALL be applied (i.e. the MAC chaining value
- *    of the previous command TLV SHALL be used)" -- so here, ICV =
- *    AES-128-ECB-Encrypt(S-ENC, chain), where "chain" is the MAC chaining
- *    value in force for this segment (the value rsp_session_init derived
- *    for the first segment, SGP.22 Annex G; the previous segment's C-MAC
- *    for every one after).
+ *    encrypted with S-ENC to produce the ICV for command encryption." So
+ *    ICV = AES-128-ECB-Encrypt(S-ENC, encryption counter), and the counter
+ *    is its own 16-byte value, NOT the MAC chaining value.
+ *
+ *    An earlier version of this file conflated the two, reading SGP.02
+ *    v4.1 section 4.1.3.3's "Otherwise the MAC chaining method SHALL be
+ *    applied (i.e. the MAC chaining value of the previous command TLV
+ *    SHALL be used)" as if it redefined the ICV. It does not: SGP.22
+ *    v2.6 section 2.5.3 carries that same "Otherwise" sentence and, in
+ *    the clause immediately before it, names the two separately -- random
+ *    key mode supplies "the initial MAC chaining value" AND resets "the
+ *    encryption counter for ICV calculation ... to its initial state
+ *    (i.e. the value on 16 bytes is '00...01')". The "Otherwise" governs
+ *    the chaining value alone. Section 2.5.4 then gives the counter its
+ *    own rule, quoted below. A real eUICC rejected the first '87' of a
+ *    Bound Profile Package built the conflated way with errorReason
+ *    scp03tSecurityError(8), which is what turned the reading up.
  *
  * 3. The MAC (Amendment D section 6.2.4, "APDU Command C-MAC Generation
  *    and Verification", Figure 6-1, as SGP.02's Figure 46 "TLV Command
@@ -399,8 +414,8 @@ static int scp03t_mac(const uint8_t s_mac[16], const uint8_t chain[16],
     return ret;
 }
 
-/* ICV = AES-128-ECB-Encrypt(S-ENC, chain) -- rule 2 above. */
-static int scp03t_icv(const uint8_t s_enc[16], const uint8_t chain[16],
+/* ICV = AES-128-ECB-Encrypt(S-ENC, encryption counter) -- rule 2 above. */
+static int scp03t_icv(const uint8_t s_enc[16], const uint8_t counter[16],
                        uint8_t icv[16])
 {
     mbedtls_aes_context aes;
@@ -409,10 +424,25 @@ static int scp03t_icv(const uint8_t s_enc[16], const uint8_t chain[16],
     mbedtls_aes_init(&aes);
     ret = mbedtls_aes_setkey_enc(&aes, s_enc, 128);
     if (ret == 0) {
-        ret = mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, chain, icv);
+        ret = mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, counter, icv);
     }
     mbedtls_aes_free(&aes);
     return ret == 0 ? 0 : -1;
+}
+
+/* The encryption counter, one further on: a 16-byte big-endian integer,
+   incremented by one. Called once per '86'/'87'/'88' TLV -- see rule 2 and
+   rsp_session_t's own comment on the field. Wrapping past all-ones would
+   need 2^128 segments, so the carry simply runs off the front. */
+static void scp03t_counter_advance(uint8_t counter[16])
+{
+    size_t i = 16;
+
+    while (i-- > 0) {
+        if (++counter[i] != 0) {
+            break;
+        }
+    }
 }
 
 int rsp_cmac(const uint8_t key[16], const uint8_t *msg, size_t len,
@@ -488,7 +518,7 @@ long rsp_protect(rsp_session_t *s, const uint8_t *plain, size_t plain_len,
         memset(padded + plain_len + 1, 0, pad_len - 1);
     }
 
-    if (scp03t_icv(s->s_enc, s->chain, icv) != 0) {
+    if (scp03t_icv(s->s_enc, s->enc_counter, icv) != 0) {
         goto out;
     }
 
@@ -516,8 +546,11 @@ long rsp_protect(rsp_session_t *s, const uint8_t *plain, size_t plain_len,
     memcpy(out + padded_len, mac16, RSP_SCP03T_MAC_LEN);
 
     /* The full 16-byte MAC becomes the chaining value for the next
-     * segment (rule 3), only once everything above has succeeded. */
+     * segment (rule 3), only once everything above has succeeded. The
+     * encryption counter moves with it, but separately: it counted this
+     * TLV, and the ICV above read it before it moved. */
     memcpy(s->chain, mac16, 16);
+    scp03t_counter_advance(s->enc_counter);
     ret = (long)(padded_len + RSP_SCP03T_MAC_LEN);
 
 out:
@@ -574,8 +607,13 @@ long rsp_protect_mac_only(rsp_session_t *s, const uint8_t *plain,
 
     /* The full 16-byte MAC becomes the chaining value for the next
      * segment (rule 3), only once everything above has succeeded --
-     * mirroring rsp_protect's own placement of this line. */
+     * mirroring rsp_protect's own placement of this line. The encryption
+     * counter advances here too, even though this function never computed
+     * an ICV: section 2.5.4 counts every '86', '87' AND '88' TLV, so a
+     * '88' that left the counter alone would put every later '86' one
+     * step behind the card's own. */
     memcpy(s->chain, mac16, 16);
+    scp03t_counter_advance(s->enc_counter);
     ret = (long)(plain_len + RSP_SCP03T_MAC_LEN);
 
 out:
@@ -636,7 +674,7 @@ long rsp_unprotect(rsp_session_t *s, const uint8_t *seg, size_t seg_len,
         goto out;
     }
 
-    if (scp03t_icv(s->s_enc, s->chain, icv) != 0) {
+    if (scp03t_icv(s->s_enc, s->enc_counter, icv) != 0) {
         goto out;
     }
 
@@ -688,6 +726,7 @@ long rsp_unprotect(rsp_session_t *s, const uint8_t *seg, size_t seg_len,
     }
 
     memcpy(s->chain, mac16, 16);
+    scp03t_counter_advance(s->enc_counter);
     ret = (long)pad_idx;
 
 out:
@@ -751,6 +790,7 @@ long rsp_unprotect_mac_only(rsp_session_t *s, const uint8_t *seg,
     }
 
     memcpy(s->chain, mac16, 16);
+    scp03t_counter_advance(s->enc_counter);
     ret = (long)plain_len;
 
 out:

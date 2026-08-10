@@ -25,6 +25,13 @@ static const uint8_t CMAC_EMPTY[16] = {
 static void session(rsp_session_t *s) {
     memset(s, 0, sizeof *s);
     for(int i = 0; i < 16; i++) { s->s_enc[i] = i; s->s_mac[i] = 0x40 + i; }
+    /* The encryption counter starts at '00...01', not at zero -- what
+       rsp_session_init leaves behind (SGP.22 v2.6 section 2.5.3). Set here
+       rather than left to the memset above, because a hand-built session
+       that starts it at zero exercises an ICV no real session ever
+       computes, and the wire pins below would then pin bytes no card would
+       ever be sent. */
+    s->enc_counter[15] = 0x01;
 }
 
 int main(void) {
@@ -138,32 +145,41 @@ int main(void) {
        isolation -- and an inversion cannot see an error that is symmetric
        between rsp_protect and rsp_unprotect: swap the MAC input tag, take
        the wire MAC from the wrong end of the CMAC, use a non-minimal DER
-       length in the MAC input, reverse the chaining value, or use the
-       chaining value itself as the ICV instead of AES-ECB(S-ENC, chain) --
-       and both sides of the round trip still agree with each other while
-       disagreeing with what a real eUICC expects on the wire. This is this
-       implementation's own measured output for two consecutive
-       rsp_protect calls -- reproduced independently before being written
-       here, not copied from anywhere -- and *not* a GSMA known-answer
-       test: no published SGP.22 vector for SCP03t's byte-level framing is
-       available to this repository. The card settles that in the second
-       half of the project. Two segments, not one: the chaining-value
-       mutation only shows up in the second segment, since the first
-       segment's chain is still the all-zero fixture value regardless. */
+       length in the MAC input, reverse the chaining value, or derive the
+       ICV from the wrong 16 bytes -- and both sides of the round trip
+       still agree with each other while disagreeing with what a real
+       eUICC expects on the wire. This is this implementation's own
+       measured output for two consecutive rsp_protect calls -- and *not*
+       a GSMA known-answer test: no published SGP.22 vector for SCP03t's
+       byte-level framing is available to this repository.
+
+       Which is exactly the limit these numbers have, and it has now been
+       demonstrated rather than merely stated. The pin held for months
+       over an ICV derived from the MAC chaining value instead of the
+       encryption counter; a real eUICC rejected the first '87' of a
+       Bound Profile Package built that way with scp03tSecurityError(8).
+       These values were re-measured after that fix, from the same
+       implementation, and can therefore still only catch a *change* --
+       never a wrong construction. The card is the authority; see
+       src/rsp_crypto.c's rule 2 for what the spec actually says.
+
+       Two segments, not one: the chaining-value mutation only shows up
+       in the second segment, since the first segment's chain is still
+       the all-zero fixture value regardless. */
     {
         static const uint8_t want_seg1[40] = {
-            0xe6, 0x6d, 0x91, 0x52, 0x33, 0x0d, 0xaa, 0x4b,
-            0xb0, 0x07, 0xb7, 0x4c, 0xae, 0x9b, 0x9f, 0xc9,
-            0xf7, 0xfd, 0x7d, 0x3b, 0x94, 0x8c, 0x10, 0x2b,
-            0x8b, 0x8d, 0x50, 0xa6, 0xec, 0x2d, 0x63, 0x1c,
-            0x1d, 0xae, 0x9b, 0x60, 0x37, 0xa2, 0xdf, 0xf9
+            0x73, 0xe8, 0xf1, 0xcd, 0xef, 0x54, 0xef, 0xc5,
+            0xbd, 0xe7, 0x0e, 0xee, 0xd5, 0xff, 0x4f, 0x9d,
+            0x47, 0xfa, 0x5d, 0x24, 0x61, 0xab, 0x21, 0x2e,
+            0x01, 0x38, 0x09, 0x64, 0x26, 0x05, 0xda, 0x7b,
+            0x0f, 0x90, 0x74, 0xf6, 0x4f, 0xe4, 0xd6, 0x3a
         };
         static const uint8_t want_seg2[40] = {
-            0x73, 0xa4, 0x96, 0x3a, 0x1a, 0x2f, 0xaf, 0x47,
-            0x93, 0xd7, 0x2c, 0x08, 0x8e, 0xe5, 0xba, 0xef,
-            0x0e, 0xb8, 0x38, 0x7a, 0xde, 0x65, 0x5f, 0x70,
-            0x19, 0x69, 0x2d, 0xf5, 0x11, 0x2d, 0x06, 0xce,
-            0x78, 0xe2, 0x4a, 0x78, 0x9b, 0x50, 0x9e, 0xb1
+            0xf4, 0xd1, 0x41, 0x3c, 0xa6, 0xff, 0x31, 0x3a,
+            0xd8, 0xcc, 0x45, 0x4a, 0x86, 0xfe, 0x02, 0xc7,
+            0x28, 0x59, 0xd3, 0x9a, 0xae, 0x88, 0xb3, 0xe1,
+            0x56, 0x03, 0xa4, 0x23, 0x72, 0x70, 0x83, 0x60,
+            0xd2, 0x79, 0x1b, 0xd0, 0xbd, 0x95, 0xc7, 0x60
         };
         uint8_t plain[16], seg1[64], seg2[64];
         memset(plain, 0x5A, sizeof plain);
