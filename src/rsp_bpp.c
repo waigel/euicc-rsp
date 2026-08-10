@@ -456,56 +456,11 @@ static void build_configure(ConfigureISDPRequest_t *cfg)
     cfg->dpProprietaryData = NULL;
 }
 
-/* StoreMetadataRequest, rsp-2.5.asn line 204. The sizes checked below are
-   the module's own SIZE constraints on serviceProviderName (0..32) and
-   profileName (0..64); asn1c's generic der_encode does not enforce SIZE,
-   so a caller string that is too long would otherwise be encoded as a
-   silently non-conformant TLV instead of being refused here.
-
-   The check is strlen() -- bytes -- against a SIZE that counts UTF8String
-   characters, not bytes. That is conservative, never permissive: it can
-   refuse a compliant string that uses enough multi-byte characters to
-   push its byte length past the character limit while staying within it
-   in characters, but it can never accept a string that is actually too
-   long. Given this project's plain-ASCII test material, that gap is
-   unexercised; a caller passing profile or provider names rich in
-   multi-byte UTF-8 should not rely on this check for the exact SGP.22
-   boundary. */
-static int build_metadata(StoreMetadataRequest_t *md,
-                           const rsp_bpp_input_t *in)
-{
-    size_t name_len = strlen(in->profile_name);
-    size_t sp_len = strlen(in->service_provider_name);
-
-    /* Zeroed before the very first failure return, unlike an earlier
-       version of this function -- so that a caller can unconditionally
-       ASN_STRUCT_RESET md even when this returns -1, the same way
-       build_isc already guarantees. */
-    memset(md, 0, sizeof *md);
-
-    if (name_len > 64 || sp_len > 32) {
-        return -1;
-    }
-
-    if (OCTET_STRING_fromBuf(&md->iccid, (const char *)in->iccid, 10) != 0) {
-        return -1;
-    }
-    if (OCTET_STRING_fromBuf(&md->serviceProviderName,
-                              in->service_provider_name, (int)sp_len) != 0) {
-        return -1;
-    }
-    if (OCTET_STRING_fromBuf(&md->profileName, in->profile_name,
-                              (int)name_len) != 0) {
-        return -1;
-    }
-    return 0;
-}
-
 int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
                    uint8_t **out, size_t *out_len)
 {
-    uint8_t *isc_der = NULL, *configure_der = NULL, *metadata_der = NULL;
-    size_t isc_len = 0, configure_len = 0, metadata_len = 0;
+    uint8_t *isc_der = NULL, *configure_der = NULL;
+    size_t isc_len = 0, configure_len = 0;
     rsp_growbuf_t content;   /* BoundProfilePackage's own content */
     rsp_growbuf_t seq86;     /* sequenceOf86's content: concatenated '86' TLVs */
     uint8_t seg_buf[RSP_BPP_SEGMENT_BUF];
@@ -515,9 +470,8 @@ int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
     if (!s || !in || !out || !out_len) {
         return -1;
     }
-    if (!in->otpk_dp || !in->iccid || !in->profile_name ||
-        !in->service_provider_name || !in->transaction_id ||
-        !in->euicc_otpk || !in->dppb) {
+    if (!in->otpk_dp || !in->metadata || in->metadata_len == 0 ||
+        !in->transaction_id || !in->euicc_otpk || !in->dppb) {
         return -1;
     }
     if (!in->upp && in->upp_len) {
@@ -607,32 +561,23 @@ int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
         rsp_growbuf_free(&wrapped);
     }
 
-    {
-        StoreMetadataRequest_t md;
-        int build_rc = build_metadata(&md, in);
-        int rc = 0;
-        if (build_rc == 0) {
-            rc = der_encode_alloc(&asn_DEF_StoreMetadataRequest, &md,
-                                   &metadata_der, &metadata_len);
-        }
-        ASN_STRUCT_RESET(asn_DEF_StoreMetadataRequest, &md);
-        if (build_rc != 0 || rc != 0) {
-            goto out;
-        }
-    }
     /* '88': StoreMetadata, MAC'd only with rsp_protect_mac_only -- Table 4's
-       own words, "MAC protected ... (i.e. not encrypted)". Table 4 does
-       allow a second, remainder '88' TLV if the first cannot hold the
-       whole StoreMetadataRequest; that is not implemented (see
-       include/rsp.h's own note on rsp_bpp_input_t), so a
-       StoreMetadataRequest too large for one segment is refused here
-       rather than silently truncated or wrongly split. */
-    if (metadata_len > RSP_BPP_MAX_SEGMENT_PLAINTEXT) {
+       own words, "MAC protected ... (i.e. not encrypted)". The caller's own
+       encoded StoreMetadataRequest goes in as it stands; nothing is decoded
+       and rebuilt here (see rsp_bpp_input_t's comment on the metadata field
+       for what a rebuild used to lose). Table 4 does allow a second,
+       remainder '88' TLV if the first cannot hold the whole
+       StoreMetadataRequest; that is not implemented (see include/rsp.h's own
+       note on rsp_bpp_input_t), so a StoreMetadataRequest too large for one
+       segment is refused here rather than silently truncated or wrongly
+       split. */
+    if (!in->metadata || in->metadata_len == 0 ||
+        in->metadata_len > RSP_BPP_MAX_SEGMENT_PLAINTEXT) {
         goto out;
     }
     {
         uint8_t prot88[RSP_BPP_SEGMENT_BUF];
-        long n = rsp_protect_mac_only(s, metadata_der, metadata_len,
+        long n = rsp_protect_mac_only(s, in->metadata, in->metadata_len,
                                        TAG_88_ELEMENT, prot88, sizeof prot88);
         rsp_growbuf_t wrapped;
         if (n < 0) {
@@ -715,7 +660,6 @@ int rsp_bpp_build(rsp_session_t *s, const rsp_bpp_input_t *in,
 out:
     free(isc_der);
     free(configure_der);
-    free(metadata_der);
     rsp_growbuf_free(&content);
     rsp_growbuf_free(&seq86);
     return ret;

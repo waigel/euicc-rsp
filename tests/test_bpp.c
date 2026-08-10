@@ -51,6 +51,23 @@ static const uint8_t iccid[10] = {
     0x98,0x00,0x10,0x32,0x54,0x76,0x98,0x10,0x32,0x14
 };
 
+/* The Profile Metadata rsp_bpp_input_t now takes: an already-encoded
+   StoreMetadataRequest, placed in the '88' group byte for byte.
+
+   Written out here rather than produced with the generated encoder,
+   because the absolute length pins further down are pinned to these
+   exact bytes: a fixture that asked asn1c what it would encode would
+   move with it, and the point of an absolute pin is that it does not.
+   BF25 <len> then iccid '5A', serviceProviderName '91', profileName '92'
+   -- the same three fields, in the same order, that this input used to
+   be given as separate members for rsp_bpp_build to encode itself. */
+static const uint8_t metadata[] = {
+    0xBF, 0x25, 0x22,
+    0x5A, 0x0A, 0x98,0x00,0x10,0x32,0x54,0x76,0x98,0x10,0x32,0x14,
+    0x91, 0x0B, 'e','u','i','c','c','-','t','o','o','l','s',
+    0x92, 0x07, 'e','x','a','m','p','l','e'
+};
+
 /* Skip a BER/DER TLV's own tag and length octets, returning a pointer to
    its content and, via *rest_len, how many bytes remain from there to the
    end of the buffer given. Used only to find where
@@ -137,8 +154,8 @@ int main(void) {
     ok("DPpb loads, for smdpSign", rsp_pki_dp(1, &dppb) == 0);
 
     rsp_bpp_input_t in = {
-        .upp = upp, .upp_len = upp_len, .otpk_dp = otpk, .iccid = iccid,
-        .profile_name = "example", .service_provider_name = "euicc-tools",
+        .upp = upp, .upp_len = upp_len, .otpk_dp = otpk,
+        .metadata = metadata, .metadata_len = sizeof metadata,
         .transaction_id = transaction_id, .euicc_otpk = euicc_otpk,
         .dppb = &dppb
     };
@@ -344,8 +361,7 @@ int main(void) {
 
         rsp_bpp_input_t min = {
             .upp = multi_upp, .upp_len = sizeof multi_upp, .otpk_dp = otpk,
-            .iccid = iccid, .profile_name = "example",
-            .service_provider_name = "euicc-tools",
+            .metadata = metadata, .metadata_len = sizeof metadata,
             .transaction_id = transaction_id, .euicc_otpk = euicc_otpk,
             .dppb = &dppb
         };
@@ -401,6 +417,52 @@ int main(void) {
            && mback == NULL);
 
         free(mbpp);
+    }
+
+    /* The Profile Metadata reaches the card whole.
+       rsp_bpp_input_t used to take iccid/profileName/serviceProviderName
+       and encode a StoreMetadataRequest out of them, which silently
+       dropped every other field a caller had put in one -- profileClass
+       above all, which SGP.22 v2.6 section 2.4.5.3 requires a Test
+       Profile to carry. Nothing caught it, because a rebuild of three
+       fields round-trips those three fields perfectly.
+
+       Table 4 has '88' "MAC protected ... (i.e. not encrypted)", so the
+       StoreMetadataRequest sits in the built BPP in the clear and can
+       simply be searched for. The fixture below is the same three fields
+       plus profileClass test(0) -- '95 01 00' -- so this fails if any
+       part of the metadata is re-encoded rather than carried across. */
+    {
+        static const uint8_t md_with_class[] = {
+            0xBF, 0x25, 0x25,
+            0x5A, 0x0A, 0x98,0x00,0x10,0x32,0x54,0x76,0x98,0x10,0x32,0x14,
+            0x91, 0x0B, 'e','u','i','c','c','-','t','o','o','l','s',
+            0x92, 0x07, 'e','x','a','m','p','l','e',
+            0x95, 0x01, 0x00
+        };
+        rsp_bpp_input_t cin = {
+            .upp = upp, .upp_len = upp_len, .otpk_dp = otpk,
+            .metadata = md_with_class, .metadata_len = sizeof md_with_class,
+            .transaction_id = transaction_id, .euicc_otpk = euicc_otpk,
+            .dppb = &dppb
+        };
+        rsp_session_t cs; session(&cs);
+        uint8_t *cbpp = NULL; size_t cbpp_len = 0;
+
+        ok("a BPP builds with metadata carrying profileClass",
+           rsp_bpp_build(&cs, &cin, &cbpp, &cbpp_len) == 0);
+
+        int found = 0;
+        if (cbpp && cbpp_len >= sizeof md_with_class) {
+            for (size_t i = 0; i + sizeof md_with_class <= cbpp_len; i++) {
+                if (memcmp(cbpp + i, md_with_class,
+                           sizeof md_with_class) == 0) { found = 1; break; }
+            }
+        }
+        ok("the caller's StoreMetadataRequest is in the BPP byte for byte,"
+           " profileClass included", found);
+
+        free(cbpp);
     }
 
     free(upp);

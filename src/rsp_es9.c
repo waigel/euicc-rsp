@@ -58,10 +58,13 @@
  * its own: this stateless library has no profile-order database to learn
  * a Profile's ICCID/name/service-provider from, so
  * rsp_dp_authenticate_client's own `metadata` parameter is the caller's
- * answer to that gap (see rsp.h) -- decoded, echoed into the response, and
- * stashed in *s so rsp_dp_get_bound_profile_package can reuse the exact
- * same values in its own StoreMetadataRequest (inside the BPP's '88'
- * group) without a second, potentially-drifting copy.
+ * answer to that gap (see rsp.h) -- decoded far enough to be checked,
+ * echoed into the response, and kept whole in *s so that the BPP's '88'
+ * group carries those same bytes rather than a second, drifting copy.
+ * Kept whole, not reduced to the three fields it used to be reduced to:
+ * a rebuilt StoreMetadataRequest silently loses profileClass and every
+ * other optional field, so the eUICC and the person reading the LPA's
+ * profileMetaData ended up told different things about one Profile.
  *
  * GetBoundProfilePackage (5.6.2) is comparatively small once
  * AuthenticateClient has run: verify euiccSignature2 against the
@@ -213,19 +216,24 @@ struct rsp_dp_session {
     char eid[32];
     size_t eid_len;
 
-    /* Stashed from rsp_dp_authenticate_client's own metadata parameter
-       (an encoded StoreMetadataRequest), for rsp_dp_get_bound_profile_
-       package's own rsp_bpp_input_t -- one caller-supplied value, reused
-       here rather than asking the caller for iccid/profile_name/
-       service_provider_name a second time in a second call that could
-       drift from the first. profile_name/service_provider_name are
-       NUL-terminated (rsp_bpp_input_t's own fields are plain "const
-       char *"); StoreMetadataRequest's own SIZE constraints (0..64,
-       0..32) are checked before this is filled, so the +1 below always
-       fits. */
-    uint8_t iccid[10];
-    char profile_name[65];
-    char service_provider_name[33];
+    /* rsp_dp_authenticate_client's own metadata parameter, kept whole:
+       the caller's encoded StoreMetadataRequest, malloc'ed here, for
+       rsp_dp_get_bound_profile_package's own rsp_bpp_input_t. One
+       caller-supplied value reused, rather than asking for it a second
+       time in a second call that could drift from the first.
+
+       Kept as bytes rather than as the three fields this used to pull out
+       of it (iccid, profileName, serviceProviderName). Those three were
+       enough to rebuild a StoreMetadataRequest, and a rebuild is exactly
+       the problem: everything else the caller had encoded --
+       profileClass, iconType/icon, notificationConfigurationInfo,
+       profileOwner, profilePolicyRules -- was dropped on the way into the
+       BPP's '88' group, while AuthenticateClient's own profileMetaData
+       echoed the caller's full version back. The eUICC and whatever the
+       LPA showed a person therefore disagreed about the same Profile.
+       See include/rsp.h's comment on rsp_bpp_input_t.metadata. */
+    uint8_t *metadata;
+    size_t   metadata_len;
 
     /* smdpSignature2 exactly as this session's own AuthenticateClient
        produced it. The eUICC computes euiccSignature2 "over euiccSigned2
@@ -454,6 +462,7 @@ void rsp_dp_session_free(rsp_dp_session_t *s)
         return;
     }
     free(s->euicc_cert_der);
+    free(s->metadata);
     rsp_session_wipe(&s->bpp_session);
     mbedtls_platform_zeroize(s, sizeof *s);
     free(s);
@@ -822,7 +831,14 @@ int rsp_dp_authenticate_client(rsp_dp_session_t *s,
        exactly as it was. */
     {
         uint8_t *cert_copy = malloc(euicc_der_buf_len);
-        if (!cert_copy) {
+        /* Both copies are taken before either is committed, so a failure
+           to allocate the second cannot leave *s holding the first --
+           this block's whole point is that a failing call leaves *s
+           exactly as it was. */
+        uint8_t *md_copy = malloc(metadata_len);
+        if (!cert_copy || !md_copy) {
+            free(cert_copy);
+            free(md_copy);
             free(*out);
             *out = NULL;
             *out_len = 0;
@@ -836,13 +852,12 @@ int rsp_dp_authenticate_client(rsp_dp_session_t *s,
         memcpy(s->eid, eid_buf, eid_len);
         s->eid_len = eid_len;
 
-        memcpy(s->iccid, md_tmp.iccid.buf, 10);
-        memcpy(s->profile_name, md_tmp.profileName.buf,
-               md_tmp.profileName.size);
-        s->profile_name[md_tmp.profileName.size] = '\0';
-        memcpy(s->service_provider_name, md_tmp.serviceProviderName.buf,
-               md_tmp.serviceProviderName.size);
-        s->service_provider_name[md_tmp.serviceProviderName.size] = '\0';
+        /* The caller's metadata, whole and unmodified -- see this
+           struct's own comment on the field. */
+        memcpy(md_copy, metadata, metadata_len);
+        free(s->metadata);
+        s->metadata = md_copy;
+        s->metadata_len = metadata_len;
 
         /* sig still holds smdpSignature2 from the signing block above --
            what the eUICC will fold into euiccSignature2, and what
@@ -1146,9 +1161,8 @@ int rsp_dp_get_bound_profile_package(rsp_dp_session_t *s,
     in.upp = upp;
     in.upp_len = upp_len;
     in.otpk_dp = otpk_dp;
-    in.iccid = s->iccid;
-    in.profile_name = s->profile_name;
-    in.service_provider_name = s->service_provider_name;
+    in.metadata = s->metadata;
+    in.metadata_len = s->metadata_len;
     in.transaction_id = s->transaction_id;
     in.euicc_otpk = resp.choice.downloadResponseOk.euiccSigned2.euiccOtpk.buf;
     in.dppb = &dppb;

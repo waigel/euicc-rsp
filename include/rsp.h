@@ -334,9 +334,29 @@ typedef struct {
     const uint8_t *upp;        /* the profile package, DER */
     size_t         upp_len;
     const uint8_t *otpk_dp;    /* our one-time public key, otPK.DP.ECKA, 65 bytes */
-    const uint8_t *iccid;      /* 10 bytes */
-    const char    *profile_name;
-    const char    *service_provider_name;
+    /* The Profile Metadata, already encoded as a StoreMetadataRequest --
+     * placed in the BPP's '88' group byte for byte, not decoded and
+     * rebuilt.
+     *
+     * This used to be three fields (iccid, profile_name,
+     * service_provider_name) that this library re-encoded into a fresh
+     * StoreMetadataRequest. That silently dropped every other field the
+     * caller had put in it: profileClass, iconType/icon,
+     * notificationConfigurationInfo, profileOwner, profilePolicyRules.
+     * The consequence is not cosmetic -- the metadata an LPA shows a
+     * person comes from ES9+.AuthenticateClient's own profileMetaData,
+     * which does carry the caller's full version, so the two disagreed
+     * about the same Profile. profileClass is the sharpest case: SGP.22
+     * v2.6 section 2.4.5.3 requires a Test Profile to say so in its
+     * metadata, and a rebuilt StoreMetadataRequest could never say it.
+     *
+     * Passed through rather than validated here: whoever encoded it is
+     * the one that knows what belongs in it, and re-encoding is precisely
+     * what this field exists to stop. rsp_dp_get_bound_profile_package
+     * hands over the same bytes its own caller supplied to
+     * rsp_dp_authenticate_client, which did decode and check them. */
+    const uint8_t *metadata;
+    size_t         metadata_len;
     const uint8_t *transaction_id; /* 16 bytes; InitialiseSecureChannelRequest.transactionId */
     const uint8_t *euicc_otpk; /* otPK.EUICC.ECKA, 65 bytes; part of what
                                    smdpSign covers (section 5.5.1) -- the
