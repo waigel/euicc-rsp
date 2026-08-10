@@ -895,22 +895,41 @@ int main(void) {
                    SharedInfo ever used a different hostId than
                    RSP_HOST_ID, this recomputation would derive a
                    different session, and rsp_bpp_recover below would
-                   fail. See this file's own top comment. */
-                uint8_t shared_info[2 + 1 + RSP_HOST_ID_LEN + 1 + 32];
+                   fail. See this file's own top comment.
+
+                   The EID goes in as its sixteen octets, not as the
+                   thirty-two decimal characters EUICC_TEST_EID spells it
+                   with: Annex G's EID-LV is the eidValue an eUICC holds,
+                   "[APPLICATION 26] Octet16". Packed here digit pair by
+                   digit pair rather than by calling src/rsp_es9.c's own
+                   converter, so a bug in that converter cannot agree with
+                   this recomputation by construction -- the same reason
+                   RSP_HOST_ID is read from the header instead of from a
+                   function. */
+                uint8_t shared_info[2 + 1 + RSP_HOST_ID_LEN + 1 + 16];
                 size_t si_len = 0;
                 rsp_session_t expected;
                 uint8_t *recovered = NULL;
                 size_t recovered_len = 0;
-                size_t eid_len = strlen(EUICC_TEST_EID);
+                uint8_t eid_octets[16];
+                size_t i;
+
+                ok("the test EID is thirty-two decimal digits",
+                   strlen(EUICC_TEST_EID) == 32);
+                for (i = 0; i < 16; i++) {
+                    eid_octets[i] = (uint8_t)
+                        (((EUICC_TEST_EID[2 * i] - '0') << 4) |
+                          (EUICC_TEST_EID[2 * i + 1] - '0'));
+                }
 
                 shared_info[0] = 0x88;
                 shared_info[1] = 0x10;
                 shared_info[2] = (uint8_t)RSP_HOST_ID_LEN;
                 memcpy(shared_info + 3, RSP_HOST_ID, RSP_HOST_ID_LEN);
-                shared_info[3 + RSP_HOST_ID_LEN] = (uint8_t)eid_len;
+                shared_info[3 + RSP_HOST_ID_LEN] = (uint8_t)sizeof eid_octets;
                 memcpy(shared_info + 3 + RSP_HOST_ID_LEN + 1,
-                       EUICC_TEST_EID, eid_len);
-                si_len = 3 + RSP_HOST_ID_LEN + 1 + eid_len;
+                       eid_octets, sizeof eid_octets);
+                si_len = 3 + RSP_HOST_ID_LEN + 1 + sizeof eid_octets;
 
                 ok("the independently-recomputed session derives",
                    rsp_session_init(otsk_dp, euicc_otpk, shared_info,

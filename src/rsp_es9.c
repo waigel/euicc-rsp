@@ -945,8 +945,47 @@ static int derive_public_key(const uint8_t sk[32], uint8_t pk[65])
  * digit count). Returns 0, or -1 if either length does not fit one byte
  * (never true for this file's own callers) or the assembled SharedInfo
  * does not fit out_cap. */
+/* The EID as Annex G's SharedInfo wants it: sixteen octets, not the
+   thirty-two decimal characters this session carries.
+ *
+ * rsp_dp_authenticate_client learns the EID from CERT.EUICC.ECDSA's
+ * Subject 'serialNumber', where section 4.5.1 defines it as "the EID as a
+ * decimal PrintableString" -- so s->eid holds ASCII digits, which is also
+ * what rsp_dp_session_eid hands a caller back and what a person reads.
+ * The eUICC's own copy is eidValue, "[APPLICATION 26] Octet16"
+ * (rsp-2.5.asn), sixteen binary octets, and that is what it derives its
+ * half of the session over. Feeding the digit string into SharedInfo
+ * instead makes both the length octet and every value octet differ, so
+ * the two sides derive different S-ENC/S-MAC and the first MAC'd element
+ * of the Bound Profile Package -- '87', ConfigureISDP -- comes back as
+ * errorReason scp03tSecurityError(8) in a ProfileInstallationResult. The
+ * InitialiseSecureChannelRequest ahead of it still passes, because that
+ * one is signed rather than MAC'd, which is what makes this failure land
+ * one element later than its cause.
+ *
+ * Two decimal digits pack into one octet, most significant nibble first.
+ * Returns 0, or -1 if the digit string is not exactly 2*out_cap digits or
+ * holds anything but digits. */
+static int eid_digits_to_octets(const char *eid, size_t eid_len,
+                                 uint8_t *out, size_t out_cap)
+{
+    size_t i;
+
+    if (eid_len != out_cap * 2) {
+        return -1;
+    }
+    for (i = 0; i < out_cap; i++) {
+        char hi = eid[2 * i], lo = eid[2 * i + 1];
+        if (hi < '0' || hi > '9' || lo < '0' || lo > '9') {
+            return -1;
+        }
+        out[i] = (uint8_t)(((hi - '0') << 4) | (lo - '0'));
+    }
+    return 0;
+}
+
 static int build_shared_info(const uint8_t *host_id, size_t host_id_len,
-                              const char *eid, size_t eid_len,
+                              const uint8_t *eid, size_t eid_len,
                               uint8_t *out, size_t out_cap, size_t *out_len)
 {
     size_t n = 2 + 1 + host_id_len + 1 + eid_len;
@@ -1076,11 +1115,18 @@ int rsp_dp_get_bound_profile_package(rsp_dp_session_t *s,
             goto out;
         }
 
-        if (build_shared_info(RSP_HOST_ID, RSP_HOST_ID_LEN,
-                               s->eid, s->eid_len,
-                               shared_info, sizeof shared_info,
-                               &shared_info_len) != 0) {
-            goto out;
+        {
+            uint8_t eid_octets[16];
+            if (eid_digits_to_octets(s->eid, s->eid_len,
+                                      eid_octets, sizeof eid_octets) != 0) {
+                goto out;
+            }
+            if (build_shared_info(RSP_HOST_ID, RSP_HOST_ID_LEN,
+                                   eid_octets, sizeof eid_octets,
+                                   shared_info, sizeof shared_info,
+                                   &shared_info_len) != 0) {
+                goto out;
+            }
         }
         if (rsp_session_init(otsk_dp, rok->euiccSigned2.euiccOtpk.buf,
                               shared_info, shared_info_len, &session) != 0) {
