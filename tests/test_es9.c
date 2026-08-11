@@ -491,6 +491,14 @@ int main(void) {
         0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11,
         0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99
     };
+    /* Fixed for the same reason transaction_id is: with the last value
+       this function used to draw from entropy now supplied by the
+       caller, a whole session becomes reproducible, and reproducible is
+       what makes a recorded fixture possible. */
+    static const uint8_t server_challenge_in[16] = {
+        0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87,
+        0x78, 0x69, 0x5a, 0x4b, 0x3c, 0x2d, 0x1e, 0x0f
+    };
     unsigned char info1_buf[512];
     size_t info1_len = 0;
     rsp_dp_session_t *sess = NULL;
@@ -503,7 +511,7 @@ int main(void) {
 
     rc = rsp_dp_initiate_authentication(euicc_challenge, sizeof euicc_challenge,
                                          info1_buf, info1_len,
-                                         transaction_id,
+                                         transaction_id, server_challenge_in,
                                          SMDP_ADDR, SMDP_ADDR,
                                          &sess, &resp, &resp_len);
     ok("rsp_dp_initiate_authentication succeeds", rc == 0);
@@ -536,6 +544,31 @@ int main(void) {
     ok("serverSigned1.euiccChallenge equals the challenge",
        decoded->serverSigned1.euiccChallenge.size == 16 &&
        memcmp(decoded->serverSigned1.euiccChallenge.buf, euicc_challenge, 16) == 0);
+
+    ok("serverSigned1.serverChallenge is the one that was passed in",
+       decoded->serverSigned1.serverChallenge.size == 16 &&
+       memcmp(decoded->serverSigned1.serverChallenge.buf,
+              server_challenge_in, 16) == 0);
+
+    /* With the serverChallenge supplied rather than drawn, and rsp_sign
+       signing deterministically, this function is a pure function of
+       its inputs. That is the property tools/session-fixtures stands
+       on: a session recorded once replays anywhere. */
+    {
+        rsp_dp_session_t *sr = NULL;
+        uint8_t *rr = NULL;
+        size_t rr_len = 0;
+        int rcr = rsp_dp_initiate_authentication(
+                euicc_challenge, sizeof euicc_challenge,
+                info1_buf, info1_len, transaction_id, server_challenge_in,
+                SMDP_ADDR, SMDP_ADDR, &sr, &rr, &rr_len);
+        ok("the same inputs open a session again", rcr == 0);
+        ok("and produce a byte-identical response",
+           rcr == 0 && rr_len == resp_len &&
+           memcmp(rr, resp, resp_len) == 0);
+        free(rr);
+        rsp_dp_session_free(sr);
+    }
 
     /* serverSigned1.serverAddress is the SM-DP+'s own FQDN (5.7.13), and
        it is now the caller's to supply. Before this, a fixed
@@ -696,7 +729,7 @@ int main(void) {
         size_t r2_len = 0;
         int rc2 = rsp_dp_initiate_authentication(
                 euicc_challenge, sizeof euicc_challenge,
-                info1_buf, info1_len, transaction_id,
+                info1_buf, info1_len, transaction_id, server_challenge_in,
                 SMDP_ADDR, SMDP_UPPER, &s2, &r2, &r2_len);
         ok("a case-only difference is accepted", rc2 == 0);
         free(r2);
@@ -709,7 +742,7 @@ int main(void) {
         size_t r3_len = 0;
         int rc3 = rsp_dp_initiate_authentication(
                 euicc_challenge, sizeof euicc_challenge,
-                info1_buf, info1_len, transaction_id,
+                info1_buf, info1_len, transaction_id, server_challenge_in,
                 SMDP_ADDR, SMDP_OTHER, &s3, &r3, &r3_len);
         ok("a different address is refused with -1", rc3 == -1);
         ok("a refusal returns no session", s3 == NULL);
@@ -723,7 +756,7 @@ int main(void) {
         size_t r4_len = 0;
         int rc4 = rsp_dp_initiate_authentication(
                 euicc_challenge, sizeof euicc_challenge,
-                info1_buf, info1_len, transaction_id,
+                info1_buf, info1_len, transaction_id, server_challenge_in,
                 NULL, SMDP_ADDR, &s4, &r4, &r4_len);
         ok("a null server address is -2, not -1", rc4 == -2);
     }
@@ -738,7 +771,7 @@ int main(void) {
         InitiateAuthenticationOkEs9_t *d5 = NULL;
         int rc5 = rsp_dp_initiate_authentication(
                 euicc_challenge, sizeof euicc_challenge,
-                info1_buf, info1_len, transaction_id,
+                info1_buf, info1_len, transaction_id, server_challenge_in,
                 SMDP_ADDR, NULL, &s5, &r5, &r5_len);
         ok("a null requested address skips the check", rc5 == 0);
         if (rc5 == 0 && r5) {
@@ -1005,7 +1038,7 @@ int main(void) {
             size_t resp2_len = 0;
             int rc2 = rsp_dp_initiate_authentication(
                     euicc_challenge, sizeof euicc_challenge,
-                    info1_buf, info1_len, transaction_id,
+                    info1_buf, info1_len, transaction_id, server_challenge_in,
                     SMDP_ADDR, SMDP_ADDR,
                     &sess2, &resp2, &resp2_len);
             ok("a second session opens, for the mismatched-transactionId case",
@@ -1068,7 +1101,7 @@ int main(void) {
             size_t resp3_len = 0;
             int rc3 = rsp_dp_initiate_authentication(
                     euicc_challenge, sizeof euicc_challenge,
-                    info1_buf, info1_len, transaction_id,
+                    info1_buf, info1_len, transaction_id, server_challenge_in,
                     SMDP_ADDR, SMDP_ADDR,
                     &sess3, &resp3, &resp3_len);
             ok("a third session opens, for the non-chaining-certificate case",

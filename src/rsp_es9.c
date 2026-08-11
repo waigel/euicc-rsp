@@ -302,6 +302,7 @@ int rsp_dp_initiate_authentication(
         const uint8_t *euicc_challenge, size_t challenge_len,
         const uint8_t *euicc_info1, size_t info1_len,
         const uint8_t transaction_id[16],
+        const uint8_t server_challenge[16],
         const char *server_address,
         const char *requested_address,
         rsp_dp_session_t **out,
@@ -311,16 +312,12 @@ int rsp_dp_initiate_authentication(
     EUICCInfo1_t info1_tmp;
     rsp_credential_t dpauth;
     mbedtls_x509_crt ci_crt;
-    mbedtls_entropy_context ent;
-    mbedtls_ctr_drbg_context drbg;
     const uint8_t *ci_der;
     size_t ci_len;
     uint8_t *ss1_der = NULL;
     size_t ss1_der_len = 0;
     uint8_t sig[64];
-    uint8_t server_challenge[16];
     int have_dpauth = 0;
-    int have_rng = 0;
     /* -2 by default: every goto out below is a question never reached.
      * The one genuine refusal -- the section 5.6.1 address check -- sets
      * -1 for itself, explicitly, just below. */
@@ -332,7 +329,8 @@ int rsp_dp_initiate_authentication(
     mbedtls_x509_crt_init(&ci_crt);
 
     if (!euicc_challenge || challenge_len != 16 || !euicc_info1 ||
-        info1_len == 0 || !transaction_id || !server_address ||
+        info1_len == 0 || !transaction_id || !server_challenge ||
+        !server_address ||
         !out || !resp || !resp_len) {
         goto out;
     }
@@ -365,13 +363,6 @@ int rsp_dp_initiate_authentication(
         }
     }
 
-    have_rng = rsp_rng_init(&ent, &drbg, "euicc-rsp/rsp_es9") == 0;
-    if (!have_rng ||
-        mbedtls_ctr_drbg_random(&drbg, server_challenge,
-                                 sizeof server_challenge) != 0) {
-        goto out;
-    }
-
     /* ServerSigned1, built directly inside ok: 5.7.13's "serverSignature1
      * SHALL apply on serverSigned1 data object" means the signed bytes
      * are ServerSigned1's own DER encoding -- exactly what encoding
@@ -393,8 +384,7 @@ int rsp_dp_initiate_authentication(
                               server_address,
                               (int)strlen(server_address)) != 0 ||
         OCTET_STRING_fromBuf(&ok.serverSigned1.serverChallenge,
-                              (const char *)server_challenge,
-                              sizeof server_challenge) != 0) {
+                              (const char *)server_challenge, 16) != 0) {
         goto out;
     }
 
@@ -466,8 +456,7 @@ int rsp_dp_initiate_authentication(
         }
         memcpy(sess->transaction_id, transaction_id, 16);
         memcpy(sess->euicc_challenge, euicc_challenge, 16);
-        memcpy(sess->server_challenge, server_challenge,
-               sizeof server_challenge);
+        memcpy(sess->server_challenge, server_challenge, 16);
         *out = sess;
     }
 
@@ -476,10 +465,6 @@ int rsp_dp_initiate_authentication(
 out:
     if (have_dpauth) {
         rsp_credential_free(&dpauth);
-    }
-    if (have_rng) {
-        mbedtls_ctr_drbg_free(&drbg);
-        mbedtls_entropy_free(&ent);
     }
     mbedtls_x509_crt_free(&ci_crt);
     ASN_STRUCT_RESET(asn_DEF_EUICCInfo1, &info1_tmp);
