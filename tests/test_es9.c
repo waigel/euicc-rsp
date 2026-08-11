@@ -65,6 +65,16 @@ static void ok(const char *what, int good) {
     if (!good) fails++;
 }
 
+/* SGP.22 v2.6 section 5.6.1 has the SM-DP+ compare the address the LPA
+   sent against its own "case-insensitive[ly]". A host name is ASCII, and
+   strcasecmp folds according to the locale, so these three state the
+   property in the only terms that hold everywhere. SMDP_ADDR is also
+   what the fixtures below echo back, so that what the eUICC is made to
+   say it saw is what the server was actually given. */
+static const char SMDP_ADDR[]  = "smdp.example.com";
+static const char SMDP_UPPER[] = "SMDP.EXAMPLE.COM";
+static const char SMDP_OTHER[] = "other.example.com";
+
 /* A fixed-capacity sink for der_encode's callback interface. */
 struct sink {
     unsigned char *p;
@@ -216,8 +226,13 @@ static int build_auth_server_response(
 
     if (OCTET_STRING_fromBuf(&rok->euiccSigned1.transactionId,
                               (const char *)transaction_id, 16) != 0 ||
+        /* The eUICC echoes back the serverAddress it was sent, so this
+           fixture must echo the one the server actually signed. The
+           length is strlen, not sizeof: the previous literal passed 33
+           for a 32-character string and carried the NUL into the
+           UTF8String. */
         OCTET_STRING_fromBuf(&rok->euiccSigned1.serverAddress,
-                              "smdp-address-placeholder.invalid", 33) != 0 ||
+                              SMDP_ADDR, (int)strlen(SMDP_ADDR)) != 0 ||
         OCTET_STRING_fromBuf(&rok->euiccSigned1.serverChallenge,
                               (const char *)server_challenge, 16) != 0 ||
         build_euicc_info2(&rok->euiccSigned1.euiccInfo2) != 0 ||
@@ -489,6 +504,7 @@ int main(void) {
     rc = rsp_dp_initiate_authentication(euicc_challenge, sizeof euicc_challenge,
                                          info1_buf, info1_len,
                                          transaction_id,
+                                         SMDP_ADDR, SMDP_ADDR,
                                          &sess, &resp, &resp_len);
     ok("rsp_dp_initiate_authentication succeeds", rc == 0);
     ok("a session was returned", sess != NULL);
@@ -520,6 +536,24 @@ int main(void) {
     ok("serverSigned1.euiccChallenge equals the challenge",
        decoded->serverSigned1.euiccChallenge.size == 16 &&
        memcmp(decoded->serverSigned1.euiccChallenge.buf, euicc_challenge, 16) == 0);
+
+    /* serverSigned1.serverAddress is the SM-DP+'s own FQDN (5.7.13), and
+       it is now the caller's to supply. Before this, a fixed
+       ".invalid" placeholder was signed in its place. */
+    ok("serverSigned1 carries the address it was given",
+       decoded->serverSigned1.serverAddress.size == (int)strlen(SMDP_ADDR) &&
+       memcmp(decoded->serverSigned1.serverAddress.buf,
+              SMDP_ADDR, strlen(SMDP_ADDR)) == 0);
+
+    /* The placeholder ended in RFC 2606's reserved ".invalid". Checking
+       the tail rather than searching the whole string keeps this to
+       plain C89 -- memmem is a GNU/BSD extension and would need
+       _GNU_SOURCE on the Linux CI runner. */
+    ok("no placeholder address survives",
+       decoded->serverSigned1.serverAddress.size >= 8 &&
+       memcmp(decoded->serverSigned1.serverAddress.buf +
+                  decoded->serverSigned1.serverAddress.size - 8,
+              ".invalid", 8) != 0);
 
     ok("serverSignature1 is 64 bytes (plain r||s, not DER)",
        decoded->serverSignature1.size == 64);
@@ -584,6 +618,144 @@ int main(void) {
         rsp_credential_free(&dppb);
     }
 
+    /* --- rsp_dp_initiate_fields: the five fields the JSON binding names
+       (SGP.22 v2.6 section 6.5.2.6), cut out of the response rather
+       than decoded and rebuilt ------------------------------------- */
+    {
+        rsp_dp_initiate_fields_t f;
+        memset(&f, 0, sizeof f);
+
+        ok("initiate fields slice out",
+           rsp_dp_initiate_fields(resp, resp_len, &f) == 0);
+        ok("every initiate field is non-empty",
+           f.transaction_id_len && f.server_signed1_len &&
+           f.server_signature1_len && f.euicc_ci_pkid_len &&
+           f.server_certificate_len);
+        ok("initiate fields borrow from the response",
+           f.transaction_id >= resp &&
+           f.server_certificate + f.server_certificate_len <= resp + resp_len);
+
+        /* serverSigned1 and serverCertificate are both untagged
+           SEQUENCEs encoding with tag '30'. A tag search would find the
+           first and call it the second, so the walk must be positional
+           -- these two assertions are what would catch that. */
+        ok("serverSigned1 precedes serverSignature1",
+           f.server_signed1 < f.server_signature1);
+        ok("serverCertificate follows serverSignature1",
+           f.server_certificate > f.server_signature1);
+
+        ok("serverSignature1 carries its own tag ([APPLICATION 55], 5F37)",
+           f.server_signature1_len > 2 && f.server_signature1[0] == 0x5f &&
+           f.server_signature1[1] == 0x37);
+        /* [0] over an OCTET STRING, and rsp-2.5.asn is AUTOMATIC TAGS,
+           so the tag is implicit and primitive -- 80, not the
+           constructed A0 an explicit tag would give. Pinned here
+           because the slice's first byte is what a server base64s. */
+        ok("transactionId carries its own tag ([0] implicit, 80)",
+           f.transaction_id_len > 2 && f.transaction_id[0] == 0x80);
+
+        ok("a truncated response is refused, not misread",
+           rsp_dp_initiate_fields(resp, resp_len / 2, &f) == -1);
+        ok("a null response is -2",
+           rsp_dp_initiate_fields(NULL, resp_len, &f) == -2);
+        ok("a null out is -2",
+           rsp_dp_initiate_fields(resp, resp_len, NULL) == -2);
+    }
+
+    /* The whole point of slicing: what comes out is what went in.
+       Re-encode ServerSigned1 from the decode above and require the
+       bytes to be identical to the slice. If they ever differ, this
+       function has started reconstructing rather than cutting, and a
+       BER response would silently change on the wire -- the failure
+       commit 8928231 removed elsewhere. */
+    {
+        rsp_dp_initiate_fields_t f;
+        unsigned char again[512];
+        struct sink sk = { again, 0, sizeof again };
+        asn_enc_rval_t er;
+
+        memset(&f, 0, sizeof f);
+        ok("fields for the round trip",
+           rsp_dp_initiate_fields(resp, resp_len, &f) == 0);
+        er = der_encode(&asn_DEF_ServerSigned1, &decoded->serverSigned1,
+                        collect, &sk);
+        ok("serverSigned1 re-encodes", er.encoded > 0);
+        ok("and the slice is byte-identical to it",
+           sk.len == f.server_signed1_len &&
+           memcmp(again, f.server_signed1, f.server_signed1_len) == 0);
+    }
+
+    /* --- the section 5.6.1 address check itself, four ways ------------
+       "Check if the received address matches its own SM-DP+ address,
+       where the comparison SHALL be case-insensitive." Each of these
+       opens its own session, because a refusal must not leave one
+       behind. */
+    {
+        rsp_dp_session_t *s2 = NULL;
+        uint8_t *r2 = NULL;
+        size_t r2_len = 0;
+        int rc2 = rsp_dp_initiate_authentication(
+                euicc_challenge, sizeof euicc_challenge,
+                info1_buf, info1_len, transaction_id,
+                SMDP_ADDR, SMDP_UPPER, &s2, &r2, &r2_len);
+        ok("a case-only difference is accepted", rc2 == 0);
+        free(r2);
+        rsp_dp_session_free(s2);
+    }
+
+    {
+        rsp_dp_session_t *s3 = NULL;
+        uint8_t *r3 = NULL;
+        size_t r3_len = 0;
+        int rc3 = rsp_dp_initiate_authentication(
+                euicc_challenge, sizeof euicc_challenge,
+                info1_buf, info1_len, transaction_id,
+                SMDP_ADDR, SMDP_OTHER, &s3, &r3, &r3_len);
+        ok("a different address is refused with -1", rc3 == -1);
+        ok("a refusal returns no session", s3 == NULL);
+        ok("a refusal returns no response", r3 == NULL);
+    }
+
+    {
+        /* A missing own-address is a question never reached, not a no. */
+        rsp_dp_session_t *s4 = NULL;
+        uint8_t *r4 = NULL;
+        size_t r4_len = 0;
+        int rc4 = rsp_dp_initiate_authentication(
+                euicc_challenge, sizeof euicc_challenge,
+                info1_buf, info1_len, transaction_id,
+                NULL, SMDP_ADDR, &s4, &r4, &r4_len);
+        ok("a null server address is -2, not -1", rc4 == -2);
+    }
+
+    {
+        /* No address to check against is legitimate -- a caller that
+           never received one. The comparison is skipped; the signing
+           is not. */
+        rsp_dp_session_t *s5 = NULL;
+        uint8_t *r5 = NULL;
+        size_t r5_len = 0;
+        InitiateAuthenticationOkEs9_t *d5 = NULL;
+        int rc5 = rsp_dp_initiate_authentication(
+                euicc_challenge, sizeof euicc_challenge,
+                info1_buf, info1_len, transaction_id,
+                SMDP_ADDR, NULL, &s5, &r5, &r5_len);
+        ok("a null requested address skips the check", rc5 == 0);
+        if (rc5 == 0 && r5) {
+            asn_dec_rval_t dr5 = ber_decode(
+                    NULL, &asn_DEF_InitiateAuthenticationOkEs9,
+                    (void **)&d5, r5, r5_len);
+            ok("and still signs the real address",
+               dr5.code == RC_OK && d5 != NULL &&
+               d5->serverSigned1.serverAddress.size == (int)strlen(SMDP_ADDR) &&
+               memcmp(d5->serverSigned1.serverAddress.buf,
+                      SMDP_ADDR, strlen(SMDP_ADDR)) == 0);
+            ASN_STRUCT_FREE(asn_DEF_InitiateAuthenticationOkEs9, d5);
+        }
+        free(r5);
+        rsp_dp_session_free(s5);
+    }
+
     /* server_challenge: generated internally by rsp_dp_initiate_
        authentication (real entropy, not caller-supplied -- see
        src/rsp_es9.c's own top comment), so the only way this test can
@@ -643,6 +815,41 @@ int main(void) {
         ok("rsp_dp_authenticate_client succeeds on a genuine response",
            rc == 0);
         ok("a response was returned", ac_out != NULL && ac_out_len > 0);
+
+        /* --- rsp_dp_authenticate_fields: the five fields of section
+           6.5.2.8. This response is an AuthenticateClientResponseEs9 --
+           the CHOICE, tag 'BF3B' -- not the bare Ok SEQUENCE that
+           InitiateAuthentication returns, so the walk has one more
+           level to step through. --------------------------------- */
+        if (rc == 0 && ac_out) {
+            rsp_dp_authenticate_fields_t g;
+            memset(&g, 0, sizeof g);
+
+            ok("authenticate fields slice out",
+               rsp_dp_authenticate_fields(ac_out, ac_out_len, &g) == 0);
+            ok("every authenticate field is non-empty",
+               g.transaction_id_len && g.profile_metadata_len &&
+               g.smdp_signed2_len && g.smdp_signature2_len &&
+               g.smdp_certificate_len);
+            ok("authenticate fields borrow from the response",
+               g.transaction_id >= ac_out &&
+               g.smdp_certificate + g.smdp_certificate_len
+                   <= ac_out + ac_out_len);
+            ok("profileMetadata carries its own tag ([37], BF25)",
+               g.profile_metadata_len > 2 && g.profile_metadata[0] == 0xbf &&
+               g.profile_metadata[1] == 0x25);
+            ok("smdpSignature2 carries its own tag ([APPLICATION 55], 5F37)",
+               g.smdp_signature2_len > 2 && g.smdp_signature2[0] == 0x5f &&
+               g.smdp_signature2[1] == 0x37);
+            /* smdpSigned2 and smdpCertificate are the pair of untagged
+               SEQUENCEs here -- same positional requirement. */
+            ok("smdpCertificate follows smdpSignature2",
+               g.smdp_certificate > g.smdp_signature2);
+            ok("a truncated authenticate response is refused",
+               rsp_dp_authenticate_fields(ac_out, ac_out_len / 2, &g) == -1);
+            ok("a null authenticate response is -2",
+               rsp_dp_authenticate_fields(NULL, ac_out_len, &g) == -2);
+        }
 
         if (rc == 0 && ac_out) {
             AuthenticateClientResponseEs9_t *ac_decoded = NULL;
@@ -799,6 +1006,7 @@ int main(void) {
             int rc2 = rsp_dp_initiate_authentication(
                     euicc_challenge, sizeof euicc_challenge,
                     info1_buf, info1_len, transaction_id,
+                    SMDP_ADDR, SMDP_ADDR,
                     &sess2, &resp2, &resp2_len);
             ok("a second session opens, for the mismatched-transactionId case",
                rc2 == 0 && sess2 != NULL);
@@ -861,6 +1069,7 @@ int main(void) {
             int rc3 = rsp_dp_initiate_authentication(
                     euicc_challenge, sizeof euicc_challenge,
                     info1_buf, info1_len, transaction_id,
+                    SMDP_ADDR, SMDP_ADDR,
                     &sess3, &resp3, &resp3_len);
             ok("a third session opens, for the non-chaining-certificate case",
                rc3 == 0 && sess3 != NULL);

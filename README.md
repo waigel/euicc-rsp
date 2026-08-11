@@ -21,16 +21,26 @@ What is still open is narrower, and each piece is spec-conformant on its
 own: the Profile Protection Keys ("random key") mode, a `'88'` too large for
 one segment, and a handful of OPTIONAL metadata fields --
 [`include/rsp.h`](include/rsp.h)'s comment on `rsp_bpp_input_t` has the full
-list and why each one is still open. One more sits a level up, in ES9+
-rather than in the BPP: `serverAddress` has no parameter that could carry a
-real value yet, so an `.invalid` placeholder is genuinely signed in its
-place (see [`src/rsp_es9.c`](src/rsp_es9.c)).
+list and why each one is still open.
 
-The session also stops where the download does. Of ES9+'s five functions,
+`serverAddress` used to sit on that list and no longer does. The SM-DP+'s
+own address is now a parameter of `rsp_dp_initiate_authentication`, and so
+is the `smdpAddress` the LPA sent: SGP.22 section 5.6.1 has the server
+compare the two case-insensitively, and a mismatch is the one thing that
+function refuses. An `.invalid` placeholder used to be signed in its place.
+The same call's response can now be read apart into the five fields the
+ES9+ JSON binding names (section 6.5.2.6), as can `AuthenticateClient`'s
+(section 6.5.2.8) -- cut out of the encoded bytes rather than decoded and
+rebuilt, so what a server puts on the wire is what was signed.
+
+The session still stops where the download does. Of ES9+'s five functions,
 the three above are implemented; `HandleNotification` and `CancelSession`
-are not, so nothing here verifies a `ProfileInstallationResult`. This
-library can bind a Profile to an eUICC, and cannot yet learn whether the
-eUICC installed it.
+are not. A `ProfileInstallationResult` that reaches this library *is*
+checked against the eUICC's own signature over it
+(`rsp_dp_verify_installation_result`), but nothing here receives one over
+a network, and no notification the eUICC queues is collected. This library
+can bind a Profile to an eUICC and judge the report it is handed; it
+cannot yet go and ask for one.
 
 | Repository | Role |
 | --- | --- |
