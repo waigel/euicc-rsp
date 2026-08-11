@@ -274,10 +274,15 @@ CHOICE.
 
 The protocol knowledge stays in the library rather than being
 reconstructed by a TLV walker on the Rust side: each of the two functions
-gains a way to hand back its fields individually, and the level
-inconsistency is straightened out in the same change. The alternative --
+gains a way to hand back its fields individually. The alternative --
 having the server re-open the DER the library just wrote -- would put the
 same structural knowledge in two places, free to drift.
+
+The level inconsistency itself is **not** straightened out, contrary to
+what an earlier draft of this section said. Changing what either function
+returns would change bytes that `euicc-lpa`'s `PrepareDownload`
+repacking already consumes, for no benefit this design needs. The two
+accessors absorb the difference and the header documents it.
 
 ### `euicc-tools`: `euicc card install --server URL`
 
@@ -310,8 +315,7 @@ not chain to a public root.
    ES9+ endpoints" and in the two `euicc-rsp` changes above.
 2. `euicc-rsp`: the address parameter pair, the `invalidDpAddress`
    refusal, and the `-1`/`-2` split it brings.
-3. `euicc-rsp`: field accessors for the two response types, levels
-   straightened.
+3. `euicc-rsp`: field accessors for the two response types.
 4. `euicc-smdp` skeleton: workspace, `rsp-sys` with bindgen and a
    working link against `librsp.a`.
 5. The safe wrapper and its error type.
