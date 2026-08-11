@@ -174,24 +174,58 @@ abstraction, no trait for something that has one implementation.
 
 ### The ES9+ endpoints
 
-`axum`, with TLS terminated in-process by `rustls`. Three routes under
-`/gsma/rsp2/es9plus/`: `initiateAuthentication`, `authenticateClient`,
-`getBoundProfilePackage`. Each is a thin adapter -- decode the request,
-find or create the session, call one `euicc-rsp` function, encode the
-answer.
+`axum`, with TLS terminated in-process by `rustls`. Three routes, taken
+from Table 57: `/gsma/rsp2/es9plus/initiateAuthentication`,
+`/gsma/rsp2/es9plus/authenticateClient`,
+`/gsma/rsp2/es9plus/getBoundProfilePackage`. Each is a thin adapter --
+decode the request, find or create the session, call one `euicc-rsp`
+function, encode the answer.
 
-**The exact binding must be read out of SGP.22 section 6.5 before
-implementation, not recalled.** The working assumption is JSON over
-HTTPS with base64-encoded DER in the payload fields and an
-`X-Admin-Protocol` header, but field names and the precise request and
-response shapes are to be confirmed against the specification text.
-Verifying this is the first step of the implementation plan, and its
-outcome may adjust the adapter layer.
+The binding is the JSON binding of section 6.5, read out of the
+specification rather than recalled. What it actually says, including the
+four points where an earlier draft of this design was wrong:
 
-On TLS: SGP.22 requires a production SM-DP+'s TLS certificate to chain
-to the GSMA CI. The only client here is our own `euicc-tools`, so the
-server runs with a certificate the client is told to trust explicitly.
-The DP signing credentials remain SGP.26 test material, unchanged.
+- **Requests carry no header.** Section 6.5.1.1: "HTTP messages for ES9+
+  and ES11 SHALL not contain the `<JSON requestHeader>`". An ES9+ request
+  body is the bare function body. Only responses carry a header, and it
+  holds `functionExecutionStatus`.
+- **The HTTP status code carries no function-level meaning.** Section
+  6.3: a synchronous request-response function answers `200` "regardless
+  whether the function response is an error or a success". Failures live
+  in `functionExecutionStatus.status` (`Executed-Success`,
+  `Executed-WithWarning`, `Failed`, `Expired`) with `statusCodeData`
+  carrying `subjectCode` and `reasonCode` as OIDs from sections 5.2.6.1
+  and 5.2.6.2. `RspError`'s distinction still decides what goes in the
+  body -- it just does not decide the status code. (`204` with an empty
+  body is for the Notification MEP, which is `handleNotification`, not
+  built here.)
+- **`transactionId` is uppercase hex, not base64** -- pattern
+  `^[0-9,A-F]{2,32}$`. Every other payload field is base64-encoded DER.
+- **Headers**: `X-Admin-Protocol: gsma/rsp/v<x.y.z>` on request and
+  response, `Content-Type: application/json`, and `User-Agent:
+  gsma-rsp-lpad` on the request (section 6.2).
+
+Field names, confirmed from sections 6.5.2.6 to 6.5.2.8:
+
+| Function | Request | Response |
+| --- | --- | --- |
+| `initiateAuthentication` | `euiccChallenge`, `euiccInfo1`, `smdpAddress` | `transactionId`, `serverSigned1`, `serverSignature1`, `euiccCiPKIdToBeUsed`, `serverCertificate` |
+| `authenticateClient` | `transactionId`, `authenticateServerResponse`, `useMatchingIdForAcr` (optional) | `transactionId`, `profileMetadata`, `smdpSigned2`, `smdpSignature2`, `smdpCertificate` |
+| `getBoundProfilePackage` | `transactionId`, `prepareDownloadResponse` | `transactionId`, `boundProfilePackage` |
+
+The ASN.1 binding of section 6.6 -- one path, `/gsma/rsp2/asn1`, DER in
+and DER out -- is a conformant alternative and would fit the library's
+current return shapes more closely. It is not chosen: real SM-DP+
+servers and LPAs use the JSON binding in practice, and a server that
+only speaks ASN.1 could not be pointed at by anything but our own
+client.
+
+On TLS: section 6.1 mandates TLS 1.2 and, on ES9+, server
+authentication only -- mutual TLS is required on ES2+, ES12 and ES15,
+not here. A production SM-DP+'s TLS certificate chains to the GSMA CI;
+the only client here is our own `euicc-tools`, so the server runs with a
+certificate the client is told to trust explicitly. The DP signing
+credentials remain SGP.26 test material, unchanged.
 
 ### The CLI
 
@@ -212,14 +246,38 @@ leads and costs nothing to emit.
 This project spans three repositories. Both changes outside `euicc-smdp`
 are small and neither can be made from inside it.
 
-### `euicc-rsp`: a real `serverAddress`
+### `euicc-rsp`: two changes, both forced by the binding
 
-`src/rsp_es9.c` signs an `.invalid` placeholder because no parameter can
-carry a real value -- the README lists this as open. With a server at a
-real address, it stops being a placeholder.
-`rsp_dp_initiate_authentication` gains a server-address parameter -- it
-is the call that creates the session and the one whose `serverSigned1`
-carries the value -- and the placeholder path is removed.
+**A real `serverAddress`, and the check that comes with it.**
+`src/rsp_es9.c:191` signs the fixed placeholder
+`"smdp-address-placeholder.invalid"` because no parameter can carry a
+real value -- the README lists this as open. Reading section 5.6.1 shows
+this is not one value but two. The SM-DP+ "SHALL" also "[c]heck if the
+received address matches its own SM-DP+ address, where the comparison
+SHALL be case-insensitive", and `InitiateAuthenticationRequest` carries
+`smdpAddress [3] UTF8String` for exactly that.
+
+So `rsp_dp_initiate_authentication` takes both: the server's own address,
+which goes into `serverSigned1.serverAddress`, and the address the LPA
+sent, which is compared against it case-insensitively. A mismatch is a
+genuine refusal -- `InitiateAuthenticationError.invalidDpAddress(1)` --
+which means this function moves into the group that splits `-1` ("asked,
+answered no") from `-2` ("never reached"). It has a flat `-1` today
+because it had nothing to refuse.
+
+**Accessors for the response fields.** The JSON binding needs five named
+fields; the library returns one DER blob. Worse, the two functions do not
+even return blobs at the same level: `rsp_dp_initiate_authentication`
+encodes `InitiateAuthenticationOkEs9`, the inner SEQUENCE, while
+`rsp_dp_authenticate_client` encodes `AuthenticateClientResponseEs9`, the
+CHOICE.
+
+The protocol knowledge stays in the library rather than being
+reconstructed by a TLV walker on the Rust side: each of the two functions
+gains a way to hand back its fields individually, and the level
+inconsistency is straightened out in the same change. The alternative --
+having the server re-open the DER the library just wrote -- would put the
+same structural knowledge in two places, free to drift.
 
 ### `euicc-tools`: `euicc card install --server URL`
 
@@ -248,18 +306,22 @@ not chain to a public root.
 
 ## Order of work
 
-1. Read SGP.22 section 6.5 and write down the ES9+ HTTP binding as it
-   actually is. Everything downstream depends on this being right.
-2. `euicc-rsp`: the `serverAddress` parameter.
-3. `euicc-smdp` skeleton: workspace, `rsp-sys` with bindgen and a
+1. ~~Read the binding out of SGP.22.~~ Done; the results are in "The
+   ES9+ endpoints" and in the two `euicc-rsp` changes above.
+2. `euicc-rsp`: the address parameter pair, the `invalidDpAddress`
+   refusal, and the `-1`/`-2` split it brings.
+3. `euicc-rsp`: field accessors for the two response types, levels
+   straightened.
+4. `euicc-smdp` skeleton: workspace, `rsp-sys` with bindgen and a
    working link against `librsp.a`.
-4. The safe wrapper and its error type.
-5. Store trait, SQLite provider, schema, service module.
-6. CLI: `order add`, `order list`.
-7. The three ES9+ endpoints and `serve`.
-8. `euicc-tools`: `--server`.
-9. The hardware download.
+5. The safe wrapper and its error type.
+6. Store trait, SQLite provider, schema, service module.
+7. CLI: `order add`, `order list`.
+8. The three ES9+ endpoints and `serve`.
+9. `euicc-tools`: `--server`.
+10. The hardware download.
 
-Steps 1 and 3 carry the most risk -- an unfamiliar binding and a build
-that has to reach across a language boundary into an existing Makefile.
-Both are early on purpose.
+Step 4 now carries the most risk: a build that has to reach across a
+language boundary into an existing Makefile. It is early on purpose.
+Steps 2 and 3 are in C, in a repository with an existing test suite, and
+should be provable there before any Rust exists.
