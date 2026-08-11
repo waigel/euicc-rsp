@@ -165,6 +165,11 @@ GEN_INC := -idirafter $(DIST)
 # instead: adding tests/test_whatever.c is now sufficient on its own.
 TESTS   := $(patsubst tests/test_%.c,tests/run-%,$(wildcard tests/test_*.c))
 
+# The eUICC-side fixture builders, shared by every test binary and by
+# tools/session-fixtures -- see tests/fixtures.h for why they are not
+# static inside one test any more.
+FIXTURES := tests/fixtures.c
+
 .PHONY: all check clean mbedtls codec
 
 # build/sgp26_material.c is the first target textually in this file, so
@@ -234,8 +239,8 @@ $(LIB): $(OBJS)
 # this recipe's own link line lives here, not in any test_*.c, so make has
 # no other way to notice the line changed and would otherwise reuse an
 # already-built tests/run-% binary that no longer matches this recipe.
-tests/run-%: tests/test_%.c $(LIB) $(MBED_LIBS) $(DIST)/.stamp Makefile
-	$(CC) $(ALL_CFLAGS) $(GEN_INC) $< $(LIB) $(DIST)/*.o $(MBED_LIBS) -o $@
+tests/run-%: tests/test_%.c $(FIXTURES) tests/fixtures.h $(LIB) $(MBED_LIBS) $(DIST)/.stamp Makefile
+	$(CC) $(ALL_CFLAGS) $(GEN_INC) -Itests $< $(FIXTURES) $(LIB) $(DIST)/*.o $(MBED_LIBS) -o $@
 	@# On Darwin, a -g link auto-generates a companion run-%.dSYM directory.
 	@# tests/run-tests globs "run-*", so that bundle would be picked up and
 	@# "run" as if it were a test binary. Drop it: it is a build byproduct,
