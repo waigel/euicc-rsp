@@ -6,3 +6,5 @@ dist/
 build/
 .DS_Store
 .idea/
+tools/bpp-dump
+tools/session-fixtures
