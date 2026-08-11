@@ -435,12 +435,15 @@ typedef struct rsp_dp_session rsp_dp_session_t;
  * (section 5.7.13) will require of it. euicc_challenge (16 bytes,
  * Octet16 -- challenge_len must be exactly 16) and euicc_info1 (an
  * encoded EUICCInfo1, Table 35; rejected if it does not decode as one)
- * come from the eUICC by way of the LPA. transaction_id is 16 bytes the
- * caller supplies, not generated inside: production passes fresh random,
- * a test passes a fixed value, and that difference is the entire reason
- * a recorded session can be replayed -- there is no fallback that
- * generates one internally, so there is no test path that ships that
- * way by accident.
+ * come from the eUICC by way of the LPA. transaction_id and
+ * server_challenge are 16 bytes each, both supplied by the caller and
+ * neither generated inside: production passes fresh random, a test
+ * passes a fixed value, and that difference is the entire reason a
+ * recorded session can be replayed -- there is no fallback that
+ * generates either one internally, so there is no test path that ships
+ * that way by accident. With both fixed, and rsp_sign signing
+ * deterministically, this function is a pure function of its inputs;
+ * euicc-rsp's own tools/session-fixtures relies on exactly that.
  *
  * server_address is this SM-DP+'s own FQDN, NUL-terminated. It is what
  * ServerSigned1.serverAddress carries and what the eUICC will see signed
@@ -479,6 +482,7 @@ int rsp_dp_initiate_authentication(
         const uint8_t *euicc_challenge, size_t challenge_len,
         const uint8_t *euicc_info1, size_t info1_len,
         const uint8_t transaction_id[16],
+        const uint8_t server_challenge[16],
         const char *server_address,
         const char *requested_address,
         rsp_dp_session_t **out,

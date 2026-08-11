@@ -165,6 +165,11 @@ GEN_INC := -idirafter $(DIST)
 # instead: adding tests/test_whatever.c is now sufficient on its own.
 TESTS   := $(patsubst tests/test_%.c,tests/run-%,$(wildcard tests/test_*.c))
 
+# The eUICC-side fixture builders, shared by every test binary and by
+# tools/session-fixtures -- see tests/fixtures.h for why they are not
+# static inside one test any more.
+FIXTURES := tests/fixtures.c
+
 .PHONY: all check clean mbedtls codec
 
 # build/sgp26_material.c is the first target textually in this file, so
@@ -234,8 +239,8 @@ $(LIB): $(OBJS)
 # this recipe's own link line lives here, not in any test_*.c, so make has
 # no other way to notice the line changed and would otherwise reuse an
 # already-built tests/run-% binary that no longer matches this recipe.
-tests/run-%: tests/test_%.c $(LIB) $(MBED_LIBS) $(DIST)/.stamp Makefile
-	$(CC) $(ALL_CFLAGS) $(GEN_INC) $< $(LIB) $(DIST)/*.o $(MBED_LIBS) -o $@
+tests/run-%: tests/test_%.c $(FIXTURES) tests/fixtures.h $(LIB) $(MBED_LIBS) $(DIST)/.stamp Makefile
+	$(CC) $(ALL_CFLAGS) $(GEN_INC) -Itests $< $(FIXTURES) $(LIB) $(DIST)/*.o $(MBED_LIBS) -o $@
 	@# On Darwin, a -g link auto-generates a companion run-%.dSYM directory.
 	@# tests/run-tests globs "run-*", so that bundle would be picked up and
 	@# "run" as if it were a test binary. Drop it: it is a build byproduct,
@@ -261,9 +266,30 @@ tools/bpp-dump: tools/bpp-dump.o $(LIB) $(MBED_LIBS) $(DIST)/.stamp
 	$(CC) $(ALL_CFLAGS) $(GEN_INC) $< $(LIB) $(DIST)/*.o $(MBED_LIBS) -o $@
 	@rm -rf $@.dSYM
 
+# tools/session-fixtures writes one whole RSP session to disk so a consumer
+# outside this repository -- euicc-smdp, in Rust -- can replay it without a
+# card. It links the shared fixture builders for the eUICC side, and follows
+# bpp-dump's compile-then-link split for the same IDE reason given above.
+tools/session-fixtures: tools/session-fixtures.o $(FIXTURES) tests/fixtures.h \
+                        $(LIB) $(MBED_LIBS) $(DIST)/.stamp
+	$(CC) $(ALL_CFLAGS) $(GEN_INC) -Itests $< $(FIXTURES) $(LIB) $(DIST)/*.o \
+	    $(MBED_LIBS) -o $@
+	@rm -rf $@.dSYM
+
+tools/session-fixtures.o: tools/session-fixtures.c tests/fixtures.h $(DIST)/.stamp
+	$(CC) $(ALL_CFLAGS) $(GEN_INC) -Itests -c $< -o $@
+
+# Regenerating is the only supported way to change testdata/session/ --
+# the files are outputs, not sources to be edited.
+.PHONY: session-fixtures
+session-fixtures: tools/session-fixtures
+	@mkdir -p testdata/session
+	./tools/session-fixtures testdata/session
+
 clean:
-	rm -f $(OBJS) $(LIB) tools/bpp-dump tools/bpp-dump.o
-	@rm -rf tools/bpp-dump.dSYM
+	rm -f $(OBJS) $(LIB) tools/bpp-dump tools/bpp-dump.o \
+	    tools/session-fixtures tools/session-fixtures.o
+	@rm -rf tools/bpp-dump.dSYM tools/session-fixtures.dSYM
 	@# Not "rm -f $(TESTS)": $(TESTS) is derived from the test sources that
 	@# exist right now, so a binary left over from a test that was since
 	@# renamed or deleted would not be in that list at all, would survive
