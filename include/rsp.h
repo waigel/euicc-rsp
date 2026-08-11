@@ -624,4 +624,61 @@ int rsp_dp_verify_installation_result(const rsp_dp_session_t *s,
         const uint8_t *pir, size_t pir_len,
         int *installed, long *bpp_command_id, long *error_reason);
 
+/* The ES9+ JSON binding (SGP.22 v2.6 sections 6.5.2.6 and 6.5.2.8) sends
+ * five separately named, separately base64-encoded fields per response.
+ * These two functions cut them out of the single DER blob the two
+ * functions above return, for a caller that has to encode them
+ * individually.
+ *
+ * Cut, not decoded and re-encoded. The bytes such a caller then puts on
+ * the wire are the bytes this library produced and signed -- the same
+ * reason rsp_dp_verify_installation_result verifies the received
+ * ProfileInstallationResultData rather than a reconstruction of it.
+ *
+ * Every pointer borrows from resp and is valid exactly as long as resp
+ * is. Nothing is allocated and there is nothing to free. Each slice is
+ * the complete TLV of its field, tag and length included: that is what
+ * the binding base64-encodes, and what the eUICC expects back.
+ *
+ * The two take blobs at different levels, because their producers
+ * return different levels: rsp_dp_initiate_authentication returns an
+ * InitiateAuthenticationOkEs9 (the inner SEQUENCE), while
+ * rsp_dp_authenticate_client returns an AuthenticateClientResponseEs9
+ * (the CHOICE, tag 'BF3B'), so the second steps through the CHOICE
+ * first. That difference is absorbed here rather than straightened out
+ * at the source: changing either return would change bytes euicc-lpa's
+ * PrepareDownload repacking already consumes.
+ *
+ * Both walk their SEQUENCE positionally rather than searching by tag,
+ * and must: InitiateAuthenticationOkEs9's serverSigned1 and
+ * serverCertificate are both untagged SEQUENCEs encoding with tag '30',
+ * as are AuthenticateClientOk's smdpSigned2 and smdpCertificate. A tag
+ * search would find the first and call it the second.
+ *
+ * Both return 0. -1 means the question was asked and the answer is no:
+ * the buffer is not the shape the function expects -- truncated, or some
+ * other DER object. -2 means the question was never reached: a null
+ * argument. On either, *out is untouched. */
+typedef struct {
+    const uint8_t *transaction_id;     size_t transaction_id_len;
+    const uint8_t *server_signed1;     size_t server_signed1_len;
+    const uint8_t *server_signature1;  size_t server_signature1_len;
+    const uint8_t *euicc_ci_pkid;      size_t euicc_ci_pkid_len;
+    const uint8_t *server_certificate; size_t server_certificate_len;
+} rsp_dp_initiate_fields_t;
+
+typedef struct {
+    const uint8_t *transaction_id;    size_t transaction_id_len;
+    const uint8_t *profile_metadata;  size_t profile_metadata_len;
+    const uint8_t *smdp_signed2;      size_t smdp_signed2_len;
+    const uint8_t *smdp_signature2;   size_t smdp_signature2_len;
+    const uint8_t *smdp_certificate;  size_t smdp_certificate_len;
+} rsp_dp_authenticate_fields_t;
+
+int rsp_dp_initiate_fields(const uint8_t *resp, size_t resp_len,
+        rsp_dp_initiate_fields_t *out);
+
+int rsp_dp_authenticate_fields(const uint8_t *resp, size_t resp_len,
+        rsp_dp_authenticate_fields_t *out);
+
 #endif /* RSP_H */

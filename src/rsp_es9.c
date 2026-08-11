@@ -1384,3 +1384,134 @@ out:
     if (r) ASN_STRUCT_FREE(asn_DEF_ProfileInstallationResult, r);
     return ret;
 }
+
+/* ---------------------------------------------------------------------
+ * Reading the response fields apart, for the ES9+ JSON binding.
+ * See include/rsp.h for the contract; the short version is that these
+ * cut rather than decode, so what a server base64-encodes is what was
+ * signed.
+ * ------------------------------------------------------------------ */
+
+/* Parse the TLV at off. *val_off / *val_len become its value, and
+ * *next_off where the next TLV begins. Multi-byte tags and long-form
+ * lengths both occur here -- 'BF25', and certificates longer than 127
+ * bytes -- so neither may be assumed away. Returns 0, or -1 when the
+ * buffer runs out, when the length is the indefinite form (which DER
+ * forbids), or when it is wider than a size_t. */
+static int
+parse_tlv(const uint8_t *buf, size_t end, size_t off,
+          size_t *val_off, size_t *val_len, size_t *next_off) {
+    size_t p = off, len = 0;
+
+    if (p >= end) return -1;
+    /* Tag: low five bits all set means it continues into further bytes,
+     * each with its high bit set while more follow. */
+    if ((buf[p] & 0x1f) == 0x1f) {
+        p++;
+        while (p < end && (buf[p] & 0x80)) p++;
+        if (p >= end) return -1;
+    }
+    p++;
+    if (p >= end) return -1;
+
+    /* Length: short form is the byte itself. Long form has the low seven
+     * bits give how many bytes follow; 0x80 alone is the indefinite
+     * form, which DER forbids and this walker refuses. */
+    if (buf[p] < 0x80) {
+        len = buf[p];
+        p++;
+    } else {
+        size_t n = (size_t)(buf[p] & 0x7f), i;
+        p++;
+        if (n == 0 || n > sizeof(size_t) || n > end - p) return -1;
+        for (i = 0; i < n; i++) len = (len << 8) | buf[p + i];
+        p += n;
+    }
+    if (len > end - p) return -1;
+
+    *val_off  = p;
+    *val_len  = len;
+    *next_off = p + len;
+    return 0;
+}
+
+/* Cut the field at *off out whole -- tag and length included, which is
+ * what the JSON binding base64-encodes -- and move *off past it. */
+static int
+take_field(const uint8_t *buf, size_t end, size_t *off,
+           const uint8_t **tlv, size_t *tlv_len) {
+    size_t v_off, v_len, next;
+
+    if (parse_tlv(buf, end, *off, &v_off, &v_len, &next) != 0) return -1;
+    *tlv     = buf + *off;
+    *tlv_len = next - *off;
+    *off     = next;
+    return 0;
+}
+
+int
+rsp_dp_initiate_fields(const uint8_t *resp, size_t resp_len,
+        rsp_dp_initiate_fields_t *out) {
+    rsp_dp_initiate_fields_t f;
+    size_t v_off, v_len, next, off, end;
+
+    if (!resp || !out) return -2;
+    memset(&f, 0, sizeof f);
+
+    /* resp is the InitiateAuthenticationOkEs9 SEQUENCE itself; step
+     * inside it and walk its five members in order. */
+    if (parse_tlv(resp, resp_len, 0, &v_off, &v_len, &next) != 0) return -1;
+    off = v_off;
+    end = v_off + v_len;
+
+    if (take_field(resp, end, &off, &f.transaction_id,
+                   &f.transaction_id_len) != 0 ||
+        take_field(resp, end, &off, &f.server_signed1,
+                   &f.server_signed1_len) != 0 ||
+        take_field(resp, end, &off, &f.server_signature1,
+                   &f.server_signature1_len) != 0 ||
+        take_field(resp, end, &off, &f.euicc_ci_pkid,
+                   &f.euicc_ci_pkid_len) != 0 ||
+        take_field(resp, end, &off, &f.server_certificate,
+                   &f.server_certificate_len) != 0) {
+        return -1;
+    }
+
+    *out = f;
+    return 0;
+}
+
+int
+rsp_dp_authenticate_fields(const uint8_t *resp, size_t resp_len,
+        rsp_dp_authenticate_fields_t *out) {
+    rsp_dp_authenticate_fields_t g;
+    size_t v_off, v_len, next, off, end;
+
+    if (!resp || !out) return -2;
+    memset(&g, 0, sizeof g);
+
+    /* resp is the AuthenticateClientResponseEs9 CHOICE (tag 'BF3B').
+     * Step inside it to reach the authenticateClientOk SEQUENCE, then
+     * inside that to reach its five members. */
+    if (parse_tlv(resp, resp_len, 0, &v_off, &v_len, &next) != 0) return -1;
+    if (parse_tlv(resp, v_off + v_len, v_off, &v_off, &v_len, &next) != 0)
+        return -1;
+    off = v_off;
+    end = v_off + v_len;
+
+    if (take_field(resp, end, &off, &g.transaction_id,
+                   &g.transaction_id_len) != 0 ||
+        take_field(resp, end, &off, &g.profile_metadata,
+                   &g.profile_metadata_len) != 0 ||
+        take_field(resp, end, &off, &g.smdp_signed2,
+                   &g.smdp_signed2_len) != 0 ||
+        take_field(resp, end, &off, &g.smdp_signature2,
+                   &g.smdp_signature2_len) != 0 ||
+        take_field(resp, end, &off, &g.smdp_certificate,
+                   &g.smdp_certificate_len) != 0) {
+        return -1;
+    }
+
+    *out = g;
+    return 0;
+}

@@ -618,6 +618,73 @@ int main(void) {
         rsp_credential_free(&dppb);
     }
 
+    /* --- rsp_dp_initiate_fields: the five fields the JSON binding names
+       (SGP.22 v2.6 section 6.5.2.6), cut out of the response rather
+       than decoded and rebuilt ------------------------------------- */
+    {
+        rsp_dp_initiate_fields_t f;
+        memset(&f, 0, sizeof f);
+
+        ok("initiate fields slice out",
+           rsp_dp_initiate_fields(resp, resp_len, &f) == 0);
+        ok("every initiate field is non-empty",
+           f.transaction_id_len && f.server_signed1_len &&
+           f.server_signature1_len && f.euicc_ci_pkid_len &&
+           f.server_certificate_len);
+        ok("initiate fields borrow from the response",
+           f.transaction_id >= resp &&
+           f.server_certificate + f.server_certificate_len <= resp + resp_len);
+
+        /* serverSigned1 and serverCertificate are both untagged
+           SEQUENCEs encoding with tag '30'. A tag search would find the
+           first and call it the second, so the walk must be positional
+           -- these two assertions are what would catch that. */
+        ok("serverSigned1 precedes serverSignature1",
+           f.server_signed1 < f.server_signature1);
+        ok("serverCertificate follows serverSignature1",
+           f.server_certificate > f.server_signature1);
+
+        ok("serverSignature1 carries its own tag ([APPLICATION 55], 5F37)",
+           f.server_signature1_len > 2 && f.server_signature1[0] == 0x5f &&
+           f.server_signature1[1] == 0x37);
+        /* [0] over an OCTET STRING, and rsp-2.5.asn is AUTOMATIC TAGS,
+           so the tag is implicit and primitive -- 80, not the
+           constructed A0 an explicit tag would give. Pinned here
+           because the slice's first byte is what a server base64s. */
+        ok("transactionId carries its own tag ([0] implicit, 80)",
+           f.transaction_id_len > 2 && f.transaction_id[0] == 0x80);
+
+        ok("a truncated response is refused, not misread",
+           rsp_dp_initiate_fields(resp, resp_len / 2, &f) == -1);
+        ok("a null response is -2",
+           rsp_dp_initiate_fields(NULL, resp_len, &f) == -2);
+        ok("a null out is -2",
+           rsp_dp_initiate_fields(resp, resp_len, NULL) == -2);
+    }
+
+    /* The whole point of slicing: what comes out is what went in.
+       Re-encode ServerSigned1 from the decode above and require the
+       bytes to be identical to the slice. If they ever differ, this
+       function has started reconstructing rather than cutting, and a
+       BER response would silently change on the wire -- the failure
+       commit 8928231 removed elsewhere. */
+    {
+        rsp_dp_initiate_fields_t f;
+        unsigned char again[512];
+        struct sink sk = { again, 0, sizeof again };
+        asn_enc_rval_t er;
+
+        memset(&f, 0, sizeof f);
+        ok("fields for the round trip",
+           rsp_dp_initiate_fields(resp, resp_len, &f) == 0);
+        er = der_encode(&asn_DEF_ServerSigned1, &decoded->serverSigned1,
+                        collect, &sk);
+        ok("serverSigned1 re-encodes", er.encoded > 0);
+        ok("and the slice is byte-identical to it",
+           sk.len == f.server_signed1_len &&
+           memcmp(again, f.server_signed1, f.server_signed1_len) == 0);
+    }
+
     /* --- the section 5.6.1 address check itself, four ways ------------
        "Check if the received address matches its own SM-DP+ address,
        where the comparison SHALL be case-insensitive." Each of these
@@ -748,6 +815,41 @@ int main(void) {
         ok("rsp_dp_authenticate_client succeeds on a genuine response",
            rc == 0);
         ok("a response was returned", ac_out != NULL && ac_out_len > 0);
+
+        /* --- rsp_dp_authenticate_fields: the five fields of section
+           6.5.2.8. This response is an AuthenticateClientResponseEs9 --
+           the CHOICE, tag 'BF3B' -- not the bare Ok SEQUENCE that
+           InitiateAuthentication returns, so the walk has one more
+           level to step through. --------------------------------- */
+        if (rc == 0 && ac_out) {
+            rsp_dp_authenticate_fields_t g;
+            memset(&g, 0, sizeof g);
+
+            ok("authenticate fields slice out",
+               rsp_dp_authenticate_fields(ac_out, ac_out_len, &g) == 0);
+            ok("every authenticate field is non-empty",
+               g.transaction_id_len && g.profile_metadata_len &&
+               g.smdp_signed2_len && g.smdp_signature2_len &&
+               g.smdp_certificate_len);
+            ok("authenticate fields borrow from the response",
+               g.transaction_id >= ac_out &&
+               g.smdp_certificate + g.smdp_certificate_len
+                   <= ac_out + ac_out_len);
+            ok("profileMetadata carries its own tag ([37], BF25)",
+               g.profile_metadata_len > 2 && g.profile_metadata[0] == 0xbf &&
+               g.profile_metadata[1] == 0x25);
+            ok("smdpSignature2 carries its own tag ([APPLICATION 55], 5F37)",
+               g.smdp_signature2_len > 2 && g.smdp_signature2[0] == 0x5f &&
+               g.smdp_signature2[1] == 0x37);
+            /* smdpSigned2 and smdpCertificate are the pair of untagged
+               SEQUENCEs here -- same positional requirement. */
+            ok("smdpCertificate follows smdpSignature2",
+               g.smdp_certificate > g.smdp_signature2);
+            ok("a truncated authenticate response is refused",
+               rsp_dp_authenticate_fields(ac_out, ac_out_len / 2, &g) == -1);
+            ok("a null authenticate response is -2",
+               rsp_dp_authenticate_fields(NULL, ac_out_len, &g) == -2);
+        }
 
         if (rc == 0 && ac_out) {
             AuthenticateClientResponseEs9_t *ac_decoded = NULL;
