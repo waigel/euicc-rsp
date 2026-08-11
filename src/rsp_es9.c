@@ -124,18 +124,20 @@
  * InitiateAuthenticationOkEs9 (unlike AuthenticateServerRequest) has no
  * such field to fill in the first place.
  *
- * Two judgement calls, made because section 5.6.1's own interface gives
- * this function nothing to work with for them -- see task-2-report.md
- * (euicc-tools' write-path SDD folder) for the full account:
+ * serverAddress used to be a judgement call here, and is not any more.
+ * This function once accepted no address at all, so a fixed ".invalid"
+ * placeholder was signed in place of one -- real bytes, genuinely
+ * signed, but not a real SM-DP+ address. It now takes both addresses
+ * section 5.6.1 talks about: its own, which is what serverSigned1
+ * carries, and the LPA-supplied smdpAddress of Table 35, which it
+ * checks its own against case-insensitively. A mismatch is the one
+ * refusal this function has (-1; see rsp.h).
  *
- *   - serverAddress has no input parameter at all: this function does
- *     not even accept the LPA-supplied smdpAddress Table 35 describes,
- *     so there is neither a real address to embed nor a mismatch to
- *     check. RSP_ES9_SMDP_ADDRESS_PLACEHOLDER below (RFC 2606's
- *     reserved-for-example ".invalid" TLD) is signed in its place --
- *     real bytes on the wire and genuinely signed, but not a real SM-DP+
- *     address. Whichever task first wires up server configuration
- *     should replace it with one, not extend it.
+ * One judgement call remains, made because section 5.6.1's own interface
+ * gives this function nothing to work with for it -- see
+ * task-2-report.md (euicc-tools' write-path SDD folder) for the full
+ * account:
+ *
  *   - euiccCiPKIdToBeUsed: section 5.6.1 has the SM-DP+ "select the CI
  *     ... according to the priority provided by the eUICC" among
  *     possibly several supported CI Public Keys. This library supports
@@ -183,12 +185,21 @@
 #include "ProfileInstallationResult.h"
 #include "StoreMetadataRequest.h"
 
-/* See this file's own top comment: no smdp_address input exists yet, so
- * this fixed, obviously-fake FQDN (RFC 2606 reserves ".invalid" for
- * exactly this -- content that must never resolve) stands in for it.
- * Real bytes, genuinely signed, but not a real SM-DP+ address. */
-static const char RSP_ES9_SMDP_ADDRESS_PLACEHOLDER[] =
-    "smdp-address-placeholder.invalid";
+/* Fold ASCII case only, for section 5.6.1's address comparison.
+ * Deliberately not strcasecmp: that folds according to the locale, and a
+ * host name is not locale-dependent text -- a Turkish locale maps 'I' to
+ * a dotless lowercase, which would make two equal FQDNs compare unequal.
+ * Returns 1 when equal. */
+static int
+ascii_ieq(const char *a, const char *b) {
+    for (; *a && *b; a++, b++) {
+        unsigned char ca = (unsigned char)*a, cb = (unsigned char)*b;
+        if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb - 'A' + 'a');
+        if (ca != cb) return 0;
+    }
+    return *a == '\0' && *b == '\0';
+}
 
 /* One RSP session's server-side state -- see the typedef's own doc
  * comment in rsp.h. transactionId and both challenges cross the wire in
@@ -291,6 +302,8 @@ int rsp_dp_initiate_authentication(
         const uint8_t *euicc_challenge, size_t challenge_len,
         const uint8_t *euicc_info1, size_t info1_len,
         const uint8_t transaction_id[16],
+        const char *server_address,
+        const char *requested_address,
         rsp_dp_session_t **out,
         uint8_t **resp, size_t *resp_len)
 {
@@ -308,7 +321,10 @@ int rsp_dp_initiate_authentication(
     uint8_t server_challenge[16];
     int have_dpauth = 0;
     int have_rng = 0;
-    int ret = -1;
+    /* -2 by default: every goto out below is a question never reached.
+     * The one genuine refusal -- the section 5.6.1 address check -- sets
+     * -1 for itself, explicitly, just below. */
+    int ret = -2;
 
     memset(&ok, 0, sizeof ok);
     memset(&info1_tmp, 0, sizeof info1_tmp);
@@ -316,7 +332,20 @@ int rsp_dp_initiate_authentication(
     mbedtls_x509_crt_init(&ci_crt);
 
     if (!euicc_challenge || challenge_len != 16 || !euicc_info1 ||
-        info1_len == 0 || !transaction_id || !out || !resp || !resp_len) {
+        info1_len == 0 || !transaction_id || !server_address ||
+        !out || !resp || !resp_len) {
+        goto out;
+    }
+
+    /* Section 5.6.1: "Check if the received address matches its own
+     * SM-DP+ address, where the comparison SHALL be case-insensitive."
+     * This is the only thing this function can genuinely refuse, and it
+     * is checked before anything is allocated, seeded or signed --
+     * InitiateAuthenticationError.invalidDpAddress(1) on the wire. A
+     * NULL requested_address is a caller that received no address to
+     * check, not a mismatch. */
+    if (requested_address && !ascii_ieq(server_address, requested_address)) {
+        ret = -1;
         goto out;
     }
 
@@ -361,8 +390,8 @@ int rsp_dp_initiate_authentication(
                               (const char *)euicc_challenge,
                               (int)challenge_len) != 0 ||
         OCTET_STRING_fromBuf(&ok.serverSigned1.serverAddress,
-                              RSP_ES9_SMDP_ADDRESS_PLACEHOLDER,
-                              (int)(sizeof RSP_ES9_SMDP_ADDRESS_PLACEHOLDER - 1)) != 0 ||
+                              server_address,
+                              (int)strlen(server_address)) != 0 ||
         OCTET_STRING_fromBuf(&ok.serverSigned1.serverChallenge,
                               (const char *)server_challenge,
                               sizeof server_challenge) != 0) {

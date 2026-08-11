@@ -65,6 +65,16 @@ static void ok(const char *what, int good) {
     if (!good) fails++;
 }
 
+/* SGP.22 v2.6 section 5.6.1 has the SM-DP+ compare the address the LPA
+   sent against its own "case-insensitive[ly]". A host name is ASCII, and
+   strcasecmp folds according to the locale, so these three state the
+   property in the only terms that hold everywhere. SMDP_ADDR is also
+   what the fixtures below echo back, so that what the eUICC is made to
+   say it saw is what the server was actually given. */
+static const char SMDP_ADDR[]  = "smdp.example.com";
+static const char SMDP_UPPER[] = "SMDP.EXAMPLE.COM";
+static const char SMDP_OTHER[] = "other.example.com";
+
 /* A fixed-capacity sink for der_encode's callback interface. */
 struct sink {
     unsigned char *p;
@@ -216,8 +226,13 @@ static int build_auth_server_response(
 
     if (OCTET_STRING_fromBuf(&rok->euiccSigned1.transactionId,
                               (const char *)transaction_id, 16) != 0 ||
+        /* The eUICC echoes back the serverAddress it was sent, so this
+           fixture must echo the one the server actually signed. The
+           length is strlen, not sizeof: the previous literal passed 33
+           for a 32-character string and carried the NUL into the
+           UTF8String. */
         OCTET_STRING_fromBuf(&rok->euiccSigned1.serverAddress,
-                              "smdp-address-placeholder.invalid", 33) != 0 ||
+                              SMDP_ADDR, (int)strlen(SMDP_ADDR)) != 0 ||
         OCTET_STRING_fromBuf(&rok->euiccSigned1.serverChallenge,
                               (const char *)server_challenge, 16) != 0 ||
         build_euicc_info2(&rok->euiccSigned1.euiccInfo2) != 0 ||
@@ -489,6 +504,7 @@ int main(void) {
     rc = rsp_dp_initiate_authentication(euicc_challenge, sizeof euicc_challenge,
                                          info1_buf, info1_len,
                                          transaction_id,
+                                         SMDP_ADDR, SMDP_ADDR,
                                          &sess, &resp, &resp_len);
     ok("rsp_dp_initiate_authentication succeeds", rc == 0);
     ok("a session was returned", sess != NULL);
@@ -520,6 +536,24 @@ int main(void) {
     ok("serverSigned1.euiccChallenge equals the challenge",
        decoded->serverSigned1.euiccChallenge.size == 16 &&
        memcmp(decoded->serverSigned1.euiccChallenge.buf, euicc_challenge, 16) == 0);
+
+    /* serverSigned1.serverAddress is the SM-DP+'s own FQDN (5.7.13), and
+       it is now the caller's to supply. Before this, a fixed
+       ".invalid" placeholder was signed in its place. */
+    ok("serverSigned1 carries the address it was given",
+       decoded->serverSigned1.serverAddress.size == (int)strlen(SMDP_ADDR) &&
+       memcmp(decoded->serverSigned1.serverAddress.buf,
+              SMDP_ADDR, strlen(SMDP_ADDR)) == 0);
+
+    /* The placeholder ended in RFC 2606's reserved ".invalid". Checking
+       the tail rather than searching the whole string keeps this to
+       plain C89 -- memmem is a GNU/BSD extension and would need
+       _GNU_SOURCE on the Linux CI runner. */
+    ok("no placeholder address survives",
+       decoded->serverSigned1.serverAddress.size >= 8 &&
+       memcmp(decoded->serverSigned1.serverAddress.buf +
+                  decoded->serverSigned1.serverAddress.size - 8,
+              ".invalid", 8) != 0);
 
     ok("serverSignature1 is 64 bytes (plain r||s, not DER)",
        decoded->serverSignature1.size == 64);
@@ -582,6 +616,77 @@ int main(void) {
 
         rsp_credential_free(&dpauth);
         rsp_credential_free(&dppb);
+    }
+
+    /* --- the section 5.6.1 address check itself, four ways ------------
+       "Check if the received address matches its own SM-DP+ address,
+       where the comparison SHALL be case-insensitive." Each of these
+       opens its own session, because a refusal must not leave one
+       behind. */
+    {
+        rsp_dp_session_t *s2 = NULL;
+        uint8_t *r2 = NULL;
+        size_t r2_len = 0;
+        int rc2 = rsp_dp_initiate_authentication(
+                euicc_challenge, sizeof euicc_challenge,
+                info1_buf, info1_len, transaction_id,
+                SMDP_ADDR, SMDP_UPPER, &s2, &r2, &r2_len);
+        ok("a case-only difference is accepted", rc2 == 0);
+        free(r2);
+        rsp_dp_session_free(s2);
+    }
+
+    {
+        rsp_dp_session_t *s3 = NULL;
+        uint8_t *r3 = NULL;
+        size_t r3_len = 0;
+        int rc3 = rsp_dp_initiate_authentication(
+                euicc_challenge, sizeof euicc_challenge,
+                info1_buf, info1_len, transaction_id,
+                SMDP_ADDR, SMDP_OTHER, &s3, &r3, &r3_len);
+        ok("a different address is refused with -1", rc3 == -1);
+        ok("a refusal returns no session", s3 == NULL);
+        ok("a refusal returns no response", r3 == NULL);
+    }
+
+    {
+        /* A missing own-address is a question never reached, not a no. */
+        rsp_dp_session_t *s4 = NULL;
+        uint8_t *r4 = NULL;
+        size_t r4_len = 0;
+        int rc4 = rsp_dp_initiate_authentication(
+                euicc_challenge, sizeof euicc_challenge,
+                info1_buf, info1_len, transaction_id,
+                NULL, SMDP_ADDR, &s4, &r4, &r4_len);
+        ok("a null server address is -2, not -1", rc4 == -2);
+    }
+
+    {
+        /* No address to check against is legitimate -- a caller that
+           never received one. The comparison is skipped; the signing
+           is not. */
+        rsp_dp_session_t *s5 = NULL;
+        uint8_t *r5 = NULL;
+        size_t r5_len = 0;
+        InitiateAuthenticationOkEs9_t *d5 = NULL;
+        int rc5 = rsp_dp_initiate_authentication(
+                euicc_challenge, sizeof euicc_challenge,
+                info1_buf, info1_len, transaction_id,
+                SMDP_ADDR, NULL, &s5, &r5, &r5_len);
+        ok("a null requested address skips the check", rc5 == 0);
+        if (rc5 == 0 && r5) {
+            asn_dec_rval_t dr5 = ber_decode(
+                    NULL, &asn_DEF_InitiateAuthenticationOkEs9,
+                    (void **)&d5, r5, r5_len);
+            ok("and still signs the real address",
+               dr5.code == RC_OK && d5 != NULL &&
+               d5->serverSigned1.serverAddress.size == (int)strlen(SMDP_ADDR) &&
+               memcmp(d5->serverSigned1.serverAddress.buf,
+                      SMDP_ADDR, strlen(SMDP_ADDR)) == 0);
+            ASN_STRUCT_FREE(asn_DEF_InitiateAuthenticationOkEs9, d5);
+        }
+        free(r5);
+        rsp_dp_session_free(s5);
     }
 
     /* server_challenge: generated internally by rsp_dp_initiate_
@@ -799,6 +904,7 @@ int main(void) {
             int rc2 = rsp_dp_initiate_authentication(
                     euicc_challenge, sizeof euicc_challenge,
                     info1_buf, info1_len, transaction_id,
+                    SMDP_ADDR, SMDP_ADDR,
                     &sess2, &resp2, &resp2_len);
             ok("a second session opens, for the mismatched-transactionId case",
                rc2 == 0 && sess2 != NULL);
@@ -861,6 +967,7 @@ int main(void) {
             int rc3 = rsp_dp_initiate_authentication(
                     euicc_challenge, sizeof euicc_challenge,
                     info1_buf, info1_len, transaction_id,
+                    SMDP_ADDR, SMDP_ADDR,
                     &sess3, &resp3, &resp3_len);
             ok("a third session opens, for the non-chaining-certificate case",
                rc3 == 0 && sess3 != NULL);

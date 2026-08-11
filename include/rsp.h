@@ -27,7 +27,7 @@
  * primitive that refused its input -- and for those, plain -1 covers it;
  * there is nothing a caller could usefully tell apart.
  *
- * Four functions are different: each of them can fail in two ways that
+ * Other functions are different: each of them can fail in two ways that
  * call for different responses (retry/report-and-stop, versus
  * reject-and-move-on), and used to collapse both into the same -1 --
  * indistinguishable to a caller. This mirrors the exit-code contract the
@@ -42,7 +42,16 @@
  * question was never reached -- a malformed input, a buffer too small, an
  * allocation or RNG failure.
  *
- * Each of the four says so again at its own declaration below. */
+ * For rsp_dp_initiate_authentication the question is put to a comparison
+ * instead: SGP.22 section 5.6.1 has the SM-DP+ check the address the LPA
+ * sent against its own, and -1 is that check answering no. The sense is
+ * the same -- a real negative answer about the input, not a failure to
+ * look at it.
+ *
+ * The remaining ES9+ session functions (rsp_dp_authenticate_client,
+ * rsp_dp_get_bound_profile_package, rsp_dp_verify_installation_result,
+ * and the two field accessors) split the same way, and each says so
+ * again at its own declaration below. */
 
 /* The library version, for a bug report. */
 const char *rsp_version(void);
@@ -433,22 +442,45 @@ typedef struct rsp_dp_session rsp_dp_session_t;
  * generates one internally, so there is no test path that ships that
  * way by accident.
  *
+ * server_address is this SM-DP+'s own FQDN, NUL-terminated. It is what
+ * ServerSigned1.serverAddress carries and what the eUICC will see signed
+ * (section 5.7.13). It is required: a placeholder used to stand in for
+ * it, and a server that does not know its own address cannot answer this
+ * function honestly.
+ *
+ * requested_address is the smdpAddress the LPA sent in
+ * InitiateAuthenticationRequest (Table 35), NUL-terminated, or NULL.
+ * Section 5.6.1 has the SM-DP+ "[c]heck if the received address matches
+ * its own SM-DP+ address, where the comparison SHALL be
+ * case-insensitive", so when it is not NULL it is compared against
+ * server_address, folding ASCII case only. Deliberately not strcasecmp:
+ * that folds according to the locale, and a host name is not
+ * locale-dependent text. NULL means the caller has no such address to
+ * check -- a local caller that never received one -- and the comparison
+ * is skipped. The signing is not.
+ *
  * On success (0), *out receives a new session (release with
  * rsp_dp_session_free) and *resp / *resp_len the DER encoding of an
  * InitiateAuthenticationOkEs9 -- transactionId, serverSigned1,
  * serverSignature1, euiccCiPKIdToBeUsed and serverCertificate
  * (CERT.DPauth.ECDSA), all "encoded ... including the tags defined for
  * them in the AuthenticateServerRequest data object" (Table 36, NOTE 1)
- * -- malloc'ed, owned by the caller. On failure (-1: a null or malformed
- * argument, or an internal failure -- allocation, RNG seeding, credential
- * loading, signing), *out / *resp / *resp_len are untouched. Plain -1, not
- * split like rsp_pki_verify's four: there is nothing a caller could
- * usefully tell the two failure kinds apart for here, matching this
- * header's own failure-convention note. */
+ * -- malloc'ed, owned by the caller. Read the five apart with
+ * rsp_dp_initiate_fields.
+ *
+ * -1 means the question was asked and the answer is no: requested_address
+ * is not this server's address. That is
+ * InitiateAuthenticationError.invalidDpAddress(1) on the wire, and it is
+ * the only thing this function can refuse. -2 means the question was
+ * never reached: a null or malformed argument (server_address included),
+ * or an internal failure -- allocation, RNG seeding, credential loading,
+ * signing. On either, *out / *resp / *resp_len are untouched. */
 int rsp_dp_initiate_authentication(
         const uint8_t *euicc_challenge, size_t challenge_len,
         const uint8_t *euicc_info1, size_t info1_len,
         const uint8_t transaction_id[16],
+        const char *server_address,
+        const char *requested_address,
         rsp_dp_session_t **out,
         uint8_t **resp, size_t *resp_len);
 
