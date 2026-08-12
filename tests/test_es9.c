@@ -1081,6 +1081,16 @@ int main(void) {
             ok("...carrying the metadata a server routes by",
                v.seq_number == 1 && v.operation == 0);
 
+            /* The metadata can be read without a certificate, and that
+               is the only way to find which one to use -- but it is not
+               evidence, and the verdict field stays clear to say so. */
+            memset(&v, 0, sizeof v);
+            ok("the metadata reads without verifying anything",
+               rsp_dp_notification_metadata(pir, pir_len, &v) == 0);
+            ok("...naming the profile it is about",
+               v.have_iccid && v.iccid[0] == 0x98 && v.iccid[9] == 0x14);
+            ok("...and leaving the verdict field alone", v.installed == 0);
+
             /* Without a certificate there is nothing to check against,
                and this arm cannot fall back on anything embedded. */
             memset(&v, 0, sizeof v);
