@@ -30,7 +30,7 @@ ifeq ($(shell uname -s),Darwin)
 EXTRA   += -D_DARWIN_C_SOURCE
 endif
 
-ALL_CFLAGS = $(STD) $(WARN) $(CFLAGS) $(EXTRA) $(INC) $(DEF)
+ALL_CFLAGS = $(STD) $(WARN) $(CFLAGS) $(EXTRA) $(INC) $(DEF) $(MBED_CFG)
 
 # build/sgp26_material.c embeds the published SGP.26 test material (see
 # testdata/sgp26/) as byte arrays, generated with tools/bin2c so the
@@ -54,6 +54,32 @@ LIB     := librsp.a
 HDRS    := include/rsp.h src/rsp_internal.h
 
 MBED_LIBS := $(MBED)/library/libmbedx509.a $(MBED)/library/libmbedcrypto.a
+
+# Two mbedTLS options this project turns on, defined here rather than by
+# editing the vendored submodule. Given straight to the compiler instead
+# of through MBEDTLS_USER_CONFIG_FILE: that macro's value has to stay
+# quoted across both this recipe's shell and the submake's own, and the
+# quotes do not survive the second pass. Two -D flags need no quoting at
+# all.
+#
+# Why threading. euicc-rsp is linked into a server (euicc-smdp) that
+# answers more than one request at a time. Its own shared state is gone
+# -- src/rsp_sign.c builds its RNG per call now -- but mbedTLS keeps some
+# of its own: without these, a concurrent caller crashes inside mbedTLS's
+# entropy accumulator with a NULL context, in five runs out of twelve.
+# MBEDTLS_THREADING_PTHREAD is the POSIX implementation of the mutex
+# interface MBEDTLS_THREADING_C declares; a platform without pthreads
+# would need MBEDTLS_THREADING_ALT and an implementation of its own.
+#
+# These MUST reach both the mbedTLS submake and every translation unit
+# here that includes an mbedTLS header: they add mutex members to mbedTLS
+# contexts, so a file compiled without them sizes those contexts
+# differently than the library it links against. Consumers of this
+# repository (euicc-lpa, euicc-tools) pass the same flags for the same
+# reason.
+MBED_CFG := -DMBEDTLS_THREADING_C -DMBEDTLS_THREADING_PTHREAD
+
+MBED_LDLIBS := -pthread
 
 # mbedTLS commits five generated sources for this pinned tag, but its own
 # library/Makefile decides per file whether to trust that or regenerate.
@@ -194,7 +220,7 @@ all: $(LIB)
 # both targets through one stamp file makes the actual submake invocation a
 # single target again, so there is exactly one recipe instance to run no
 # matter how many of $(MBED_LIBS) triggered it.
-build/mbed.stamp:
+build/mbed.stamp: Makefile
 	@mkdir -p $(dir $@)
 	@test -e $(MBED)/.git || { \
 	    echo "the submodule is missing: git submodule update --init --recursive" >&2; \
@@ -209,7 +235,8 @@ build/mbed.stamp:
 	    }; \
 	done
 	@touch $(MBED_GENERATED)
-	$(MAKE) -C $(MBED)/library libmbedcrypto.a libmbedx509.a
+	$(MAKE) -C $(MBED)/library libmbedcrypto.a libmbedx509.a \
+	    CFLAGS="$(CFLAGS) $(MBED_CFG)"
 	@touch $@
 
 $(MBED_LIBS): build/mbed.stamp
@@ -243,7 +270,7 @@ $(LIB): $(OBJS)
 # at once. Harmless for every other test binary, and cheaper than giving
 # one test its own rule outside this pattern.
 tests/run-%: tests/test_%.c $(FIXTURES) tests/fixtures.h $(LIB) $(MBED_LIBS) $(DIST)/.stamp Makefile
-	$(CC) $(ALL_CFLAGS) $(GEN_INC) -Itests -pthread $< $(FIXTURES) $(LIB) $(DIST)/*.o $(MBED_LIBS) -o $@
+	$(CC) $(ALL_CFLAGS) $(GEN_INC) -Itests -pthread $< $(FIXTURES) $(LIB) $(DIST)/*.o $(MBED_LIBS) $(MBED_LDLIBS) -o $@
 	@# On Darwin, a -g link auto-generates a companion run-%.dSYM directory.
 	@# tests/run-tests globs "run-*", so that bundle would be picked up and
 	@# "run" as if it were a test binary. Drop it: it is a build byproduct,
@@ -266,7 +293,7 @@ check: $(TESTS)
 # a file with no known flags -- #include "rsp.h" unresolvable in the editor --
 # for as long as it stayed out of "all".
 tools/bpp-dump: tools/bpp-dump.o $(LIB) $(MBED_LIBS) $(DIST)/.stamp
-	$(CC) $(ALL_CFLAGS) $(GEN_INC) $< $(LIB) $(DIST)/*.o $(MBED_LIBS) -o $@
+	$(CC) $(ALL_CFLAGS) $(GEN_INC) $< $(LIB) $(DIST)/*.o $(MBED_LIBS) $(MBED_LDLIBS) -o $@
 	@rm -rf $@.dSYM
 
 # tools/session-fixtures writes one whole RSP session to disk so a consumer
@@ -276,7 +303,7 @@ tools/bpp-dump: tools/bpp-dump.o $(LIB) $(MBED_LIBS) $(DIST)/.stamp
 tools/session-fixtures: tools/session-fixtures.o $(FIXTURES) tests/fixtures.h \
                         $(LIB) $(MBED_LIBS) $(DIST)/.stamp
 	$(CC) $(ALL_CFLAGS) $(GEN_INC) -Itests $< $(FIXTURES) $(LIB) $(DIST)/*.o \
-	    $(MBED_LIBS) -o $@
+	    $(MBED_LIBS) $(MBED_LDLIBS) -o $@
 	@rm -rf $@.dSYM
 
 tools/session-fixtures.o: tools/session-fixtures.c tests/fixtures.h $(DIST)/.stamp
