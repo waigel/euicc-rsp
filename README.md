@@ -51,18 +51,30 @@ cannot yet go and ask for one.
 
 ## Threads
 
-`rsp_sign` builds its RNG per call, so signing from several threads at
-once is safe and genuinely parallel -- measured at 755% CPU over 12 800
-signatures on eight threads. It was not always: the RNG used to be a
-file-scope singleton with an unsynchronised lazy initialisation, which
-segfaulted under concurrency in five runs out of six.
-[`tests/test_threads.c`](tests/test_threads.c) is what holds it, and it
-crosses `MBEDTLS_CTR_DRBG_RESEED_INTERVAL` on purpose so it reaches the
-second race as well as the first.
+This library can be called from more than one thread at once. Two things
+were needed, and neither alone was enough.
 
-No mutex was added and `MBEDTLS_THREADING_C` is still off in the vendored
-mbedTLS: the sharing was removed rather than guarded, which is why
-nothing downstream has to agree on a configuration.
+`rsp_sign` used to keep its RNG in a file-scope singleton behind an
+unsynchronised lazy initialisation: one thread's `mbedtls_ctr_drbg_init`
+would memset a context another was already seeding. It builds one per
+call now, on the stack, the way [`src/rsp_pki.c`](src/rsp_pki.c) always
+has — the sharing is removed rather than guarded.
+
+That fixed this library's own state but not mbedTLS's. With only the
+first change, a concurrent caller still crashed inside mbedTLS's entropy
+accumulator, so the Makefile now compiles the vendored mbedTLS **and
+everything here** with `MBEDTLS_THREADING_C` and
+`MBEDTLS_THREADING_PTHREAD`. Both flags have to reach both: they add
+mutex members to mbedTLS contexts, so a translation unit built without
+them would size those contexts differently than the library it links
+against. Anything linking this — [euicc-lpa](https://github.com/waigel/euicc-lpa),
+[euicc-tools](https://github.com/waigel/euicc-tools) — passes the same
+two flags, and links with `-pthread`.
+
+[`tests/test_threads.c`](tests/test_threads.c) holds it: eight threads,
+12 800 signatures, crossing `MBEDTLS_CTR_DRBG_RESEED_INTERVAL` on purpose
+so the second race is reached as well as the first. Before the fixes it
+segfaulted in five runs out of six; after, 0 in 20, at 755% CPU.
 
 ## Build
 
