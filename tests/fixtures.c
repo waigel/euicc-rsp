@@ -294,8 +294,23 @@ int build_installation_result(
             (OCTET_STRING_t *)&d->notificationMetadata.profileManagementOperation,
             "\x80", 1) != 0 ||
         OCTET_STRING_fromBuf(&d->notificationMetadata.notificationAddress,
-                              "smdp-address-placeholder.invalid", 32) != 0) {
+                              SMDP_ADDR, (int)strlen(SMDP_ADDR)) != 0) {
         goto done;
+    }
+    /* A real ProfileInstallationResult names the Profile it is about,
+       and a server has nothing else to correlate it with -- a
+       notification carries no EID and no transactionId an SM-DP+ could
+       match. OPTIONAL in the module, indispensable in practice. */
+    {
+        static const uint8_t iccid[10] = {
+            0x98, 0x00, 0x10, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0x14
+        };
+        d->notificationMetadata.iccid = calloc(1, sizeof *d->notificationMetadata.iccid);
+        if (!d->notificationMetadata.iccid ||
+            OCTET_STRING_fromBuf(d->notificationMetadata.iccid,
+                                  (const char *)iccid, sizeof iccid) != 0) {
+            goto done;
+        }
     }
     /* smdpOid: any well-formed OID -- this function is about the
        signature, and nothing in rsp_dp_verify_installation_result reads
