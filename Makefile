@@ -239,8 +239,11 @@ $(LIB): $(OBJS)
 # this recipe's own link line lives here, not in any test_*.c, so make has
 # no other way to notice the line changed and would otherwise reuse an
 # already-built tests/run-% binary that no longer matches this recipe.
+# -pthread is for tests/test_threads.c, which signs from several threads
+# at once. Harmless for every other test binary, and cheaper than giving
+# one test its own rule outside this pattern.
 tests/run-%: tests/test_%.c $(FIXTURES) tests/fixtures.h $(LIB) $(MBED_LIBS) $(DIST)/.stamp Makefile
-	$(CC) $(ALL_CFLAGS) $(GEN_INC) -Itests $< $(FIXTURES) $(LIB) $(DIST)/*.o $(MBED_LIBS) -o $@
+	$(CC) $(ALL_CFLAGS) $(GEN_INC) -Itests -pthread $< $(FIXTURES) $(LIB) $(DIST)/*.o $(MBED_LIBS) -o $@
 	@# On Darwin, a -g link auto-generates a companion run-%.dSYM directory.
 	@# tests/run-tests globs "run-*", so that bundle would be picked up and
 	@# "run" as if it were a test binary. Drop it: it is a build byproduct,

@@ -47,47 +47,43 @@
  * makes a recorded session replayable (the same input must produce the
  * same bytes on a second run), and it is safer -- a random k that repeats
  * or is even slightly biased reveals the private signing key, which RFC
- * 6979 avoids by construction. Seeded once and kept for the life of the
- * process: reseeding an entropy-backed DRBG on every call buys nothing
- * and this library is not multi-threaded anywhere else either.
+ * 6979 avoids by construction.
  * mbedtls_ecdsa_verify takes no RNG parameter at all -- verifying an
  * ECDSA signature is pure arithmetic on public values, nothing here is
- * blinded -- so only rsp_sign uses this. */
-static mbedtls_entropy_context g_entropy;
-static mbedtls_ctr_drbg_context g_drbg;
-static int g_rng_ready;
-
-static int ensure_rng(void)
-{
-    static const unsigned char pers[] = "euicc-rsp/rsp_sign";
-
-    if (g_rng_ready) {
-        return 0;
-    }
-    mbedtls_entropy_init(&g_entropy);
-    mbedtls_ctr_drbg_init(&g_drbg);
-    if (mbedtls_ctr_drbg_seed(&g_drbg, mbedtls_entropy_func, &g_entropy,
-                               pers, sizeof pers - 1) != 0) {
-        mbedtls_ctr_drbg_free(&g_drbg);
-        mbedtls_entropy_free(&g_entropy);
-        return -1;
-    }
-    g_rng_ready = 1;
-    return 0;
-}
+ * blinded -- so only rsp_sign uses this.
+ *
+ * The RNG is built per call, on the stack, the way src/rsp_pki.c has
+ * always built its own. It used to be a file-scope singleton seeded
+ * once and kept for the life of the process, on the reasoning that
+ * "reseeding an entropy-backed DRBG on every call buys nothing and this
+ * library is not multi-threaded anywhere else either". The second half
+ * of that stopped being true the moment a server linked this library:
+ * the lazy initialisation had no synchronisation at all, so one thread's
+ * mbedtls_ctr_drbg_init would memset the context another was already
+ * inside mbedtls_ctr_drbg_seed on, and the second would then call a NULL
+ * entropy callback. Past MBEDTLS_CTR_DRBG_RESEED_INTERVAL a second race
+ * followed, the shared DRBG reseeding inline during a signature and
+ * freeing memory on the shared entropy context.
+ *
+ * A per-call DRBG removes both by removing the sharing, rather than by
+ * guarding it: there is no mutex here, and none is needed. It costs one
+ * entropy gather per signature, which is small beside the elliptic-curve
+ * work it accompanies and is what buys the ability to sign from more
+ * than one thread. tests/test_threads.c is what holds this: with the
+ * singleton it segfaults, five runs in six. */
 
 int rsp_sign(const rsp_credential_t *c, const uint8_t *tbs, size_t tbs_len,
              uint8_t sig[64])
 {
     unsigned char hash[32];
+    mbedtls_entropy_context ent;
+    mbedtls_ctr_drbg_context drbg;
     mbedtls_ecp_group grp;
     mbedtls_mpi d, r, s;
+    int rng_ok;
     int ret = -1;
 
     if (!c || !sig || (!tbs && tbs_len != 0)) {
-        return -1;
-    }
-    if (ensure_rng() != 0) {
         return -1;
     }
     if (mbedtls_sha256(tbs, tbs_len, hash, 0) != 0) {
@@ -98,12 +94,14 @@ int rsp_sign(const rsp_credential_t *c, const uint8_t *tbs, size_t tbs_len,
     mbedtls_mpi_init(&d);
     mbedtls_mpi_init(&r);
     mbedtls_mpi_init(&s);
+    rng_ok = rsp_rng_init(&ent, &drbg, "euicc-rsp/rsp_sign") == 0;
 
-    if (mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1) == 0 &&
+    if (rng_ok &&
+        mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1) == 0 &&
         mbedtls_mpi_read_binary(&d, c->sk, sizeof c->sk) == 0 &&
         mbedtls_ecdsa_sign_det_ext(&grp, &r, &s, &d, hash, sizeof hash,
                                     MBEDTLS_MD_SHA256,
-                                    mbedtls_ctr_drbg_random, &g_drbg) == 0 &&
+                                    mbedtls_ctr_drbg_random, &drbg) == 0 &&
         mbedtls_mpi_write_binary(&r, sig, 32) == 0 &&
         mbedtls_mpi_write_binary(&s, sig + 32, 32) == 0) {
         ret = 0;
@@ -118,6 +116,10 @@ int rsp_sign(const rsp_credential_t *c, const uint8_t *tbs, size_t tbs_len,
     mbedtls_mpi_free(&r);
     mbedtls_mpi_free(&s);
     mbedtls_ecp_group_free(&grp);
+    if (rng_ok) {
+        mbedtls_ctr_drbg_free(&drbg);
+        mbedtls_entropy_free(&ent);
+    }
     mbedtls_platform_zeroize(hash, sizeof hash);
     return ret;
 }
