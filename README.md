@@ -49,6 +49,21 @@ cannot yet go and ask for one.
 | [euicc-tools](https://github.com/waigel/euicc-tools) | the command |
 | `euicc-rsp` (this one) | the protocol |
 
+## Threads
+
+`rsp_sign` builds its RNG per call, so signing from several threads at
+once is safe and genuinely parallel -- measured at 755% CPU over 12 800
+signatures on eight threads. It was not always: the RNG used to be a
+file-scope singleton with an unsynchronised lazy initialisation, which
+segfaulted under concurrency in five runs out of six.
+[`tests/test_threads.c`](tests/test_threads.c) is what holds it, and it
+crosses `MBEDTLS_CTR_DRBG_RESEED_INTERVAL` on purpose so it reaches the
+second race as well as the first.
+
+No mutex was added and `MBEDTLS_THREADING_C` is still off in the vendored
+mbedTLS: the sharing was removed rather than guarded, which is why
+nothing downstream has to agree on a configuration.
+
 ## Build
 
 ```sh
