@@ -235,6 +235,13 @@ build/mbed.stamp: Makefile
 	    }; \
 	done
 	@touch $(MBED_GENERATED)
+	@# mbedTLS's own Makefile tracks source mtimes, not the flags it was
+	@# given, so changing $(MBED_CFG) would leave a stale archive next to
+	@# freshly compiled objects here -- and since those flags add mutex
+	@# members to mbedTLS contexts, the two would disagree about struct
+	@# sizes. That is silent memory corruption, not a link error, so the
+	@# objects go first whenever this stamp is out of date.
+	rm -f $(MBED)/library/*.o $(MBED)/library/*.a
 	$(MAKE) -C $(MBED)/library libmbedcrypto.a libmbedx509.a \
 	    CFLAGS="$(CFLAGS) $(MBED_CFG)"
 	@touch $@
