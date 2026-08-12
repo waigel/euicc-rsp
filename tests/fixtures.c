@@ -26,6 +26,7 @@
 #include "ProfileInstallationResult.h"
 #include "ServerSigned1.h"
 #include "SmdpSigned2.h"
+#include "OtherSignedNotification.h"
 #include "StoreMetadataRequest.h"
 #include "fixtures.h"
 /* SGP.22 v2.6 section 5.6.1 has the SM-DP+ compare the address the LPA
@@ -429,3 +430,84 @@ done:
     return ret;
 }
 
+
+int build_other_notification(
+        long seq_number, int operation_bit,
+        const uint8_t *euicc_cert_der, size_t euicc_cert_len,
+        const uint8_t *eum_cert_der, size_t eum_cert_len,
+        unsigned char *out, size_t cap, size_t *out_len) {
+    OtherSignedNotification_t osn;
+    unsigned char tbs_buf[512];
+    struct sink tbs_sink = { tbs_buf, 0, sizeof tbs_buf };
+    struct sink out_sink = { out, 0, cap };
+    asn_enc_rval_t r;
+    rsp_credential_t euicc_cred;
+    uint8_t sig[64];
+    uint8_t event[1];
+    int ret = -1;
+
+    memset(&osn, 0, sizeof osn);
+
+    /* NotificationEvent is a BIT STRING, most significant bit first:
+       install is bit 0, enable 1, disable 2, delete 3. */
+    event[0] = (uint8_t)(0x80 >> operation_bit);
+    if (asn_long2INTEGER(&osn.tbsOtherNotification.seqNumber, seq_number) != 0 ||
+        OCTET_STRING_fromBuf(
+            (OCTET_STRING_t *)&osn.tbsOtherNotification.profileManagementOperation,
+            (const char *)event, 1) != 0 ||
+        OCTET_STRING_fromBuf(&osn.tbsOtherNotification.notificationAddress,
+                              SMDP_ADDR, (int)strlen(SMDP_ADDR)) != 0) {
+        goto done;
+    }
+    osn.tbsOtherNotification.profileManagementOperation.bits_unused = 4;
+
+    /* The eUICC signs tbsOtherNotification, so it has to be encoded on
+       its own first -- exactly as the signature verifier slices it back
+       out of what arrives. */
+    r = der_encode(&asn_DEF_NotificationMetadata, &osn.tbsOtherNotification,
+                   collect, &tbs_sink);
+    if (r.encoded < 0) {
+        goto done;
+    }
+    memset(&euicc_cred, 0, sizeof euicc_cred);
+    memcpy(euicc_cred.sk, EUICC_TEST_SK, sizeof euicc_cred.sk);
+    if (rsp_sign(&euicc_cred, tbs_sink.p, tbs_sink.len, sig) != 0) {
+        goto done;
+    }
+    if (OCTET_STRING_fromBuf(&osn.euiccNotificationSignature,
+                              (const char *)sig, sizeof sig) != 0) {
+        goto done;
+    }
+
+    /* ber_decode allocates, and these two members are embedded rather
+       than pointers -- so decode into locals and move the contents. */
+    {
+        Certificate_t *ec = NULL, *mc = NULL;
+        asn_dec_rval_t d1 = ber_decode(NULL, &asn_DEF_Certificate,
+                                       (void **)&ec, euicc_cert_der,
+                                       euicc_cert_len);
+        asn_dec_rval_t d2 = ber_decode(NULL, &asn_DEF_Certificate,
+                                       (void **)&mc, eum_cert_der,
+                                       eum_cert_len);
+        if (d1.code != RC_OK || !ec || d2.code != RC_OK || !mc) {
+            if (ec) ASN_STRUCT_FREE(asn_DEF_Certificate, ec);
+            if (mc) ASN_STRUCT_FREE(asn_DEF_Certificate, mc);
+            goto done;
+        }
+        osn.euiccCertificate = *ec;
+        osn.eumCertificate = *mc;
+        free(ec);
+        free(mc);
+    }
+
+    r = der_encode(&asn_DEF_OtherSignedNotification, &osn, collect, &out_sink);
+    if (r.encoded < 0) {
+        goto done;
+    }
+    *out_len = out_sink.len;
+    ret = 0;
+
+done:
+    ASN_STRUCT_RESET(asn_DEF_OtherSignedNotification, &osn);
+    return ret;
+}

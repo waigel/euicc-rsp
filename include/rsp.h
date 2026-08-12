@@ -628,6 +628,68 @@ int rsp_dp_verify_installation_result(const rsp_dp_session_t *s,
         const uint8_t *pir, size_t pir_len,
         int *installed, long *bpp_command_id, long *error_reason);
 
+/* The certificate rsp_dp_authenticate_client learned, CERT.EUICC.ECDSA,
+ * borrowed from the session -- valid as long as the session is.
+ *
+ * A server needs it after the session is gone. A notification arrives
+ * with no session behind it and, for a ProfileInstallationResult, no
+ * certificate either (see rsp_dp_verify_notification), so the only way
+ * to check whose signature it carries is to have kept this from the
+ * download. Returns 0, or -1 when rsp_dp_authenticate_client has not
+ * succeeded on this session yet, or -2 for a null argument. */
+int rsp_dp_session_euicc_cert(const rsp_dp_session_t *s,
+        const uint8_t **der, size_t *len);
+
+/* What a verified notification turned out to be. */
+typedef struct {
+    /* 1 for a ProfileInstallationResult, 0 for an OtherSignedNotification. */
+    int  is_installation_result;
+    long seq_number;
+    /* Which operation it reports: 0 install, 1 enable, 2 disable,
+     * 3 delete, or -1 when the eUICC set no single bit. */
+    int  operation;
+    int  have_iccid;
+    uint8_t iccid[10];
+    /* Only meaningful for an installation result: 1 when the eUICC said
+     * it installed the Profile, 0 when it reported an error. */
+    int  installed;
+} rsp_notification_t;
+
+/* Is this pending notification genuinely an eUICC's, and what does it
+ * say? SGP.22 v2.6 section 5.7.12's PendingNotification, which is what
+ * ES9+ HandleNotification carries.
+ *
+ * The two arms are not symmetric, and the difference decides what a
+ * caller has to have kept:
+ *
+ *   A ProfileInstallationResult carries its data and one signature and
+ *   no certificates at all. Verifying it needs CERT.EUICC.ECDSA from
+ *   somewhere else -- from the download that produced it, which is why
+ *   rsp_dp_session_euicc_cert above exists. cert_euicc_der is required
+ *   for this arm.
+ *
+ *   An OtherSignedNotification carries euiccCertificate and
+ *   eumCertificate itself, so it is self-contained: the chain is checked
+ *   against this library's compiled-in test CI and cert_euicc_der may be
+ *   NULL. When it is given, the embedded certificate must match it --
+ *   otherwise a genuine notification from one eUICC would verify while
+ *   claiming to be about another's Profile.
+ *
+ * There is no transactionId to bind against: a notification does not
+ * carry one an SM-DP+ could match, and NotificationMetadata has no EID.
+ * So this answers "did this eUICC sign this", never "does this belong to
+ * that session". Correlating it with an order is the caller's job, by
+ * ICCID.
+ *
+ * Returns 0 with *out filled. -1 means the question was asked and the
+ * answer is no: a signature that does not verify, a certificate that
+ * does not chain, or an embedded certificate that is not the one given.
+ * -2 means it was never reached: a null argument, something that does
+ * not decode as a PendingNotification, or an internal failure. */
+int rsp_dp_verify_notification(const uint8_t *cert_euicc_der, size_t cert_len,
+        const uint8_t *notification, size_t notification_len,
+        rsp_notification_t *out);
+
 /* The ES9+ JSON binding (SGP.22 v2.6 sections 6.5.2.6 and 6.5.2.8) sends
  * five separately named, separately base64-encoded fields per response.
  * These two functions cut them out of the single DER blob the two

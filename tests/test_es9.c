@@ -1052,5 +1052,116 @@ int main(void) {
 
     rsp_dp_session_free(sess);
 
+    /* ---- rsp_dp_verify_notification ----------------------------------
+       A notification arrives with no session behind it, so this is the
+       session-free check. The two arms are not symmetric: a
+       ProfileInstallationResult carries no certificates and needs one
+       kept from the download, while an OtherSignedNotification carries
+       CERT.EUICC and CERT.EUM itself. */
+    {
+        rsp_credential_t euicc_cert;
+        memset(&euicc_cert, 0, sizeof euicc_cert);
+
+        /* --- the installation-result arm --- */
+        {
+            unsigned char pir[1024];
+            size_t pir_len = 0;
+            rsp_notification_t v;
+
+            ok("a ProfileInstallationResult fixture encodes",
+               build_installation_result(transaction_id, 1, pir, sizeof pir,
+                                          &pir_len) == 0);
+            memset(&v, 0, sizeof v);
+            ok("it verifies against the eUICC's certificate",
+               rsp_dp_verify_notification(rsp_sgp26_euicc_der,
+                                           rsp_sgp26_euicc_der_len,
+                                           pir, pir_len, &v) == 0);
+            ok("...and is reported as an installation result", v.is_installation_result == 1);
+            ok("...that says the profile was installed", v.installed == 1);
+            ok("...carrying the metadata a server routes by",
+               v.seq_number == 1 && v.operation == 0);
+
+            /* Without a certificate there is nothing to check against,
+               and this arm cannot fall back on anything embedded. */
+            memset(&v, 0, sizeof v);
+            ok("without a certificate the question cannot be asked",
+               rsp_dp_verify_notification(NULL, 0, pir, pir_len, &v) == -2);
+
+            /* The DP's certificate is a real, well-formed certificate --
+               just not this eUICC's. A -1, not a -2: the question was
+               asked. */
+            {
+                rsp_credential_t dpauth;
+                memset(&dpauth, 0, sizeof dpauth);
+                ok("DPauth loads, to check against the wrong certificate",
+                   rsp_pki_dp(0, &dpauth) == 0);
+                memset(&v, 0, sizeof v);
+                ok("another certificate is a refusal, not a failure to ask",
+                   rsp_dp_verify_notification(dpauth.der, dpauth.der_len,
+                                               pir, pir_len, &v) == -1);
+                rsp_credential_free(&dpauth);
+            }
+
+            /* One byte of the signed data changed. */
+            if (pir_len > 40) {
+                unsigned char tampered[1024];
+                memcpy(tampered, pir, pir_len);
+                tampered[pir_len - 40] ^= 0x01;
+                memset(&v, 0, sizeof v);
+                ok("a tampered notification does not verify",
+                   rsp_dp_verify_notification(rsp_sgp26_euicc_der,
+                                               rsp_sgp26_euicc_der_len,
+                                               tampered, pir_len, &v) != 0);
+            }
+        }
+
+        /* --- the self-contained arm --- */
+        {
+            unsigned char osn[2048];
+            size_t osn_len = 0;
+            rsp_notification_t v;
+
+            ok("an OtherSignedNotification fixture encodes",
+               build_other_notification(7, 3, rsp_sgp26_euicc_der,
+                                         rsp_sgp26_euicc_der_len,
+                                         rsp_sgp26_eum_der,
+                                         rsp_sgp26_eum_der_len,
+                                         osn, sizeof osn, &osn_len) == 0);
+
+            /* No certificate given: this arm carries its own, and the
+               chain is checked against the compiled-in test CI. */
+            memset(&v, 0, sizeof v);
+            ok("it verifies with no certificate given at all",
+               rsp_dp_verify_notification(NULL, 0, osn, osn_len, &v) == 0);
+            ok("...and is not reported as an installation result",
+               v.is_installation_result == 0);
+            ok("...naming the operation and sequence number it reports",
+               v.seq_number == 7 && v.operation == 3);
+
+            /* Given the matching certificate it still verifies. */
+            memset(&v, 0, sizeof v);
+            ok("it verifies against the matching certificate too",
+               rsp_dp_verify_notification(rsp_sgp26_euicc_der,
+                                           rsp_sgp26_euicc_der_len,
+                                           osn, osn_len, &v) == 0);
+
+            /* Given a different one it must not: a genuine notification
+               from one eUICC would otherwise be filed against another's
+               Profile. */
+            {
+                rsp_credential_t dpauth;
+                memset(&dpauth, 0, sizeof dpauth);
+                ok("DPauth loads, for the mismatched-certificate case",
+                   rsp_pki_dp(0, &dpauth) == 0);
+                memset(&v, 0, sizeof v);
+                ok("a certificate that is not the embedded one is refused",
+                   rsp_dp_verify_notification(dpauth.der, dpauth.der_len,
+                                               osn, osn_len, &v) == -1);
+                rsp_credential_free(&dpauth);
+            }
+        }
+        (void)euicc_cert;
+    }
+
     return fails ? 1 : 0;
 }
