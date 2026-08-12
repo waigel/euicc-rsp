@@ -196,6 +196,20 @@ main(int argc, char **argv) {
     put("prepare-download-response.der", pdr, pdr_len);
     put("upp.der", UPP, sizeof UPP - 1);
 
+    /* A PendingNotification, for anything that has to exercise ES9+
+       HandleNotification. The eUICC sends one after every install; this
+       is the same structure, signed by the same test key, so a consumer
+       can post it at a server and see what happens without a card. */
+    {
+        unsigned char pn[1024];
+        size_t pn_len = 0;
+        if (build_installation_result(TRANSACTION_ID, 1, pn, sizeof pn,
+                                       &pn_len) != 0) {
+            die("build_installation_result", -1);
+        }
+        put("pending-notification.der", pn, pn_len);
+    }
+
     /* --- and what this library made of it -------------------------- */
     put("initiate-response.der", init_resp, init_len);
     put("authenticate-response.der", ac_resp, ac_len);
