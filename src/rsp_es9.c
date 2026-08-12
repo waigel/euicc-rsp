@@ -1801,6 +1801,45 @@ out:
 }
 
 int
+rsp_dp_notification_metadata(const uint8_t *notification,
+        size_t notification_len, rsp_notification_t *out)
+{
+    int ret = -2;
+
+    if (!notification || notification_len < 2 || !out) return -2;
+    memset(out, 0, sizeof *out);
+    out->operation = -1;
+
+    if (notification[0] == 0xBF && notification[1] == 0x37) {
+        ProfileInstallationResult_t *r = NULL;
+        asn_dec_rval_t dr = ber_decode(NULL, &asn_DEF_ProfileInstallationResult,
+                                       (void **)&r, notification,
+                                       notification_len);
+        if (dr.code == RC_OK && r &&
+            notification_meta(&r->profileInstallationResultData
+                                   .notificationMetadata, out) == 0) {
+            out->is_installation_result = 1;
+            ret = 0;
+        }
+        if (r) ASN_STRUCT_FREE(asn_DEF_ProfileInstallationResult, r);
+        return ret;
+    }
+    if ((notification[0] & 0x1f) == 0x10) {
+        OtherSignedNotification_t *o = NULL;
+        asn_dec_rval_t dr = ber_decode(NULL, &asn_DEF_OtherSignedNotification,
+                                       (void **)&o, notification,
+                                       notification_len);
+        if (dr.code == RC_OK && o &&
+            notification_meta(&o->tbsOtherNotification, out) == 0) {
+            ret = 0;
+        }
+        if (o) ASN_STRUCT_FREE(asn_DEF_OtherSignedNotification, o);
+        return ret;
+    }
+    return -2;
+}
+
+int
 rsp_dp_verify_notification(const uint8_t *cert_euicc_der, size_t cert_len,
         const uint8_t *notification, size_t notification_len,
         rsp_notification_t *out)

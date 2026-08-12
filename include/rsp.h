@@ -655,6 +655,28 @@ typedef struct {
     int  installed;
 } rsp_notification_t;
 
+/* Read a pending notification's metadata WITHOUT verifying anything.
+ *
+ * This exists for one reason: the certificate a ProfileInstallationResult
+ * has to be checked against is found by ICCID, and the ICCID is inside
+ * the notification. Something has to read it before there is anything to
+ * verify with, and pretending otherwise would mean trying every stored
+ * certificate in turn.
+ *
+ * Nothing here is evidence. A caller that acts on this without then
+ * calling rsp_dp_verify_notification has taken an unauthenticated
+ * stranger's word for which Profile it is talking about. Use it to look
+ * a certificate up, and then ask the question properly.
+ *
+ * out->installed is left 0 whatever the notification says, because
+ * saying otherwise would put an unverified verdict in a field that reads
+ * like a verified one.
+ *
+ * Returns 0, or -2 when the bytes do not decode as a
+ * PendingNotification. There is no -1: nothing is being asked. */
+int rsp_dp_notification_metadata(const uint8_t *notification,
+        size_t notification_len, rsp_notification_t *out);
+
 /* Is this pending notification genuinely an eUICC's, and what does it
  * say? SGP.22 v2.6 section 5.7.12's PendingNotification, which is what
  * ES9+ HandleNotification carries.
