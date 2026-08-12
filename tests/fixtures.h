@@ -74,6 +74,19 @@ int build_installation_result(
         int success,
         unsigned char *out, size_t cap, size_t *out_len);
 
+/* An OtherSignedNotification: what an eUICC sends after an enable,
+   disable or delete. Unlike a ProfileInstallationResult it carries
+   CERT.EUICC.ECDSA and CERT.EUM with it, so it can be verified without
+   anything having been kept from a download.
+
+   operation_bit is which NotificationEvent bit to set: 1 enable,
+   2 disable, 3 delete. */
+int build_other_notification(
+        long seq_number, int operation_bit,
+        const uint8_t *euicc_cert_der, size_t euicc_cert_len,
+        const uint8_t *eum_cert_der, size_t eum_cert_len,
+        unsigned char *out, size_t cap, size_t *out_len);
+
 int build_prepare_download_response(
         const uint8_t transaction_id[16],
         const uint8_t euicc_otpk[65],

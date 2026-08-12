@@ -182,6 +182,8 @@
 #include "SmdpSigned2.h"
 #include "ber_tlv_length.h"
 #include "ber_tlv_tag.h"
+#include "NotificationMetadata.h"
+#include "OtherSignedNotification.h"
 #include "ProfileInstallationResult.h"
 #include "StoreMetadataRequest.h"
 
@@ -1499,4 +1501,328 @@ rsp_dp_authenticate_fields(const uint8_t *resp, size_t resp_len,
 
     *out = g;
     return 0;
+}
+
+/* ---------------------------------------------------------------------
+ * Notifications: what an eUICC says after the download is over.
+ * ------------------------------------------------------------------ */
+
+int
+rsp_dp_session_euicc_cert(const rsp_dp_session_t *s,
+        const uint8_t **der, size_t *len)
+{
+    if (!s || !der || !len) return -2;
+    if (!s->euicc_cert_der || s->euicc_cert_der_len == 0) return -1;
+    *der = s->euicc_cert_der;
+    *len = s->euicc_cert_der_len;
+    return 0;
+}
+
+/* Copy the NotificationMetadata fields a caller needs for routing into
+ * the verdict. Returns 0, or -1 when the metadata cannot be described
+ * honestly -- an ICCID that is not ten octets, or a seqNumber wider than
+ * a long. */
+static int
+notification_meta(const NotificationMetadata_t *m, rsp_notification_t *out)
+{
+    long seq = 0;
+    int bit = -1, found = -1;
+    size_t byte;
+
+    if (asn_INTEGER2long(&m->seqNumber, &seq) != 0) return -1;
+    out->seq_number = seq;
+
+    /* NotificationEvent is a BIT STRING with exactly one bit set here
+     * (section 5.7.11). Report which, or -1 when the eUICC set none or
+     * several -- a value this struct cannot describe. */
+    for (byte = 0; m->profileManagementOperation.buf &&
+                   byte < (size_t)m->profileManagementOperation.size; byte++) {
+        for (bit = 0; bit < 8; bit++) {
+            if (byte + 1 == (size_t)m->profileManagementOperation.size &&
+                bit >= 8 - m->profileManagementOperation.bits_unused) {
+                break;
+            }
+            if (m->profileManagementOperation.buf[byte] & (0x80 >> bit)) {
+                if (found >= 0) { found = -1; goto done_bits; }
+                found = (int)(byte * 8 + (size_t)bit);
+            }
+        }
+    }
+done_bits:
+    out->operation = found;
+
+    if (m->iccid) {
+        if (m->iccid->size != 10) return -1;
+        memcpy(out->iccid, m->iccid->buf, 10);
+        out->have_iccid = 1;
+    }
+    return 0;
+}
+
+/* Verify a ProfileInstallationResult against a certificate given from
+ * outside. It carries none of its own -- see rsp.h -- so this is the arm
+ * that needs the caller to have kept CERT.EUICC.ECDSA from the download. */
+static int
+verify_installation_notification(const uint8_t *cert_der, size_t cert_len,
+        const uint8_t *pir, size_t pir_len, rsp_notification_t *out)
+{
+    ProfileInstallationResult_t *r = NULL;
+    uint8_t *data_der = NULL;
+    size_t data_der_len = 0;
+    int ret = -2;
+
+    if (!cert_der || cert_len == 0) return -2;
+
+    {
+        asn_dec_rval_t dr = ber_decode(NULL, &asn_DEF_ProfileInstallationResult,
+                                       (void **)&r, pir, pir_len);
+        if (dr.code != RC_OK || !r) goto out;
+    }
+    if (r->euiccSignPIR.size != 64) goto out;
+
+    /* The signature is over the received ProfileInstallationResultData
+     * ('BF 27') as it arrived, not over a re-encoding of the decode --
+     * the same rule commit 8928231 established for the in-session check. */
+    {
+        static const uint8_t tag_pir[2]  = { 0xBF, 0x37 };
+        static const uint8_t tag_data[2] = { 0xBF, 0x27 };
+        size_t start = 0, len = 0, hdr = 0;
+
+        if (find_tlv(pir, pir_len, 0, tag_pir, sizeof tag_pir, &start, &len) != 0) {
+            goto out;
+        }
+        {
+            ber_tlv_tag_t t;
+            ber_tlv_len_t cl;
+            ssize_t tl = ber_fetch_tag(pir, pir_len, &t);
+            ssize_t ll;
+            if (tl <= 0) goto out;
+            ll = ber_fetch_length(BER_TLV_CONSTRUCTED(pir), pir + tl,
+                                   pir_len - (size_t)tl, &cl);
+            if (ll <= 0) goto out;
+            hdr = (size_t)tl + (size_t)ll;
+        }
+        if (find_tlv(pir, pir_len, hdr, tag_data, sizeof tag_data,
+                      &start, &data_der_len) != 0) {
+            goto out;
+        }
+        data_der = malloc(data_der_len);
+        if (!data_der) goto out;
+        memcpy(data_der, pir + start, data_der_len);
+    }
+
+    {
+        int vr = rsp_sign_verify(cert_der, cert_len, data_der, data_der_len,
+                                  r->euiccSignPIR.buf);
+        if (vr != 0) { ret = (vr == -1) ? -1 : -2; goto out; }
+    }
+
+    if (notification_meta(&r->profileInstallationResultData.notificationMetadata,
+                          out) != 0) {
+        goto out;
+    }
+    out->is_installation_result = 1;
+    out->installed =
+        r->profileInstallationResultData.finalResult.present ==
+        ProfileInstallationResultData__finalResult_PR_successResult;
+    ret = 0;
+
+out:
+    free(data_der);
+    if (r) ASN_STRUCT_FREE(asn_DEF_ProfileInstallationResult, r);
+    return ret;
+}
+
+/* Step over the TLV at *off. *val is its value and *val_len that value's
+ * length; *whole / *whole_len are the field as it arrived, tag and length
+ * included. Used positionally, because OtherSignedNotification's two
+ * certificates share tag '30' and a tag search would find the first
+ * twice. */
+static int
+step_tlv(const uint8_t *buf, size_t end, size_t *off,
+         const uint8_t **whole, size_t *whole_len,
+         const uint8_t **val, size_t *val_len)
+{
+    ber_tlv_tag_t t;
+    ber_tlv_len_t cl;
+    ssize_t tl, ll;
+    size_t hdr;
+
+    if (*off >= end) return -1;
+    tl = ber_fetch_tag(buf + *off, end - *off, &t);
+    if (tl <= 0) return -1;
+    ll = ber_fetch_length(BER_TLV_CONSTRUCTED(buf + *off), buf + *off + tl,
+                           end - *off - (size_t)tl, &cl);
+    if (ll <= 0 || cl < 0) return -1;
+    hdr = (size_t)tl + (size_t)ll;
+    if ((size_t)cl > end - *off - hdr) return -1;
+
+    *whole = buf + *off;
+    *whole_len = hdr + (size_t)cl;
+    *val = buf + *off + hdr;
+    *val_len = (size_t)cl;
+    *off += *whole_len;
+    return 0;
+}
+
+/* Verify an OtherSignedNotification. Unlike a ProfileInstallationResult
+ * this one is self-contained: it carries CERT.EUICC.ECDSA and CERT.EUM
+ * with it, so the chain can be checked against the compiled-in test CI
+ * and no stored certificate is needed. When one is given anyway it must
+ * be the same certificate -- otherwise a genuine notification from one
+ * eUICC would verify while being filed against another's Profile. */
+static int
+verify_other_notification(const uint8_t *cert_der, size_t cert_len,
+        const uint8_t *osn, size_t osn_len, rsp_notification_t *out)
+{
+    OtherSignedNotification_t *o = NULL;
+    mbedtls_x509_crt ci, eum, euicc;
+    const uint8_t *ci_der = NULL;
+    size_t ci_len = 0;
+    const uint8_t *tbs = NULL, *sig_tlv = NULL, *euicc_c = NULL, *eum_c = NULL;
+    size_t tbs_len = 0, sig_len = 0, euicc_c_len = 0, eum_c_len = 0;
+    int ret = -2, have_ci = 0, have_eum = 0, have_euicc = 0;
+
+    mbedtls_x509_crt_init(&ci);
+    mbedtls_x509_crt_init(&eum);
+    mbedtls_x509_crt_init(&euicc);
+
+    {
+        asn_dec_rval_t dr = ber_decode(NULL, &asn_DEF_OtherSignedNotification,
+                                       (void **)&o, osn, osn_len);
+        if (dr.code != RC_OK || !o) goto out; 
+    }
+    if (o->euiccNotificationSignature.size != 64) goto out; 
+
+    /* Walk the received bytes for the four members: the signature is over
+     * tbsOtherNotification as it arrived, and the two certificates go to
+     * mbedTLS as they arrived. Re-encoding either would be a different
+     * message wherever BER and DER disagree. */
+    {
+        size_t off = 0, end = 0;
+        const uint8_t *w = NULL, *v = NULL;
+        size_t wl = 0, vl = 0;
+
+        if (step_tlv(osn, osn_len, &off, &w, &wl, &v, &vl) != 0) goto out;  
+        off = (size_t)(v - osn);
+        end = off + vl;
+
+        if (step_tlv(osn, end, &off, &tbs, &tbs_len, &v, &vl) != 0) goto out;  
+        if (step_tlv(osn, end, &off, &sig_tlv, &sig_len, &v, &vl) != 0) goto out;  
+        if (step_tlv(osn, end, &off, &euicc_c, &euicc_c_len, &v, &vl) != 0) goto out;  
+        if (step_tlv(osn, end, &off, &eum_c, &eum_c_len, &v, &vl) != 0) goto out;  
+    }
+
+    if (cert_der && cert_len > 0) {
+        if (cert_len != euicc_c_len || memcmp(cert_der, euicc_c, cert_len) != 0) {
+            ret = -1;   /* asked, and this is a different eUICC */
+            goto out;
+        }
+    }
+
+    /* The same callback and copy flag every other parse in this file
+     * uses. CERT.EUM carries a name-constraints extension mbedTLS marks
+     * critical and does not otherwise recognise, so the narrower
+     * policies-only callback refuses it -- which is what a first attempt
+     * here did, on bytes that were byte-identical to the certificate
+     * that parses fine two hundred lines up. */
+    if (rsp_pki_test_ci(&ci_der, &ci_len) != 0) goto out;
+    if (mbedtls_x509_crt_parse_der_with_ext_cb(
+            &ci, ci_der, ci_len, 1,
+            rsp_accept_certificate_policies_and_name_constraints,
+            NULL) != 0) {
+        goto out;
+    }
+    /* Declared at the point of use, as rsp_dp_authenticate_client also
+     * does -- build/sgp26_material.c defines it. */
+    {
+        extern const unsigned char rsp_sgp26_ci2017_der[];
+        extern const unsigned int rsp_sgp26_ci2017_der_len;
+    /* Both certificate objects for the one test CI key this project
+     * compiles in, exactly as rsp_dp_authenticate_client does: CERT.EUM's
+     * chain check needs a trust anchor whose Name matches the issuer it
+     * names, and only the second one has it. Parsing just the first
+     * leaves a chain that fails for a reason that reads like a bad
+     * certificate rather than a missing anchor. */
+    if (mbedtls_x509_crt_parse_der_with_ext_cb(
+            &ci, rsp_sgp26_ci2017_der, rsp_sgp26_ci2017_der_len, 1,
+            rsp_accept_certificate_policies_and_name_constraints,
+            NULL) != 0) {
+        goto out;
+    }
+    }
+    have_ci = 1;
+    if (mbedtls_x509_crt_parse_der_with_ext_cb(
+            &eum, eum_c, eum_c_len, 1,
+            rsp_accept_certificate_policies_and_name_constraints,
+            NULL) != 0) {
+        goto out;
+    }
+    have_eum = 1;
+    if (mbedtls_x509_crt_parse_der_with_ext_cb(
+            &euicc, euicc_c, euicc_c_len, 1,
+            rsp_accept_certificate_policies_and_name_constraints,
+            NULL) != 0) {
+        goto out;
+    }
+    have_euicc = 1;
+
+    {
+        uint32_t flags = 0;
+        if (mbedtls_x509_crt_verify(&eum, &ci, NULL, NULL, &flags,
+                                     NULL, NULL) != 0) {
+            ret = -1;   /* CERT.EUM does not chain to the CI */
+            goto out;
+        }
+        flags = 0;
+        if (mbedtls_x509_crt_verify(&euicc, &eum, NULL, NULL, &flags,
+                                     NULL, NULL) != 0) {
+            ret = -1;   /* CERT.EUICC does not chain to CERT.EUM */
+            goto out;
+        }
+    }
+
+    {
+        int vr = rsp_sign_verify(euicc_c, euicc_c_len, tbs, tbs_len,
+                                  o->euiccNotificationSignature.buf);
+        if (vr != 0) { ret = (vr == -1) ? -1 : -2; goto out; }
+    }
+
+    if (notification_meta(&o->tbsOtherNotification, out) != 0) goto out; 
+    out->is_installation_result = 0;
+    ret = 0;
+
+out:
+    if (have_ci) mbedtls_x509_crt_free(&ci);
+    if (have_eum) mbedtls_x509_crt_free(&eum);
+    if (have_euicc) mbedtls_x509_crt_free(&euicc);
+    if (o) ASN_STRUCT_FREE(asn_DEF_OtherSignedNotification, o);
+    return ret;
+}
+
+int
+rsp_dp_verify_notification(const uint8_t *cert_euicc_der, size_t cert_len,
+        const uint8_t *notification, size_t notification_len,
+        rsp_notification_t *out)
+{
+    if (!notification || notification_len < 2 || !out) return -2;
+    memset(out, 0, sizeof *out);
+    out->operation = -1;
+
+    /* PendingNotification is a CHOICE whose first alternative carries
+     * [55], so automatic tagging is off for it: a ProfileInstallation
+     * Result keeps 'BF 37' and an OtherSignedNotification keeps its
+     * SEQUENCE tag. The two arms are told apart by that, not guessed. */
+    if (notification[0] == 0xBF && notification[1] == 0x37) {
+        return verify_installation_notification(cert_euicc_der, cert_len,
+                                                notification,
+                                                notification_len, out);
+    }
+    /* A SEQUENCE: tag number 16 in the low five bits. Masking six bits
+     * instead, as this once did, never matches -- 0x30 & 0x3f is 0x30. */
+    if ((notification[0] & 0x1f) == 0x10) {
+        return verify_other_notification(cert_euicc_der, cert_len,
+                                         notification, notification_len, out);
+    }
+    return -2;
 }
